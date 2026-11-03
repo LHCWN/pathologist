@@ -32,6 +32,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+      - name: Diagnostic probe regression
+        run: python3 scripts/test_eval_diagnostic_probes.py
+
       - name: Fmt
         run: cargo fmt --all -- --check
 

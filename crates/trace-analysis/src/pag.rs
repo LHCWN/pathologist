@@ -81,6 +81,8 @@ pub struct Pag {
     /// Synthetic null values with no other producer; excludes mutable variables.
     pub(crate) null_temps: FxHashSet<PagNodeId>,
     pub fn_locations: IndexMap<FnId, LocId, FxBuildHasher>,
+    pub(crate) reinterpret_nodes: FxHashSet<PagNodeId>,
+    reinterpret_locations: FxHashMap<LocId, LocId>,
     pub var_location: IndexMap<VarId, LocId, FxBuildHasher>,
     /// Interned `StringConst` locations keyed by literal contents.
     pub string_locs: FxHashMap<String, LocId>,
@@ -187,7 +189,10 @@ impl Pag {
             if is_static && !named.contains(&var.id) {
                 continue;
             }
-            self.var_node_id(var.id);
+            let node = self.var_node_id(var.id);
+            if var.temp == Some(trace_ir::TempKind::Reinterpret) {
+                self.reinterpret_nodes.insert(node);
+            }
             if !is_static {
                 continue;
             }
@@ -678,19 +683,55 @@ impl Pag {
     /// Declared parameter count of the function-pointer slot `base.field`,
     /// used by the solver to keep signature-incompatible function values out
     /// of typed slots under wrong-type pointer flow. `None` = slot is not
-    /// (known to be) a fn pointer.
+    /// (known to be) a fixed-arity fn pointer; open signatures also return None.
     pub fn field_slot_arity(
         &self,
         program: &Program,
         base_loc: LocId,
         field: FieldId,
     ) -> Option<usize> {
+        self.field_slot_type(program, base_loc, field)?
+            .fixed_fn_ptr_arity()
+    }
+
+    /// Preserve the distinction between an open callable field and a
+    /// non-callable field when filtering function values carried by a GEP.
+    pub(crate) fn field_slot_type<'a>(
+        &self,
+        program: &'a Program,
+        base_loc: LocId,
+        field: FieldId,
+    ) -> Option<&'a trace_ir::TypeDesc> {
         let parent_type = struct_type_for_loc(self, program, base_loc)?;
         let layout = program.types.get(parent_type).layout.fields.get(&field)?;
-        match program.types.get(layout.type_id).desc.as_ref() {
-            trace_ir::TypeDesc::FnPtr { params, .. } => Some(params.len()),
-            _ => None,
+        Some(program.types.get(layout.type_id).desc.as_ref())
+    }
+
+    /// A cast-qualified function value has its own location, preserving the
+    /// original FnId while leaving ordinary locations' storage guards intact.
+    /// Allocated lazily during solving: per-location solver maps are sparse,
+    /// and missing fn_arity deliberately means no fixed signature for this cast.
+    /// New per-location state must define its missing-entry behavior or initialize
+    /// lazily; it cannot assume all locations existed when solving began.
+    pub(crate) fn reinterpret_location(&mut self, original: LocId) -> LocId {
+        if self.locations[original.0 as usize].kind != LocKind::Function {
+            return original;
         }
+        if let Some(&loc) = self.reinterpret_locations.get(&original) {
+            return loc;
+        }
+        let mut location = self.locations[original.0 as usize].clone();
+        let id = LocId(self.locations.len() as u32);
+        location.id = id;
+        self.alloc_loc(location);
+        self.set_location_target(id, self.location_target(original));
+        self.reinterpret_locations.insert(original, id);
+        self.reinterpret_locations.insert(id, id);
+        id
+    }
+
+    pub(crate) fn is_reinterpreted_location(&self, loc: LocId) -> bool {
+        self.reinterpret_locations.get(&loc) == Some(&loc)
     }
 
     fn build_function_locations(&mut self, program: &Program) {
@@ -734,6 +775,11 @@ impl Pag {
                     // remapped at merge; a global name lookup here could bind
                     // an unrelated same-name function (e.g. file-`static`s).
                     if let Some(&fn_loc) = self.fn_locations.get(callee) {
+                        let fn_loc = if self.reinterpret_nodes.contains(&dst_n) {
+                            self.reinterpret_location(fn_loc)
+                        } else {
+                            fn_loc
+                        };
                         let loc_n = self.loc_node[&fn_loc];
                         self.add_addr_of(dst_n, loc_n);
                     }
@@ -1470,6 +1516,41 @@ fn lookup_var_in_fn(
 mod tests {
     use super::*;
     use trace_ir::{Span, TypeDesc, TypeId, Variable};
+
+    #[test]
+    fn field_slot_arity_distinguishes_fixed_and_open_signatures() {
+        for (params, expected) in [
+            (Vec::new(), Some(0)),
+            (vec![TypeDesc::Int, TypeDesc::Int], Some(2)),
+            (vec![TypeDesc::Unknown], None),
+            (vec![TypeDesc::Int, TypeDesc::Unknown], None),
+        ] {
+            let mut program = Program::new(".".into());
+            let ty = program.types.intern(TypeDesc::Struct {
+                name: "Ops".into(),
+                fields: vec![(
+                    "callback".into(),
+                    TypeDesc::FnPtr {
+                        ret: Box::new(TypeDesc::Void),
+                        params,
+                    },
+                )],
+            });
+            let field = program.types.field_id_by_name(ty, "callback").unwrap();
+            let mut pag = Pag::default();
+            let loc = LocId(0);
+            pag.alloc_loc(AbstractLocation {
+                id: loc,
+                kind: LocKind::Heap,
+                var: None,
+                fn_id: None,
+                field: None,
+                type_id: ty,
+                desc: "ops".into(),
+            });
+            assert_eq!(pag.field_slot_arity(&program, loc, field), expected);
+        }
+    }
 
     /// Stage 6 (#133): a global no fact names gets neither a node nor a
     /// location; one a flow names gets both, in variable order.

@@ -2170,6 +2170,829 @@ each corpus specification explicitly. All 162 assertions pass against both
 completed runs after the audited calibration deduplication and center updates;
 all clean revision checks pass. The JSON note now links to this report rather
 than duplicating its historical measurements.
+## Explicit instantiations and member-pointer calls: #246 — 2026-10-30
+
+The corpus measurements and 119-check/34-table validation claims in this section
+are the historical report recorded in `6d3485f`, before the #257 using-directive
+and later review fixes. They do **not** validate the final reviewed code. The
+pinned corpus checkouts were unavailable for that snapshot, so its follow-up
+had no recaptured corpus counts or expectation centers. The PR description's
+older validation paragraph likewise applies to that historical snapshot.
+Measured final centers are recorded in
+[PR #257 final review validation](#pr-257-final-review-validation--2026-11-12).
+
+Fresh macOS release builds compared against `d23d70e`, with the clean revisions
+in `scripts/eval_expected.json`, minimal export, jobs 8 and a solver budget of
+800,000 pops. The custom preprocessor is used throughout, without SDK headers.
+Rules and deliberate approximations live in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+**Parser recovery.** Independent reductions cover explicit class and member
+instantiations (declarations and definitions, qualified names, pointer and
+reference returns), nested SFINAE pointer defaults, and `.*` / `->*` calls.
+Raw-parser tests establish which forms the pinned grammar rejects; adapted
+inputs parse without errors, while malformed neighbors still report errors.
+The shared-header fixtures retain template members, defaults and original
+positions, without phantom definitions or duplicate instantiation identities.
+Header and macro member-call spelling/expansion positions are checked separately.
+
+| Corpus | Parse-stage diagnostics before → after | Preprocess diagnostics before → after |
+|---|---:|---:|
+| HDF | unchanged | unchanged |
+| HiView | 81 → 64 | 2,908 → 2,908 |
+| Camera | 417 → 358 | 4,395 → 4,395 |
+
+HiView's `encoded_param.h` and `raw_data_builder.h` lose their parse warnings.
+`sys_event.h`'s explicit member instantiations recover, but unrelated syntax
+still leaves a warning in that header. Camera's five `camera_napi_adaptor.h`
+member invocations and the named `dps.h` form no longer cause production parse
+warnings. The standalone `parse_failures` helper can select C for an orphan
+`.h`; its `*` errors in such a reparse are not a C++ member-call recovery
+measurement. No parse-error suppression was added.
+
+**Calls and value flow.** The two-TU fixture checks local copies, named member
+pointer declarations and parameters, object/reference/pointer receivers, callback
+argument positions and invocation, return pointees, wrong-owner/signature
+exclusion, and shared virtual-dispatch behavior including a final receiver.
+Template-dependent receiver/signature tests remain conservative, including
+parameter packs whose final arity is unknown.
+
+Camera gains exactly 12 indirect edges, all at the named adaptor sites:
+`SetArgImpl:97` and `SetArg:120` each reach
+`CaptureSession::EnableCompositionEffectPreview` and
+`CaptureSession::SetRecommendedInfoLanguage`; `GetArg:151` reaches
+`CaptureSession::GetSupportedRecommendedInfoLanguage` and
+`CaptureSession::IsCompositionEffectPreviewSupported`; `RegCallback:172`
+reaches the four `StitchingPhotoSession::SetStitching*Callback` members and
+`CaptureSession::SetCompositionEffectReceiveCallback`; and
+`UnregCallback:195` reaches
+`CaptureSession::UnSetCompositionEffectReceiveCallback`. No pre-existing
+indirect edge is lost. Parsing `(server.get()->*func)(cmd)` in `dps.h` does not
+supply the missing `get()` alias/value flow; that remains a separate gap.
+Grouped callback-map operands such as Camera's `this->*((...))` now parse;
+resolving their standard-library iterator/map values remains a separate gap.
+
+**Review follow-up — 2026-11-02.** Keeping a lexical dependent class instance
+conservative in a member-pointer signature recovers the twelfth adaptor edge,
+`RegCallback:172 -> CaptureSession::SetCompositionEffectReceiveCallback`.
+The call at `camera_session_napi.cpp:5379` supplies that exact member address;
+its declared argument is `std::shared_ptr<NativeInfoCallback<CompositionEffectInfo>>`,
+while the adaptor spells `std::shared_ptr<NativeInfoCallback<T>>`. Against
+`b8d307f`, Camera gains one indirect/total edge and two argument-flow rows;
+no indirect edge is lost, and HDF and HiView metrics are unchanged. The focused
+regressions also check base-typed receivers after explicit member-pointer
+conversion, unrelated-owner exclusion, and contextual overload selection for
+declarations, assignments and arrays, including known concrete template
+arguments and reinterpretation barriers. The workspace suite passes all 2,608
+tests. Both jobs 1 and jobs 8 pass all 118 pinned-corpus checks, and all 34
+analysis tables match row for row for each corpus (excluding run metadata).
+
+**Review follow-up — 2026-11-03.** Instance-member callback operands now load
+through the shared implicit-field machinery, including inherited field summaries
+and local shadowing. Defined member-pointer targets preserve the address-taking
+TU's identity; direct calls still select their own TU's body. An unresolved
+virtual receiver uses the bound member's owner as its dispatch root, while a
+known final receiver retains its boundary. Three regressions reproduce the
+previous failures independently. All 2,611 workspace tests pass, as do all 118
+pinned-corpus checks with both jobs 1 and 8. All 34 analysis tables match across
+job counts in each corpus. Global metrics are unchanged from `ef423b7`, so the
+expectations and tolerances are unchanged. The only exported data changes are
+`variables_data.type_id` for typed callback-load temporaries (HDF 4, HiView 6,
+Camera 55 rows) and the corresponding database identity; call edges are unchanged.
+
+**RHS grouping follow-up — 2026-11-03.** Binary parse placeholders keep array
+subscripts, field chains, parentheses and casts in the callable operand for
+both `->*` and `.*`. Regressions cover local-pointer equivalence, unknown-index
+array and field summaries, macro expansion, original byte/CRLF offsets, and
+C++14/C++17 operand sequencing. Compared with `d4f4a09`, all call edges and
+non-diagnostic global metrics are unchanged on the three pinned corpora.
+Camera has 19 fewer parse-diagnostic rows (10 distinct paths, including reused
+header variants): parse 377 → 358, total 5,211 → 5,192. The recovered spellings
+include `(this->*((ExecuteFunc)it->second))(...)` in `camera_ability_builder.cpp`
+and grouped register/unregister casts in both callback emitter headers; their
+includers account for the other recovered paths. No diagnostic is added.
+The exact diagnostic expectation is updated, without widening a tolerance;
+an exact probe requires both callback emitter headers to remain free of parse
+diagnostics. Iterator/map callback value flow still limits those call targets.
+All 2,614 workspace tests pass. Both jobs 1 and 8 pass all 119 pinned-corpus
+checks; all 34 analysis tables match across job counts for each corpus, and
+semantic call-edge identities match the parent.
+
+**Inline member-address follow-up — 2026-11-03.** The regression for
+`(b->*&B::f)()` now reaches both `B::f` and its `D::f` override, matching a
+local member-pointer value. It also checks grouped/dot operands, cast-selected
+overloads, final receivers, returned pointer values and a field hiding a global
+function. All 2,615 workspace tests and all 119 pinned-corpus checks pass with
+jobs 1 and 8. All 34 analysis tables match row for row across job counts and
+against `cdd75de` on HDF, HiView and Camera (excluding run metadata), so corpus
+expectations and tolerances are unchanged.
+
+HiView loses one phantom defined function whose name consumed
+`std::string TAG;...EventParamInfo` after the malformed instantiations in
+`raw_data_builder.h`. The test class and its generated test methods now have
+the correct `OHOS::HiviewDFX` ownership, instead of the leaked `EventRaw`
+namespace. This exposes the existing coarse treatment of receiver class names
+available only through `using namespace EventRaw`: some formerly direct/CHA
+edges become external stubs, while concrete base-member edges remain. This
+is receiver-type imprecision, distinct from parser recovery and from missing
+SDK declarations; the relevant policy is documented under C++ support in
+`ANALYSIS.md`. The namespace correction and phantom removal have exact probes.
+
+| Metric | HiView before → after | Camera before → after |
+|---|---:|---:|
+| Functions (defined / external) | 9,971 (7,993 / 1,978) → 9,994 (7,992 / 2,002) | unchanged at 23,722 |
+| Direct edges | 23,319 → 23,062 | 68,819 → 68,836 |
+| Indirect edges | unchanged at 246 | 442 → 454 |
+| External edges | 15,690 → 15,872 | 46,066 → 46,071 |
+| Total edges | 39,299 → 39,224 | 116,135 → 116,169 |
+| Argument-flow edges | 31,924 → 31,760 | 57,894 → 57,930 |
+| All diagnostics | 3,576 → 3,559 | 5,251 → 5,192 |
+
+HDF's metrics and existing dispatch/calibration probes are unchanged. Reviewed
+metric centers are re-captured without widening tolerances. All analysis tables
+(excluding run metadata) match across jobs 1 and 8 on all three corpora; fixture
+minimal and full exports also match across jobs 1 and 4. The focused regressions
+and `cargo test --workspace` pass.
+
+Follow-up review (#257): receiver type lookup now resolves class names introduced
+by active using-directives. Focused regressions retain the declared EventRaw
+base member without leaking its namespace into the test class; moving an
+overload definition between TUs still selects the imported class's compatible
+overload. The table above records the earlier measured revision; the final
+rebased implementation is measured in [PR #257 final review validation](#pr-257-final-review-validation--2026-11-12).
+
+The 119-check / 34-table claims in the earlier paragraphs are historical
+validation of the intermediate implementation, not validation of `7a6fb09`
+or the subsequent review fixes. The analyzer commit for the table above was
+not recorded with those measurements; it cannot be identified reliably from
+this workspace. The merged expectation file also contains later master
+recaptures (see its top-level note), so that table is not a statement of its
+current centers. Do not infer final-revision corpus coverage from either
+record. Final corpus validation is recorded in
+[PR #257 final review validation](#pr-257-final-review-validation--2026-11-12).
+
+The header-warning probes now cover diagnostics linked through `file_id`,
+the current file-level `parse errors in <path>` message (which ends with the
+path), and `path:line:column` messages. A synthetic SQLite regression injects
+each representation for both headers in each probe and checks that the probe
+counts it; unrelated stages and paths do not count. This verifies the probes,
+not the corpus expectation of zero warnings.
+
+**Parser scaling follow-up (#257).** A release parser-only probe on this macOS
+workspace parsed the review's left-deep `x * 2 + ...` expression in approximately
+22 ms for 4,000 terms and 52 ms for 16,000 terms (one run; normalization included,
+lowering and solving excluded). The grouping walk carries parent state on its
+stack, removing depth-dependent root searches. Clean named and unnamed
+member-pointer parameter lists each use one full-source parse, verified by a
+parser test; ambiguous declarations still receive their required repair parse.
+Reproduce with `cargo test --release -p trace-parse deep_expression_scaling_probe
+-- --ignored --nocapture`. These are microbenchmark results, not corpus timings.
+
+### PR #257 final review validation — 2026-11-12
+
+The branch was rebased onto freshly fetched `origin/master` `aa6f846`.
+Reinterpreted function and member-pointer invocations now retain differing
+return types, including reference/value differences. Overload selection keeps
+its full signature checks; invocation still checks parameters and member owners.
+The C and C++ stored, passed and local worker regressions pass, as do the member
+pointer cases. The HDF `OsalThreadFn -> HdfThreadMain` indirect edge is restored
+and pinned by a new named probe. Rules are in
+[Argument flow](ANALYSIS.md#argument-flow) and
+[C++ support](ANALYSIS.md#c-support-first-step).
+
+Fresh release runs use the exact HDF, HiView and Camera revisions in
+`eval_expected.json`, an 800,000-pop budget and jobs 1, 4 and 8. The final
+centers below replace the stale centers without widening any tolerance:
+
+| Raw metric | HDF | HiView | Camera |
+|---|---:|---:|---:|
+| Functions | 12,172 | 9,762 | 23,540 |
+| Defined functions | 10,306 | 7,992 | 19,806 |
+| Direct edges | 49,816 | 24,105 | 70,073 |
+| Indirect edges | 5,226 | 266 | 475 |
+| External edges | 23,874 | 15,085 | 45,942 |
+| IPC edges | 58 | 44 | 808 |
+| Total edges | 78,974 | 39,500 | 117,298 |
+| Argument-flow edges | 72,585 | 33,789 | 60,961 |
+| Diagnostics | 1,910 | 3,559 | 5,192 |
+
+The diagnostic reductions, restored HiView namespace and additional typed
+receivers are expected recoveries. Camera's known-imprecise `SubmitTask` probe
+moves from 14 to 20: six newly typed `GetTaskManager()` receivers expose the
+existing #244 overload debt, including a two-argument candidate at a one-argument
+call. This is recorded as imprecision rather than an overload-accuracy gain.
+
+The opaque-copy audit uses a release control with only the persistent opaque
+argument copies disabled, retaining the return-type fix. Against that control,
+54 HDF indirect edges are the six remote-dispatch stubs at nine additional
+`rtc_if_u.c` sites; HiView and Camera indirect-edge counts do not change. This isolates
+most of the review's reported remote/IO-dispatch mixing to propagation through
+erased pointer arguments. Instance-insensitive aggregate flow remains an
+approximation; these extra remote-stub candidates are not claimed as precise
+RTC targets. The control also demonstrates why opaque forwarding cannot simply
+be removed: the focused late callback-slot-address regression requires it.
+
+The broad opaque condition measurably increased HDF solve time, so persistent
+wiring now excludes a known scalar buffer on either side. Function-pointer
+slots, aggregates and unknown/erased pointees remain eligible. With
+`TRACE_SOLVER_STATS=1`, final constraint counts and solver-loop times are:
+
+| Corpus | Opaque copies disabled | Final narrowed copies | Solver time, control → final |
+|---|---:|---:|---:|
+| HDF | 117,366 | 119,582 | 0.919–0.930 s → 1.161–1.210 s |
+| HiView | 50,549 | 50,570 | 24.75–24.89 ms → 24.79–25.68 ms |
+| Camera | 133,651 | 133,695 | 68.34–69.41 ms → 65.88–73.12 ms |
+
+These are local macOS measurements, not portable performance guarantees. The
+control ranges are two quiet jobs-4 runs; the final ranges are jobs 1, 4 and 8.
+HDF's remaining cost is explicit: 1.9% more constraints and roughly 0.25 s in
+the solver, with 561,311 pops versus 497,036. Rounded final analyze times are
+1.3 s, 0.1 s and 0.2 s. The broad version had 119,721 HDF constraints; excluding
+known scalar buffers removes 139 of them without losing a corpus call edge.
+No run reaches the budget.
+
+All 165 expectation checks pass on each final jobs-1, jobs-4 and jobs-8
+export. All 139 compared logical/backing relations match row for row between
+jobs 1 and 8 for each corpus, excluding run/producer metadata in both
+`analysis_run` and `raw_analysis_run`. The generic comparison helper needs the
+same metadata-column exclusion for the raw snapshot's run relation; no analysis
+data is excluded for that comparison.
+
+The full workspace suite passes 3,047 tests (one manual parser probe ignored).
+Clippy with `--workspace --all-targets -- -D warnings`, formatting, whitespace
+checks and the synthetic diagnostic-probe regression pass. Existing regressions
+also confirm that clean named/unnamed member-pointer parameters use one full
+parse and member-pointer calls preserve loop and unevaluated context.
+
+**Additional review cleanup — 2026-11-12.** Copy propagation now gates
+cast-destination scans on the presence of reinterpretation nodes, reads copy
+indices without cloning, and reuses its cast-location buffer in source-delta
+order (see [Propagation highlights](ANALYSIS.md#propagation-highlights)).
+Callback signature lookup uses the site's explicit binding rather than the
+callee's `this` metadata and leaves a receiver position without an explicit
+parameter signature. Duplicate cast lowering, the overlapping slot-guard check
+and the impossible mixed-member disjunct were removed. Refinement shares an
+original-spelling fallback; direct unit tests cover an empty saved spelling
+and a bound site selecting a callee without `this`. The schema documentation
+now explains the existing member-pointer storage layer in exported type names;
+the exported spelling is unchanged. The #246 introduction identifies its old
+unavailable-checkout statement as evidence for that historical snapshot.
+
+All 3,049 workspace tests, warnings-as-errors Clippy, formatting and whitespace
+checks pass. Fresh pinned HDF, HiView and Camera runs pass all 165 checks at
+jobs 1 and 8 without changing expectation centers. All 139 compared relations
+match between job counts after excluding run metadata as above. Compared with
+the preceding final-review snapshot, only `database_identity` changes with the
+producer build identity; all remaining compared rows match. Solver constraints
+and pop counts remain unchanged. Observed solver-loop times are HDF
+1.243–1.251 s, HiView 26.17–26.25 ms and Camera 69.83–71.26 ms on this host.
+
+**Zero-argument slot and pack-position follow-up — 2026-11-12.** Fixed
+zero-argument callable slots now apply an arity-zero guard, including pointer
+and array storage. Unknown arities and trailing-Unknown signatures retain their
+conservative behavior. Static-member function locations use the shared explicit
+parameter metadata so a lowered receiver slot cannot reject valid zero- or
+one-argument static callbacks. The typed pointer-store regression rejects the
+reported two-argument target for both zero- and one-argument slots and retains
+valid free and static callback stores. The authoritative rules remain in
+[Propagation highlights](ANALYSIS.md#propagation-highlights).
+
+Callable casts, overloaded arrow-star results and bound data-member arguments
+following a pack expansion now use the pack's position. A lowering regression
+checks all three forms and their `pack_vars` membership. Character keywords
+are excluded from unresolved-integer-typedef tolerance while the standard
+integer alias spellings retain it. Class-qualification comments now link to the
+shared lookup policy, including active using-directives in their lookup order.
+
+All 3,053 workspace tests, warnings-as-errors Clippy, formatting and whitespace
+checks pass. Fresh pinned HDF, HiView and Camera runs pass all 165 checks at
+jobs 1 and 8. All global corpus counts remain unchanged from the preceding
+review snapshot, so expectation centers are unchanged. All 139 compared
+relations match between job counts after excluding run metadata as above.
+
+**Field arity, original spelling and CI follow-up — 2026-11-12.**
+Ordinary callable storage and GEP field filtering now share the fixed/open
+arity helper. An empty list means zero arguments; an Unknown tail leaves the
+arity open. The GEP path distinguishes an open callable field from a
+non-callable field, admitting zero-, one- and two-argument values for coarse C
+fields while retaining fixed C++ arity filtering. Direct PAG and end-to-end
+regressions cover these cases. All unevaluated-operand call sites now pass the
+original spelling; a file-scope regression checks the normalized member-binding
+case. CI runs `python3 scripts/test_eval_diagnostic_probes.py`. The declaration
+insertion scan already skips comments and literals; it needs no change here.
+
+Final validation uses `trace 0.1.0 (a7e6163-dirty 2026-11-12)`, built after all
+production changes in this follow-up. The base commit is `a7e6163`; `dirty`
+includes the code changes subsequently amended into this commit. The final
+amend changes only validation documentation, expectation provenance and the
+commit message after that build. These source blob IDs identify the exact
+production edits tested independently of the final commit-message hash:
+
+| Source | Git blob |
+|---|---|
+| `crates/trace-ir/src/types.rs` | `d008d804029a8474c6bcea2ed9e224f1e546ed3d` |
+| `crates/trace-analysis/src/pag.rs` | `1c4c8cf89d0fc50199d911d392d125d5fe0a8810` |
+| `crates/trace-analysis/src/solver.rs` | `e11670d3e4390ca117ab1a2e601560a3c88d659e` |
+| `crates/trace-parse/src/lower.rs` | `eb625b15eab9f2d15cb5c8b627b955beb7d60e9d` |
+
+Release binary SHA-256: `4ca01ab81b9aa2937daf051e3448190244ac98d7243866833ea04c0188c4c76c`.
+
+HDF, HiView and Camera were fetched at their exact pinned revisions and
+reanalyzed at jobs 1 and 8 with the 800,000-pop budget. Every global center in
+those three entries was measured again and equals the table above: HDF
+indirect 5,226, Camera argument-flow 60,961 and Camera diagnostics 5,192 are
+measured values for this production code, not estimates or inherited
+unverified counts. All 165 expectation checks pass for both job counts.
+All 139 compared logical/backing relations match row for row between jobs 1
+and 8, with the run-metadata exclusions described above.
+Other corpus entries, including ability_runtime, retain their prior centers;
+they were not rerun in this follow-up.
+
+The all-features workspace suite and warnings-as-errors Clippy pass, as do
+the Python diagnostic-probe regression, whitespace checks and rustfmt checks
+for the edited Rust sources. An existing test-only local parser probe is left
+outside the amend and does not enter the release artifact.
+
+**Prototype arity, image-scoped callbacks and parser cost follow-up — 2026-11-12.**
+GEP function-value filtering now reads explicit signature metadata for
+prototype-only targets lacking parameter variables. Pack functions retain the
+lowered fixed-prefix-plus-pack count used by the existing comparison. The
+regression checks propagated callable values as well as final call edges, so
+later invocation filtering cannot hide an incorrect GEP admission. Static
+callback re-selection uses the caller's link image through the shared resolver;
+a two-image regression excludes the foreign same-name definition.
+
+Declaration repair now requires a complete leading `template` token, matching
+the normalizer. The documented cost model counts both source scans, candidate
+validation parses and possible full declaration/grouping reparses. The earlier
+4k/16k scaling probe calls the parser entry point on synthetic arithmetic and
+member-binding input: its timings include the triggered recovery scan but do
+not isolate it or measure declaration repair on production headers. This
+follow-up updates the cost model rather than claiming an isolated scan speedup.
+
+Validation uses `trace 0.1.0 (f189b77-dirty 2026-11-12)`, built with all
+production changes in this follow-up. `f189b77` is the base commit; the dirty
+working tree supplies the code subsequently amended into this commit. These
+production source blobs identify that code; the parser blob excludes the
+preserved test-only local scratch probe:
+
+| Source | Git blob |
+|---|---|
+| `crates/trace-analysis/src/solver.rs` | `298308936806254efc2c74af7051c185f4ded583` |
+| `crates/trace-parse/src/lower.rs` | `13e07d4a693cfd008e80680630b65f1dbc27e448` |
+| `crates/trace-parse/src/parse.rs` | `c151546f3f03a6f8317610052fb6401ee04141dd` |
+
+Release binary SHA-256: `59be93068093bb3872a20d3170c97c905892a54bab861e9063092dcd441eff2e`.
+
+The all-features workspace suite, strict all-features Clippy, focused
+prototype/link-image/token-boundary regressions, Python diagnostic-probe test,
+whitespace checks and formatting checks for the amended Rust files pass.
+Fresh pinned HDF, HiView and Camera runs pass all 165 checks at jobs 1 and 8.
+Every global center in those entries was remeasured and is unchanged. All 139
+compared logical/backing relations match between job counts with the run-metadata
+exclusions described above. All other corpus entries are carried forward
+rather than rerun in this follow-up.
+
+**Member-pointer identity, unambiguous class lookup and repair fallback — 2026-11-12.**
+Spelling comparisons retain member-pointer owners and function/data categories:
+only ordinary pointer layers are stripped. Struct- and union-valued member
+pointers stay distinct from other owners and ordinary pointers at every
+spelling tolerance. The valid `take(S C::*)` / `take(S D::*)` regression binds
+the matching declaration instead of another owner's definition.
+
+Class lookup accepts a unique canonical class from active using-directives.
+Repeated aliases of the same class agree, distinct matches remain unresolved,
+and ambiguous qualified names are not retried as a different bare class.
+Template parameters retain their existing unresolved stand-in and pointer/
+reference shape instead of capturing an imported class. Nested template
+arguments retain dependent names too. The GNU typeof alias-shape suite remains
+passing. Function and variable directive lookup policies are unchanged.
+
+Declaration and grouping repairs now retain the preceding tree if an optional
+parse returns None. Test-only failure injection exercises both repair stages;
+the initial parse still reports failure when no base tree is available.
+The existing local scratch parser probe is preserved outside the amend.
+
+Final validation uses `trace 0.1.0 (c4eb27b-dirty 2026-11-12)`, built after
+these production changes. `c4eb27b` is the base; the dirty source is identified
+by the blobs below (parser blob excludes the test-only local scratch probe):
+
+| Source | Git blob |
+|---|---|
+| `crates/trace-ir/src/types.rs` | `3627831f91f71c49270206a404a4cf5d05e6722a` |
+| `crates/trace-ir/src/symbol.rs` | `bdd9b61d531b9939cbff6421bba40f2f41eec726` |
+| `crates/trace-parse/src/lower.rs` | `0d376d6899d021cfdc67f92559409cec83d8286e` |
+| `crates/trace-parse/src/parse.rs` | `318eb154ccedae9deccc962030b332a6344cd3c5` |
+
+Release binary SHA-256: `20b918903b91877ae01c87118759be961542abfb71f22fe1451dc92b66395410`.
+
+The all-features workspace suite, strict all-features Clippy, focused identity/
+lookup/repair regressions, Python diagnostic-probe regression, edited-source
+formatting and whitespace checks pass. Fresh pinned HDF, HiView and Camera
+runs pass all 165 expectation checks at jobs 1 and 8. All 139 compared
+logical/backing relations match across job counts with the run-metadata
+exclusions described above.
+
+HDF and HiView global centers are unchanged. Camera's two external placeholders
+`Ani::Camera::T::SaveCallbackReference` and
+`OHOS::CameraStandard::T::SaveCallbackReference` become the unresolved
+`T::SaveCallbackReference`. Both source calls at line 41 of the Taihe and NAPI
+event-listener headers remain external; this is a dependent-name cleanup,
+not recovery of a defined target. The three affected centers are recaptured
+without widening tolerances:
+
+| Camera metric | Previous center | Measured center |
+|---|---:|---:|
+| Raw functions | 23,540 | 23,539 |
+| Raw external functions | 3,734 | 3,733 |
+| Public functions | 22,694 | 22,693 |
+
+All other global centers and call-edge counts are unchanged. Corpus entries
+other than HDF, HiView and Camera retain their previous measurements and were
+not rerun for this follow-up.
+
+**Global data-member declarator safety and callback retention — 2026-11-12.**
+
+This follow-up to `7d279b8` prevents the lexical member-pointer adaptation from
+erasing an unrecognized member type in `MyT ::C::*`. Without a known keyword
+boundary, the spelling stays untouched and records a parse diagnostic, even
+when tree-sitter accepts it as an expression statement. This is conservative
+recovery, not support for those global-owner typedef/class/template spellings.
+Keyword-delimited global owners and ordinary `MyT C::*` declarations still
+lower normally. The regression covers qualifiers, comments, attributes,
+template parameter lists and access labels; a lowering test verifies the
+reported diagnostic and retention of the surrounding function.
+
+Static callback re-selection retains each original actual if it finds no
+compatible replacement, including distinct values sharing a pack position.
+Standard integer typedef names share one vocabulary between callable lowering
+and member-template comparison. Template arguments admit integral alternatives
+without assuming a target ABI, while preserving pointer layers and excluding
+known floating/class alternatives. An end-to-end member-callback regression
+covers `Box<size_t>` against `Box<unsigned long>`. Solver comments document
+that cast-qualified function locations are allocated lazily and require sparse
+per-location state with explicit missing-entry semantics. The authoritative
+behavior and parser cost model are in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+The tested release analyzer reports `trace 0.1.0 (7d279b8-dirty 2026-11-12)`. The base revision
+is `7d279b8`; these production-source blobs identify the tested changes before
+the amend:
+
+| Source | Git blob |
+|---|---|
+| `crates/trace-ir/src/cpp_type_names.rs` | `e62f3c8577d8b7f88dca184c22fe194df6d815bf` |
+| `crates/trace-ir/src/symbol.rs` | `91c1447a6bfe2c1283141d66fb292f3df5b4c406` |
+| `crates/trace-parse/src/parse.rs` | `af14fb0a4e4ac5386571f05d220102ed7b017f1e` |
+| `crates/trace-parse/src/parse/declaration_macros.rs` | `35172b3d04ae0ef86a456291dee2c3d8f488188f` |
+| `crates/trace-parse/src/lower.rs` | `edb7d945d273fee181ee4fc26dfd4ba9a2405cfe` |
+| `crates/trace-analysis/src/pag.rs` | `7d8ae3f955b5def58aa54383fbedc452afb86dc9` |
+| `crates/trace-analysis/src/solver.rs` | `afa121ae2efda94d274deeeba64e3cf739fd17ed` |
+
+Release binary SHA-256: `4b1e5f93d713ad281f13032e4cd41e14147f08c5cf60455ed990c13a06cec22f`.
+
+All **3066 all-features workspace tests**, strict all-features Clippy, Python
+diagnostic-probe regression, formatting and whitespace checks pass. Fresh runs
+of the pinned HDF, HiView and Camera corpora at jobs 1 and 8 pass all **165
+expectation checks** each. Every global center was remeasured and is unchanged;
+no tolerance was widened. In particular, HDF indirect edges remain 5226 and
+argument-flow rows 72585; Camera argument-flow rows remain 60961, diagnostics
+5192 and raw functions 23539. Other corpora were not rerun and retain their
+earlier measurements.
+
+All **139 compared logical/backing relations** match between jobs 1 and 8,
+using the same run-metadata exclusions as the preceding validation. Comparison
+against the previous `7d279b8` corpus outputs changes only `database_identity`;
+all analysis relations match. These corpus inputs therefore do not exercise a
+behavior-changing instance of this follow-up; the focused regressions validate
+the fixes. Fresh databases, checks and comparison reports are retained under
+`/tmp/trace-257-current-*` for this session.
+
+**Declaration-macro recovery preserves member-pointer repairs — 2026-11-13.**
+
+The `e15c472` follow-up shares virtual declarator insertion and member-pointer
+precedence repair between ordinary parsing and every declaration-macro retry.
+A retry uses the original spelling and the macro-blanked parser input at the
+same offsets. Recovered trees remain outside the incremental syntax cache.
+The parser regression compares the complete repaired node shapes and byte/line
+positions against an equivalent macro-free unit, including a pointer-shaped
+template default. The two-file analysis regression retains overloaded
+`operator->*` edges in ordinary, `FFI_EXPORT` and `DECLARE_SINGLETON` contexts.
+The policy is documented in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+`strat_user::via_using` now has a positive assertion for
+`hdfx::Strategy::run`; the obsolete unresolved fixture comment and vacuous
+negative assertion are removed. Schema documentation distinguishes data-member
+pointer names from member-function-pointer storage layers. Callable refinement
+runs once in `lower_one_declarator`, shared by local types, declaration walks
+and range/catch bindings, instead of repeating parameter lowering for initialized
+locals.
+
+The tested release reports `trace 0.1.0 (e15c472-dirty 2026-11-13)`; `e15c472` is the base.
+These production-source blobs identify the tested changes before the amend:
+
+| Source | Git blob |
+|---|---|
+| `crates/trace-parse/src/parse.rs` | `c03f4f266a055086eb49c92eae935db7c60f25ad` |
+| `crates/trace-parse/src/parse/declaration_macros.rs` | `1b4e65c323080395b306e1646ef4629967bb9f1c` |
+| `crates/trace-parse/src/lower.rs` | `fd13d39ef80d3d358e72ca02006a31c9d1fec6bb` |
+
+Release binary SHA-256: `7e68c47ed5622cdf78b5f532d468f0af8be0cddbd4c6a0b62de3c2a67deb8c9b`.
+
+All **3068 all-features workspace tests**, strict all-features Clippy, the Python
+diagnostic-probe regression, formatting and whitespace checks pass. Fresh pinned
+HDF, HiView and Camera analyses at jobs 1 and 8 pass all **165 expectation
+checks** each. Every global center was remeasured and remains unchanged,
+including HDF indirect 5226 / argument-flow 72585 and Camera argument-flow
+60961 / diagnostics 5192. No tolerances were widened. Other corpora were not
+rerun and retain their earlier measurements.
+
+All **139 compared logical/backing relations** match between job counts,
+with the run-metadata exclusions documented above. Against the preceding
+`e15c472` outputs, HDF and Camera differ only in `database_identity`. HiView's
+variable relations also contain remapped `type_id` values after removing
+duplicate refinement: 17587 variable rows and 329 preimage variable rows change
+only that column. Every old changed type ID consistently maps to one new ID;
+all other variable columns and all graph relations match. The comparison keeps
+these differences visible rather than excluding type IDs. Global centers and
+call edges are unchanged; the focused regression exercises the repaired edge
+that is absent from these corpus inputs. Fresh databases, checks, provenance
+and variable audits are retained under `/tmp/trace-257-macro-*` for this session.
+
+**Member-pointer field arrays and linking shapes — 2026-11-13.**
+
+This `f2b8c93` follow-up retains constant dimensions during the field's full
+declarator walk and adopts that shape without the legacy array re-fold.
+Member-function-pointer fields drop their implicit callable storage-pointer
+layer while retaining explicit pointers and arrays around it. The export
+regression asserts names, sizes and following-field offsets for aliases,
+direct member-function declarators, data-member pointers, explicit pointers,
+multidimensional arrays and pointers to arrays, alongside a plain-array control.
+`Holder { M arr[2]; int y; }` exports `fn_ptr C::*[2]` at offset 0 with size
+16, `y` at offset 16, and class size 24. A field array of three Holders occupies
+72 bytes. Bounds are evaluated once and shared with the ordinary field path;
+legacy reference-declarator handling is preserved. The behavior is defined in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+Compact linking shapes now recurse through member-pointer values when stripping
+tag completions and collecting or restoring guessed-class metadata. Owners and
+function/data categories stay intact. Tests cover incomplete/completed nested
+tags, legacy guess inference, and guessed return/parameter types inside member
+callbacks when a different provider declares the same class name. See
+[Cross-repository callgraph reconstruction](ANALYSIS.md#cross-repository-callgraph-reconstruction-trace-merge).
+
+The tested release reports `trace 0.1.0 (f2b8c93-dirty 2026-11-13)`. The base is `f2b8c93`;
+these production-source blobs identify the tested changes before the amend:
+
+| Source | Git blob |
+|---|---|
+| `crates/trace-parse/src/lower.rs` | `6e3ff0a051181848f34370986329bf225929e587` |
+| `crates/trace-ir/src/linking.rs` | `a5df5e060b888dff9d6889d5910799539c8d59db` |
+| `crates/trace-analysis/src/linking.rs` | `c28782af5e05c20de8652ec362b6d8f6ec8f3b55` |
+
+Release binary SHA-256: `b94b84d047b93de3d764205d5a0612b59d83bcebbc93624f80c5a2b962b4366b`.
+
+All **3071 all-features workspace tests**, strict all-features Clippy, the Python
+diagnostic-probe regression, formatting and whitespace checks pass. Fresh pinned
+HDF, HiView and Camera analyses at jobs 1 and 8 pass all **165 expectation
+checks** each. All **139 compared logical/backing relations** match across job
+counts with the run-metadata exclusions documented above. Comparison against
+the preceding `f2b8c93` outputs changes only `database_identity` in each corpus.
+These inputs therefore retain the preceding review's centers; the focused
+export and linking regressions exercise the fixes.
+
+**Expectation baseline.** PR #257 recaptured its expectation centers relative
+to parent `aa6f846`. The latest review remeasurement is compared with
+`f2b8c93`, which already contains those recaptures. These are distinct baselines:
+
+| Corpus / metric | Parent `aa6f846` | Recaptured PR #257 / latest measured |
+|---|---:|---:|
+| HDF functions | 12198 | 12172 |
+| HDF indirect edges | 5153 | 5226 |
+| HDF argument-flow rows | 72400 | 72585 |
+| HiView functions | 9971 | 9762 |
+| HiView indirect edges | 265 | 266 |
+| HiView argument-flow rows | 32470 | 33789 |
+| Camera functions | 23722 | 23539 |
+| Camera argument-flow rows | 59919 | 60961 |
+| Camera diagnostics | 5251 | 5192 |
+
+Every global center in these three corpus entries was remeasured for this
+follow-up. Existing tolerances were retained. Other corpora were not rerun and
+carry forward their earlier measurements. Fresh databases, checks, source
+provenance, parent-center comparisons and relation reports are retained under
+`/tmp/trace-257-layout-*` for this session.
+
+**Callback retention and located member-pointer warnings — 2026-11-13.**
+
+This `272d56e` follow-up retains an original static callback whenever it admits
+the slot signature, even when target-scoped re-selection returns another
+compatible candidate and omits the original declaration. The existing fallback
+for lookup with no compatible replacement is preserved. The regression uses
+an admitting recovered declaration absent from the resolver's name bucket,
+with target scopes enabled, and asserts that both admitting values survive.
+
+Fallback alternative sites use one receiver-removal policy for variable,
+function, address-of-member and address-of arguments: drop index zero and
+subtract one from the remaining indices. Unrecovered member-pointer spellings
+now retain their byte offsets and produce a distinct
+`member-pointer owner not recovered` warning at the original file and line.
+A clean grammar tree no longer receives the generic syntax-error warning;
+genuine tree errors are diagnosed independently. The regression checks two
+unrecovered declarations on separate lines, their locations, and absence of
+the generic parse-error message. Macro recovery preserves the offset list.
+The authoritative behavior remains in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+The tested release reports `trace 0.1.0 (272d56e-dirty 2026-11-13)`. These production-source blobs
+identify the changes from base `272d56e` before the amend:
+
+| Source | Git blob |
+|---|---|
+| `crates/trace-parse/src/lower.rs` | `fc0f5d2cc33b53b6a1c037fcb22c6917f910010f` |
+| `crates/trace-parse/src/parse.rs` | `490f202851de6bc287464c504c6df5dacf25ab5a` |
+| `crates/trace-parse/src/parse/declaration_macros.rs` | `9c1f1504ced3664099c6c265a4a6e8f83fb0af4e` |
+
+Release binary SHA-256: `f6f3cf7a0c89f8d63b74c2f04af9d5356da7650373083c6f913c14a65c11ead1`.
+
+All **3071 all-features workspace tests**, strict all-features Clippy, the Python
+diagnostic-probe regression, formatting and whitespace checks pass. Fresh pinned
+HDF, HiView and Camera analyses at jobs 1 and 8 pass all **165 expectation
+checks** each. Every global center was remeasured and matches the preceding
+`272d56e` review snapshot; existing tolerances are retained. All **139 compared
+logical/backing relations** match across job counts with the run-metadata
+exclusions documented above. Against the preceding snapshot each corpus changes
+only `database_identity`. These corpus inputs do not exercise the focused
+callback omission or warning cases.
+
+The PR's centers were recaptured relative to parent `aa6f846`, as the preceding
+parent/latest comparison table shows; this follow-up remeasurement uses
+`272d56e` as its baseline. Other corpora were not rerun and carry forward their
+earlier measurements. Session artifacts are under `/tmp/trace-257-retention-*`.
+
+**Pack and dependent-owner callable signatures — 2026-11-13.**
+
+This `c99aaea` follow-up uses `has_pack_param` when comparing a concrete callable
+signature with a callee's recorded explicit parameters. A pack callee requires
+and compares its fixed prefix, while additional callback parameters can bind
+the pack. Non-pack signatures retain exact known arity. Callable type comparison
+also recurses through member-pointer values: unresolved owners such as `T` may
+match `C`, while declared unrelated owners, incompatible member types and
+function/data member categories remain distinct. This tolerance is local to
+callable selection and does not change declaration identity. The authoritative
+policy is in [C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+An integration regression retains call edges for static template instantiations
+with empty, one-argument and multi-argument packs, a fixed-prefix pack, and
+`int T::*` instantiated with `C`. The IR regression checks missing and mismatched
+fixed prefixes, exact non-pack arity, recursive pointer wrappers, distinct known
+owners and template arguments, member types, and member-pointer categories.
+
+The tested release reports `trace 0.1.0 (c99aaea-dirty 2026-11-13)`, built with production changes
+from base `c99aaea`. The tested `crates/trace-ir/src/symbol.rs` blob is
+`9d5d30c01289164ef2934162dba2b319a731360c`. Release binary SHA-256:
+`b5198636291c00e78e0a7023be1a1fed57e35dd72410c1c4b1dee5343de32e02`.
+
+All **3073 all-features workspace tests**, strict all-features Clippy, the Python
+diagnostic-probe regression, formatting and whitespace checks pass. Fresh pinned
+HDF, HiView and Camera analyses at jobs 1 and 8 pass all **165 expectation
+checks** each. Every global center was remeasured and matches the preceding
+`c99aaea` snapshot; existing tolerances were retained. All **139 compared
+logical/backing relations** match across job counts with the run-metadata
+exclusions documented above. Against the preceding snapshot each corpus changes
+only `database_identity`. The focused regressions exercise cases absent from
+these corpus inputs.
+
+PR #257's centers were recaptured relative to parent `aa6f846`, as the earlier
+parent/latest comparison table records. This remeasurement uses `c99aaea` as its
+baseline. Other corpora were not rerun and carry forward their earlier
+measurements. Session artifacts are under `/tmp/trace-257-dependent-*`.
+
+**Loaded callable reinterpretation and inherited data-member owners — 2026-11-13.**
+
+This `7614d77` follow-up materializes a non-address callable cast operand using
+its own type, then copies it into the reinterpretation node. Loads and other
+producers therefore receive cast-qualified function locations before the
+intermediate destination's storage guard runs. Direct function addresses retain
+contextual overload selection. Regressions restore a one-argument callback from
+a zero-argument slot read through a pointer, covering named reinterpretation,
+an inline C-style cast, fields and array elements.
+
+Inferred data-member pointers use the declaring owner from the shared hierarchy
+field result. `auto pm = &D::field` therefore has owner `B` when the field is
+declared in `B`. The regression asserts both inferred types and exact overload
+owners for direct and transitive inheritance, a nearer hidden field, and an
+explicitly converted derived-owner destination. The authoritative rules are in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+The tested release reports `trace 0.1.0 (7614d77-dirty 2026-11-13)`, built with production changes
+from base `7614d77`. The tested `crates/trace-parse/src/lower.rs` blob is
+`c942a6bc62cc759380677f337c3b784b5545cbcb`. Release binary SHA-256:
+`d28e2d26380db9cd3d99973d711051dde026ff348765752ad2adccbce0a60357`.
+
+All **3075 all-features workspace tests**, strict all-features Clippy, the Python
+diagnostic-probe regression, formatting and whitespace checks pass. Fresh pinned
+HDF, HiView and Camera analyses at jobs 1 and 8 pass all **165 expectation
+checks** each. Every global center was remeasured and matches the preceding
+`7614d77` snapshot; existing tolerances were retained. All **139 compared
+logical/backing relations** match across job counts with the run-metadata
+exclusions documented above.
+
+The preceding-snapshot comparison retains the changed flow relations and IDs.
+Materialization adds ordinary operand temporaries and Copy edges, with downstream
+ID/order changes and updated analysis-run graph counts. The raw call
+inventories, compared as multisets of caller, callee, resolution and source
+position/text rather than edge IDs, match. Source-call and named-variable
+inventories also match. HiView differs only in `database_identity`.
+The raw export size changes are:
+
+| Corpus / relation | Previous `7614d77` | Latest measured |
+|---|---:|---:|
+| HDF variables | 137929 | 137938 |
+| HDF flow nodes | 185577 | 185623 |
+| HDF flow edges | 164923 | 164932 |
+| Camera variables | 212786 | 212814 |
+| Camera flow nodes | 232476 | 232504 |
+| Camera flow edges | 173137 | 173165 |
+
+All added flow edges are `copy`: 9 in HDF and 28 in Camera. The audit leaves the
+standard comparison's differences visible; no new exclusion hides these rows.
+PR #257's expectation centers were recaptured relative to parent `aa6f846`, as
+the earlier parent/latest comparison table records. This remeasurement uses
+`7614d77` as its baseline. Other corpora were not rerun and carry forward earlier
+measurements. Session artifacts, including the source-position inventory audit,
+are under `/tmp/trace-257-storage-*`.
+
+**Dependent owners, reference aliases and receiver qualification — 2026-11-13.**
+
+This `3980106` follow-up retains explicit dependency metadata on member-pointer
+owners rooted in active template parameters. A declared class of the same name
+cannot make that owner concrete. The bit survives interning, compact linking
+shapes and serialization; older descriptors default to false and false values
+are omitted. Dependent member-function owner slots remain unknown instead of
+acquiring a concrete namesake class. The regression checks a shadowed global
+`T`, distinct known owners, linking-fact preservation and legacy deserialization.
+Reference-alias function results are normalized to their referents before
+registration, including reference-to-pointer aliases and out-of-class definitions.
+
+Overloaded arrow-star results retain selected return cv and reference category
+in receiver queries. Built-in subscript receivers propagate element constness
+from their array or pointer. Chained-call regressions assert exact final targets
+and exclude the wrong cv/ref alternatives. The authoritative rules are in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+
+The tested release reports `trace 0.1.0 (3980106-dirty 2026-11-13)`, built with production changes
+from base `3980106`. The tested source blobs are:
+
+| Source | Git blob |
+|---|---|
+| `crates/trace-ir/src/types.rs` | `1532353c44d480fabdaf3d148bc4843c530db1d6` |
+| `crates/trace-ir/src/symbol.rs` | `09fded9c2f8a7bee87ebd301d08e131a4c617e21` |
+| `crates/trace-ir/src/linking.rs` | `d1f14ec2d8006756918c2c601a7bb6e4fc136881` |
+| `crates/trace-analysis/src/linking.rs` | `832c5fff6fe9062eea9038b9d1e81db4a6c6bb75` |
+| `crates/trace-parse/src/lower.rs` | `178b6b775506ccf1fe3b01e135381c8795e95fdb` |
+
+Release binary SHA-256: `7170d3ebc92720f99dbd413901b0ddbb88246ddd15a32322ab48a92d95d1af67`.
+
+All **3079 all-features workspace tests**, strict all-features Clippy, the Python
+diagnostic-probe regression, formatting and whitespace checks pass. The new
+compiler differential families pass in strict mode: **18/18** Clang-valid
+arrow-star result cases and **11/11** subscript cases are exact.
+
+The broader differential remains nonzero because of pre-existing receiver
+limitations. To distinguish those from regressions, an isolated offline release
+was built from a `git archive` of parent snapshot `3980106` and both binaries
+were compared on the same 8312 generated / 4469 Clang-valid cases:
+
+| Classification | Parent snapshot | Corrected |
+|---|---:|---:|
+| Exact | 4345 | 4360 |
+| Wrong target | 37 | 22 |
+| Extra targets | 0 | 0 |
+| Untyped / missed | 87 | 87 |
+
+All 15 changed cases improve from wrong to exact. No previously exact case
+regresses, and no new wrong or extra case appears. The same 22 wrong and 87
+missed cases remain (including conditional/comma receivers, const array pointer
+arithmetic and lambda results); the broader run is recorded as a failure rather
+than described as green. The baseline binary SHA-256 is
+`477bc23680c871deb3aef49eb7804cd20144b2f9ac99bb8a3d099b2b1b81d36f`.
+
+Fresh pinned HDF, HiView and Camera analyses at jobs 1 and 8 pass all **165
+expectation checks** each. Every global center was remeasured and matches the
+preceding `3980106` snapshot; existing tolerances were retained. All **139 compared
+logical/backing relations** match across job counts with the standard run-metadata
+exclusions. Against the preceding snapshot HDF and HiView change only
+`database_identity`. Camera also updates five parameter-JSON dictionary values
+for dependent `TSession` member-function pointers: `owner_dependent: true` and
+an unknown implicit owner slot. An audit verifies that these are the only JSON
+changes; graph relations and dictionary IDs are retained.
+
+PR #257's centers were recaptured relative to parent `aa6f846`, as the earlier
+parent/latest table records. Other corpora were not rerun and carry forward
+earlier measurements. Session artifacts are under `/tmp/trace-cv-*`, including
+the isolated baseline, compiler classification audit and metadata audit.
 
 ## Owning-pointer `get()` aliases — 2026-10-31
 

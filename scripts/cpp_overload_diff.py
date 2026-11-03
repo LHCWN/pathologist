@@ -22,7 +22,7 @@ when it also holds others, "wrong" when it holds only others, and "missed" when
 the receiver is left untyped and no edge is recorded. Exit status is 1 when any
 case is wrong or extra; --strict also fails on missed ones (receiver forms the
 analyzer does not type: ternaries, comma and assignment expressions,
-lambda-call results, `C{}`, `d.Base::f()`, subscripts of array parameters).
+lambda-call results, `C{}`, `d.Base::f()`).
 """
 import argparse
 import bisect
@@ -181,6 +181,14 @@ def make_cases(sets):
         def use(expr):
             return SHOW_LINE % expr
 
+        for reference in ["&", "&&", "const &"]:
+            result_type = "const @C@&" if reference == "const &" else "@C@" + reference
+            add("arrow_star_result[%s]" % reference,
+                "struct Proxy@N@ { %s operator->*(int); }; void Run_@N@(Proxy@N@ p) { %s }"
+                % (result_type, use("(p->*0).f(@a@)")))
+        for declaration in ["@C@& p", "const @C@& p"]:
+            add("subscript_result[%s]" % declaration,
+                "void Run_@N@(%s) { %s }" % (declaration, use("(&p)[0].f(@a@)")))
         for p in OBJ_PARAMS:
             for acc in OBJ_ACC:
                 add("param[%s]|%s" % (p, acc),

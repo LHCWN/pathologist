@@ -12,6 +12,8 @@ mod compile_commands_tests;
 mod compile_flags_tests;
 mod complex_cases;
 mod cpp_cases;
+mod cpp_instantiation_member_calls;
+mod cpp_review_257;
 mod cpp_type_syntax;
 mod cpp_visibility_linkage;
 mod cross_tu_tests;
@@ -46,3 +48,8 @@ mod thread_entry;
 mod value_slice;
 mod variadic_packs;
 mod weak_targets;
+
+mod cpp_review_257_followup;
+mod cpp_review_257_opaque;
+mod cpp_review_257_postfix;
+mod cpp_review_257_templates;
