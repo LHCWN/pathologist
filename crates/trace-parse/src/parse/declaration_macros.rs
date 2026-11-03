@@ -17,6 +17,7 @@ struct Candidate {
 /// are validated against the retry's AST before any edit is accepted.
 pub(crate) fn recover_declaration_macros(
     original: ParseResult,
+    spelling: &str,
     line_map: &LineMap,
 ) -> Result<(ParseResult, Vec<DeclarationMacroRecovery>), String> {
     let source = &original.source;
@@ -100,8 +101,12 @@ pub(crate) fn recover_declaration_macros(
             parser.reset();
             tree
         });
-        tree.map(|tree| ParseResult { tree, source })
-            .ok_or_else(|| "tree-sitter returned no tree".to_string())
+        tree.map(|tree| ParseResult {
+            tree: repair_cpp_tree(spelling, &source, tree),
+            source,
+            unadapted_member_pointers: original.unadapted_member_pointers.clone(),
+        })
+        .ok_or_else(|| "tree-sitter returned no tree".to_string())
     };
     let mut parsed = retry(&candidates)?;
     let count = candidates.len();
@@ -272,7 +277,45 @@ mod tests {
 
     fn recover(source: &str) -> (ParseResult, Vec<DeclarationMacroRecovery>) {
         let parsed = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
-        recover_declaration_macros(parsed, &LineMap::new()).unwrap()
+        recover_declaration_macros(parsed, source, &LineMap::new()).unwrap()
+    }
+
+    #[test]
+    fn macro_retries_preserve_declarator_and_grouping_repairs() {
+        let source = "template<class T, et<sizeof(T) == 4, int> ** = nullptr> void f(T);\nstruct W { int operator->*(int); };\nFFI_EXPORT int ov(W w) { return 1 + w->*0; }\nclass Factory { DECLARE_SINGLETON(Factory) public: void after(); };\n";
+        let (parsed, reports) = recover(source);
+        assert_eq!(reports.len(), 2);
+        assert!(
+            !parsed.has_errors(),
+            "{}",
+            parsed.tree.root_node().to_sexp()
+        );
+        let expected = source
+            .replace("FFI_EXPORT", &" ".repeat("FFI_EXPORT".len()))
+            .replace(
+                "DECLARE_SINGLETON(Factory)",
+                &" ".repeat("DECLARE_SINGLETON(Factory)".len()),
+            );
+        let expected = parse_source_with_lang(expected, SourceLang::Cpp).unwrap();
+        assert_eq!(
+            parsed.tree.root_node().to_sexp(),
+            expected.tree.root_node().to_sexp()
+        );
+        let nodes = |tree: &Tree| {
+            let mut pending = vec![tree.root_node()];
+            let mut result = Vec::new();
+            while let Some(node) = pending.pop() {
+                result.push((
+                    node.kind().to_owned(),
+                    node.byte_range(),
+                    node.start_position(),
+                    node.end_position(),
+                ));
+                pending.extend(node.children(&mut node.walk()));
+            }
+            result
+        };
+        assert_eq!(nodes(&parsed.tree), nodes(&expected.tree));
     }
 
     #[test]
@@ -407,8 +450,9 @@ mod tests {
         for _ in 0..2 {
             let pre = trace_preproc::preprocess_file(&main, &opts).unwrap();
             assert!(!cache.read().unwrap().is_empty());
-            let parsed = parse_source_with_lang(pre.output, SourceLang::Cpp).unwrap();
-            let (parsed, reports) = recover_declaration_macros(parsed, &pre.line_map).unwrap();
+            let parsed = parse_source_with_lang(pre.output.as_str(), SourceLang::Cpp).unwrap();
+            let (parsed, reports) =
+                recover_declaration_macros(parsed, &pre.output, &pre.line_map).unwrap();
             assert!(!has_parse_errors(&parsed.tree));
             let positions: Vec<_> = reports
                 .iter()

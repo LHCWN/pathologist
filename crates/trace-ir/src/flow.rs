@@ -57,7 +57,8 @@ pub enum FlowConstraint {
         caller: Option<FnId>,
     },
     /// Return from an exact, already-resolved function (not name-only lookup).
-    /// Used after merge when a file-scope initializer has no CallSite.
+    /// Used for selected free operators and after merge when a file-scope
+    /// initializer has no CallSite.
     CallReturnResolved { dst: VarId, callee: FnId },
     /// Address of a reference returned by a direct file-scope getter.
     /// Resolved after merge in the destination's file and link target.

@@ -406,7 +406,6 @@ fn cpp_auto_return_types_match_explicit_receivers() {
         "placeholder_scalar",
         "Mixin::through_this",
         "Mixin::implicit",
-        "strat_user::via_using",
     ] {
         assert!(members(caller).is_empty(), "{caller} must stay unresolved");
         for guess in [
@@ -459,6 +458,7 @@ fn cpp_auto_return_types_match_explicit_receivers() {
     );
     for (caller, callee) in [
         ("shared_template", "Box::run"),
+        ("strat_user::via_using", "hdfx::Strategy::run"),
         ("ui::construct_local", "ui::Gadget::run"),
         ("inherited_nested", "NodeBase::Node::run"),
         ("new_qualified", "qual::Maker::run"),
@@ -471,7 +471,6 @@ fn cpp_auto_return_types_match_explicit_receivers() {
         );
     }
     for (caller, callee) in [
-        ("strat_user::via_using", "Strategy::run"),
         ("ui::construct_local", "Other::run"),
         ("inherited_nested", "Node::run"),
     ] {
@@ -3750,12 +3749,8 @@ fn conversion_operator_returns_the_type_it_converts_to() {
             .clone()
     };
     assert_eq!(ret("Handle::operator bool"), trace_ir::TypeDesc::Bool);
-    // The prototype's return type wins the merge, so it is the prototype that
-    // has to carry a real one. A plain method's in-class declaration does
-    // (#64 reads it there, which is what lets `operator->` be followed), but a
-    // conversion operator's does not: it has no `type` node, the converted-to
-    // type sitting inside the `operator_cast` instead. Declared in the class
-    // and defined out of line, it therefore still keeps the placeholder.
+    // A conversion prototype reads its target from operator_cast too, so
+    // merging an out-of-line definition retains the same real return type.
     let split = defined_return_types(
         "conv_op_ret_split",
         "struct Payload { int v; };\n\
@@ -3769,11 +3764,10 @@ fn conversion_operator_returns_the_type_it_converts_to() {
             ("Split::Plain".to_string(), trace_ir::TypeDesc::Int),
             (
                 "Split::operator Payload*".to_string(),
-                trace_ir::TypeDesc::Void
+                ret("Handle::operator Payload*")
             ),
         ],
-        "a plain member prototype carries its return type; a conversion \
-         operator's does not, and the merge keeps the placeholder"
+        "ordinary and conversion prototypes both retain their declared return type"
     );
 
     // A reference lowers as a pointer here, as it does everywhere else.
@@ -9169,6 +9163,11 @@ void first(void) { table[0] = &cp; (*table[0])->cb(); }
 void second(void) { table[0] = &cp; (**table[0]).cb(); }
 void (*functions[1])(void) = {alpha};
 void read(void) { void (*raw)(void) = *functions[0]; }
+typedef void (*Fn)(void); Fn callback = alpha; Fn *slots[1];
+Fn take(void) { return *slots[0]; }
+void put(Fn *out) { *out = *slots[0]; }
+void returned(void) { slots[0] = &callback; Fn cb = take(); cb(); }
+void stored(void) { slots[0] = &callback; Fn cb; put(&cb); cb(); }
 "#;
         let (_dir, p) = build_tree(&[(file, source)], default_opts);
         assert!(p.diagnostics.is_empty(), "{file}: {:?}", p.diagnostics);
@@ -9181,6 +9180,9 @@ void read(void) { void (*raw)(void) = *functions[0]; }
         );
         assert!(has_any_edge(&p, &a, "first", "alpha"), "{file}: first");
         assert!(has_any_edge(&p, &a, "second", "alpha"), "{file}: second");
+        for caller in ["returned", "stored"] {
+            assert!(has_any_edge(&p, &a, caller, "alpha"), "{file}: {caller}");
+        }
         let raw = common::local_variable(&p, "read", "raw");
         let targets: Vec<_> = a.points_to[&pag.var_node[&raw]]
             .iter()
@@ -14566,16 +14568,14 @@ fn deref_store_resolves_offsets_before_evaluating_the_value() {
 /// `return *(int **)p` have no operand value to compute, so they emit
 /// nothing, as master did: no fact through the root one level short.
 #[test]
-fn deref_value_of_no_computable_operand_emits_nothing() {
+fn deref_value_of_no_computable_cast_emits_nothing() {
     let (program, _) = deref_member_reads();
-    for func in ["return_elem", "store_elem", "return_cast"] {
-        let facts: Vec<_> = flows_in(program, func).collect();
-        assert!(facts.is_empty(), "{func}: {facts:?}");
-        let returns = program
-            .fn_returns
-            .get(&common::only_function(program, func));
-        assert!(returns.is_none_or(|r| r.is_empty()), "{func}: {returns:?}");
-    }
+    let facts: Vec<_> = flows_in(program, "return_cast").collect();
+    assert!(facts.is_empty(), "{facts:?}");
+    let returns = program
+        .fn_returns
+        .get(&common::only_function(program, "return_cast"));
+    assert!(returns.is_none_or(|r| r.is_empty()), "{returns:?}");
 }
 
 /// Issue #151: `return *cpp_g_hp` from a function returning a

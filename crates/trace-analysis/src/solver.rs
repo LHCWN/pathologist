@@ -263,8 +263,10 @@ struct SolverState {
     epoll_waiting: IndexSet<PagNodeId, FxBuildHasher>,
     /// Signature-aware propagation guards (see `SlotGuard`).
     slot_guard: FxHashMap<LocId, SlotGuard>,
-    /// Parameter count per function location (only when > 0; old-style `()`
-    /// declarations stay unfiltered).
+    /// Parameter count per function location when parameter variables exist;
+    /// static members use their explicit count. Unrecorded arities stay open,
+    /// including cast-qualified locations allocated by Pag::reinterpret_location
+    /// during propagation. Per-location tables must tolerate these lazy additions.
     fn_arity: FxHashMap<LocId, usize>,
     /// Last-seen `memory_pts[loc]` size per destination and cell, used to
     /// skip redundant merge iterations when memory hasn't grown. Keyed by
@@ -530,6 +532,8 @@ fn write_memory(
 /// checker keep two steps from sharing one buffer.
 #[derive(Default)]
 struct Scratch {
+    /// Cast-qualified locations in the source delta's propagation order.
+    reinterpret_values: Vec<LocId>,
     /// `apply_store_to_targets`: the store's source set, materialized once.
     store_src: Vec<LocId>,
     /// `in_set_order`: a popped node's new locations, as a set.
@@ -943,8 +947,20 @@ fn solve(
         let f = program.symbols.function(fn_id);
         // A pack function takes any number from its fixed parameters on: its
         // arity is unknown here, which every slot admits.
-        if !f.params.is_empty() && !f.has_pack_param {
-            st.fn_arity.insert(loc, f.params.len());
+        if !f.params.is_empty() && f.pack_positions.is_empty() {
+            // Static members can retain a lowered receiver slot. Their
+            // ordinary callable signature counts only explicit parameters.
+            let arity = if f.is_static_member {
+                program
+                    .symbols
+                    .explicit_params(f)
+                    .map(|params| params.len())
+            } else {
+                Some(f.params.len())
+            };
+            if let Some(arity) = arity {
+                st.fn_arity.insert(loc, arity);
+            }
         }
     }
 
@@ -1227,12 +1243,39 @@ fn solve(
             continue;
         }
         sync_var_to_cell(pag, &mut st, &mut scratch.holders, node, &delta);
-
         if let Some(idxs) = pag.indices.copy_src.get(&node) {
-            for &idx in idxs {
-                let dst = pag.constraints[idx].dst;
-                w_copy += delta.len() as u64;
-                propagate_locs(&mut st, &mut scratch.fresh, dst, delta.iter().copied());
+            if !pag.reinterpret_nodes.is_empty()
+                && idxs
+                    .iter()
+                    .any(|&idx| pag.reinterpret_nodes.contains(&pag.constraints[idx].dst))
+            {
+                // Reinterpretation can allocate locations, but does not change
+                // copy indices. Reborrow each entry so no per-step clone is needed.
+                for position in 0..idxs.len() {
+                    let idx = pag.indices.copy_src[&node][position];
+                    let dst = pag.constraints[idx].dst;
+                    w_copy += delta.len() as u64;
+                    if pag.reinterpret_nodes.contains(&dst) {
+                        scratch.reinterpret_values.clear();
+                        scratch
+                            .reinterpret_values
+                            .extend(delta.iter().map(|&loc| pag.reinterpret_location(loc)));
+                        propagate_locs(
+                            &mut st,
+                            &mut scratch.fresh,
+                            dst,
+                            scratch.reinterpret_values.iter().copied(),
+                        );
+                    } else {
+                        propagate_locs(&mut st, &mut scratch.fresh, dst, delta.iter().copied());
+                    }
+                }
+            } else {
+                for &idx in idxs {
+                    let dst = pag.constraints[idx].dst;
+                    w_copy += delta.len() as u64;
+                    propagate_locs(&mut st, &mut scratch.fresh, dst, delta.iter().copied());
+                }
             }
         }
 
@@ -1376,8 +1419,8 @@ fn solve(
                     // `ArrayFnMember` table initializers (flow through element
                     // accesses unchanged) or via opaque/wrong-type parameter
                     // flow. Table members always pass; other fn values pass
-                    // only when their declared arity matches the field slot's
-                    // signature — otherwise a stray callback rides every
+                    // only for a callable field: open signatures admit any
+                    // arity, fixed signatures must match. Otherwise a stray callback rides every
                     // field access of whatever pointer it polluted.
                     if let Some(fn_id) = fn_for_loc(pag, loc) {
                         let mut passed = false;
@@ -1393,21 +1436,39 @@ fn solve(
                             }
                         }
                         // Non-table function values ride a field access only
-                        // when the destination slot's declared signature
-                        // matches; anything else is wrong-type flow that must
+                        // when the destination slot's fixed/open signature
+                        // admits them; anything else is wrong-type flow that must
                         // not surface as an indirect-call target.
                         if !passed {
                             let callee = program.symbols.function(fn_id);
-                            let n = callee.params.len();
-                            let slot = pag.field_slot_arity(program, loc, effective_field);
-                            // A pack function takes a slot of the parameters
-                            // it declares before the pack, or more.
-                            let fits = if callee.has_pack_param {
-                                slot.is_some_and(|slot| slot + 1 >= n)
-                            } else {
-                                slot == Some(n)
-                            };
-                            if n > 0 && fits {
+                            let n = st.fn_arity.get(&loc).copied().unwrap_or_else(|| {
+                                if !callee.pack_positions.is_empty() {
+                                    // Packs occupy lowered slots; the comparison
+                                    // below excludes all of them.
+                                    callee.params.len()
+                                } else {
+                                    program
+                                        .symbols
+                                        .explicit_params(callee)
+                                        .map_or(callee.params.len(), |params| params.len())
+                                }
+                            });
+                            let fits = pag
+                                .field_slot_type(program, loc, effective_field)
+                                .is_some_and(|desc| {
+                                    if !matches!(desc, trace_ir::TypeDesc::FnPtr { .. }) {
+                                        return false;
+                                    }
+                                    desc.fixed_fn_ptr_arity().is_none_or(|slot| {
+                                        // A pack function accepts its fixed prefix or more.
+                                        if !callee.pack_positions.is_empty() {
+                                            slot + callee.pack_positions.len() >= n
+                                        } else {
+                                            slot == n
+                                        }
+                                    })
+                                });
+                            if fits {
                                 add_pts(&mut st, dst, loc);
                             }
                         }
@@ -1491,16 +1552,40 @@ fn solve(
             for cs_id in call_sites {
                 let cs = program
                     .symbols
-                    .call_sites
-                    .get(cs_id.0 as usize)
-                    .filter(|c| c.id == cs_id)
+                    .call_site_by_id(cs_id)
                     .expect("call site id in index");
                 let mut new_callees = Vec::new();
                 // Loop-invariant: this is the solver's indirect-call fixpoint.
                 let caller_target = program.symbols.function(cs.caller).target;
                 for &loc in delta.iter() {
                     if let Some(fn_id) = fn_for_loc(pag, loc) {
-                        new_callees.extend(reached_definitions(program, fn_id, caller_target));
+                        if cs.args_bound_past_this {
+                            new_callees.extend(member_pointer_targets(
+                                program,
+                                cs,
+                                fn_id,
+                                pag.is_reinterpreted_location(loc),
+                            ));
+                        } else {
+                            if pag.is_reinterpreted_location(loc)
+                                && cs.callee_var.is_some_and(|var| {
+                                    let desc = program
+                                        .types
+                                        .get(program.symbols.variable(var).type_id)
+                                        .desc
+                                        .as_ref();
+                                    !program.symbols.reinterpreted_callable_signature_admits(
+                                        fn_id,
+                                        desc,
+                                        &program.types,
+                                        false,
+                                    )
+                                })
+                            {
+                                continue;
+                            }
+                            new_callees.extend(reached_definitions(program, fn_id, caller_target));
+                        }
                     }
                 }
                 let prev = resolved_indirect.entry(cs_id).or_default();
@@ -1527,7 +1612,11 @@ fn solve(
                         // value reaches the assignment LHS (e.g.
                         // `sbuf->impl = constructor->obtain(capacity)`).
                         if let Some(callee_var) = cs.callee_var {
-                            let dst_nodes = pag.indirect_return_dst.get(&callee_var).cloned();
+                            let dst_nodes = if cs.args_bound_past_this {
+                                cs.return_dst.map(|dst| vec![pag.var_node_id(dst)])
+                            } else {
+                                pag.indirect_return_dst.get(&callee_var).cloned()
+                            };
                             if let Some(dst_nodes) = dst_nodes {
                                 for dst_n in dst_nodes {
                                     let constraint_before = pag.constraints.len();
@@ -2215,6 +2304,9 @@ fn slot_guard_for(program: &Program, cell_type: trace_ir::TypeId) -> Option<Slot
 fn slot_guard_of(desc: &trace_ir::TypeDesc) -> Option<SlotGuard> {
     use trace_ir::TypeDesc as TD;
     let desc = match desc {
+        // Pointer layers around a member pointer are storage, not callable
+        // arity guards. Direct member pointers are handled below, arrays recurse.
+        TD::Ptr(inner) if inner.member_pointer().is_some() => return None,
         // A fn-pointer *variable* lowers as `Ptr(FnPtr)`, a field as bare
         // `FnPtr`; both are fn-pointer slots (docs/POINTERS.md, "Variable
         // cells").
@@ -2229,7 +2321,10 @@ fn slot_guard_of(desc: &trace_ir::TypeDesc) -> Option<SlotGuard> {
         desc => desc,
     };
     match desc {
-        TD::FnPtr { params, .. } if !params.is_empty() => Some(SlotGuard::FnParams(params.len())),
+        TD::MemberPointer { .. } => None,
+        // A trailing Unknown or Ellipsis denotes an open callable signature, not
+        // a fixed parameter count. Retain its values through storage.
+        TD::FnPtr { .. } => desc.fixed_fn_ptr_arity().map(SlotGuard::FnParams),
         TD::Void
         | TD::Char
         | TD::Bool
@@ -2241,7 +2336,7 @@ fn slot_guard_of(desc: &trace_ir::TypeDesc) -> Option<SlotGuard> {
         | TD::Double
         | TD::SizeT
         | TD::Unknown
-        | TD::FnPtr { .. } => None,
+        | TD::Ellipsis => None,
         TD::Struct { .. } | TD::Union { .. } | TD::Ptr(_) | TD::Array { .. } => {
             Some(SlotGuard::NotFnPtr)
         }
@@ -2431,6 +2526,13 @@ fn sync_cell_to_var(pag: &Pag, st: &mut SolverState, fresh: &mut Vec<LocId>, cel
     }
 }
 
+/// Whether the pointer erases its pointee type. Unlike sized scalar buffers,
+/// a void pointer can carry a callback slot's address through later copies.
+fn var_is_opaque_pointer(program: &Program, var: VarId) -> bool {
+    matches!(program.types.get(program.symbols.variable(var).type_id).desc.as_ref(),
+        trace_ir::TypeDesc::Ptr(inner) if matches!(inner.as_ref(), trace_ir::TypeDesc::Void))
+}
+
 /// Only parameters whose pointees can influence call-target resolution get
 /// persistent interprocedural copy constraints: function pointers directly,
 /// opaque/unknown pointees that may hide them, and aggregates (op tables,
@@ -2445,15 +2547,19 @@ fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
     };
     let desc = program.types.get(v.type_id).desc.as_ref();
     let holds = match desc {
-        TD::FnPtr { .. } => true,
+        TD::FnPtr { .. } | TD::MemberPointer { .. } => true,
         // A pointer to a fn-pointer slot (`cb_t *out`, a table row) reaches
         // callbacks through its pointee just as a struct pointer does.
         TD::Ptr(inner) => match inner.as_ref() {
-            TD::FnPtr { .. } | TD::Unknown | TD::Struct { .. } | TD::Union { .. } => true,
-            // Reference addresses can add further pointer layers before the
-            // callback cell. Their values may arrive through a return copy
-            // after initial argument wiring, so retain the persistent edge.
-            TD::Ptr(_) => matches!(inner.innermost().0, TD::FnPtr { .. }),
+            TD::FnPtr { .. }
+            | TD::MemberPointer { .. }
+            | TD::Unknown
+            | TD::Struct { .. }
+            | TD::Union { .. } => true,
+            TD::Ptr(_) => matches!(
+                inner.innermost().0,
+                TD::FnPtr { .. } | TD::MemberPointer { .. }
+            ),
             _ => false,
         },
         // Pointer-flagged variable whose recorded shape is not a pointer: a
@@ -2544,10 +2650,24 @@ fn wire_actuals(
     mut on_wired: impl FnMut(&mut SolverState, u32, u32),
 ) {
     let callee_fn = program.symbols.function(callee);
-    let packs = callee_fn.variadic && !program.pack_vars.is_empty();
+    let this = u32::from(program.symbols.has_this_param(callee));
+    callee_fn.debug_assert_pack_positions(this as usize);
+    let mut packs = callee_fn
+        .pack_positions
+        .iter()
+        .map(|at| at + this)
+        .peekable();
+    let mut packs_before = 0;
     for (i, formal) in callee_fn.params.iter().enumerate() {
         let formal_idx = i as u32;
-        if packs && program.pack_vars.contains(formal) {
+        let is_pack = packs.next_if_eq(&formal_idx).is_some();
+        debug_assert_eq!(
+            is_pack,
+            program.pack_vars.contains(formal),
+            "{}: parameter pack metadata disagrees with formal {formal_idx}",
+            callee_fn.name
+        );
+        if is_pack || packs_before > 0 {
             // A pack formal takes every argument from its position on: the
             // positions the site passes, mapped as the callee takes them,
             // each wired once however many positions an expansion covers.
@@ -2556,7 +2676,10 @@ fn wire_actuals(
                 .max()
                 .map_or(1, |last| last + 1);
             let mut taken: Vec<u32> = Vec::new();
-            for slot in formal_idx..formal_idx.saturating_add(reach) {
+            // Earlier packs may all be empty. Omit each of their synthetic
+            // slots to find this formal's first possible actual position.
+            let first = formal_idx - packs_before;
+            for slot in first..first.saturating_add(reach) {
                 let Some(idx) = actual_of(slot) else {
                     continue;
                 };
@@ -2598,6 +2721,7 @@ fn wire_actuals(
                 &mut on_wired,
             );
         }
+        packs_before += u32::from(is_pack);
     }
 }
 
@@ -2626,10 +2750,13 @@ fn wire_one(
         // here loses interprocedural flow (observed as missed indirect
         // targets passed through parameters). Scalars cannot contribute
         // pointees and are skipped to bound constraint volume.
-        if var_may_hold_pointee(program, actual)
-            && var_may_hold_pointee(program, formal)
-            && st.wired_copies.insert((actual_node, formal_node))
-        {
+        let actual_pointee = var_may_hold_pointee(program, actual);
+        let formal_pointee = var_may_hold_pointee(program, formal);
+        // Erasure can hide a callback slot or aggregate, but a known scalar
+        // buffer on either side still cannot carry callable contents.
+        let carries_pointee = (actual_pointee || var_is_opaque_pointer(program, actual))
+            && (formal_pointee || var_is_opaque_pointer(program, formal));
+        if carries_pointee && st.wired_copies.insert((actual_node, formal_node)) {
             ensure_param_copy(pag, st, actual_node, formal_node);
         }
         if let Some(actual_pts) = st.pts.get(&actual_node) {
@@ -3149,6 +3276,16 @@ fn callback_edges<'m>(
     (edges, invocations)
 }
 
+/// A points-to function value may be invoked only in the caller's link image.
+/// Unlike a spelled direct call, a foreign value must not rebind by name.
+fn indirect_target_in_image(
+    program: &Program,
+    fn_id: FnId,
+    caller_target: Option<TargetId>,
+) -> bool {
+    !program.symbols.has_target_scopes() || program.symbols.function(fn_id).target == caller_target
+}
+
 /// The functions an indirect call from a caller in `caller_target` reaches
 /// through `fn_id`: nothing when link images are in play and the function is
 /// in another one; else, when it is a declaration (a weak forward declaration,
@@ -3160,8 +3297,7 @@ fn reached_definitions(
     caller_target: Option<TargetId>,
 ) -> Vec<FnId> {
     let callee = program.symbols.function(fn_id);
-    let scoped = program.symbols.has_target_scopes();
-    if scoped && callee.target != caller_target {
+    if !indirect_target_in_image(program, fn_id, caller_target) {
         return Vec::new();
     }
     let mut reached = Vec::new();
@@ -3180,6 +3316,80 @@ fn reached_definitions(
     }
     reached.push(fn_id);
     reached
+}
+
+/// A member-function value and its actual object enter ordinary indirect
+/// handling together. Bind the value through the shared call resolver before
+/// expanding the same virtual alternatives used for a spelled member call.
+fn member_pointer_targets(
+    program: &Program,
+    cs: &trace_ir::CallSite,
+    fid: FnId,
+    reinterpreted: bool,
+) -> Vec<FnId> {
+    let f = program.symbols.function(fid);
+    if f.is_defined
+        && !indirect_target_in_image(program, fid, program.symbols.function(cs.caller).target)
+    {
+        return Vec::new();
+    }
+    if !f.is_cpp
+        || f.is_static_member
+        || !(f.declared_in_class || program.symbols.has_this_param(fid))
+    {
+        return Vec::new();
+    }
+    let Some((owner, _)) = trace_ir::MethodKind::of_function(&f.name) else {
+        return Vec::new();
+    };
+    if cs.receiver_class.as_deref().is_some_and(|receiver| {
+        program.types.declares_class(receiver)
+            && program.types.declares_class(&owner)
+            && receiver != owner
+            && !program.derives_from(receiver, &owner)
+            // An explicitly converted D::* value may have type B::* and
+            // run through B* when its actual object is a D.
+            && !program.derives_from(&owner, receiver)
+    }) {
+        return Vec::new();
+    }
+    if let Some(var) = cs.callee_var {
+        let desc = program
+            .types
+            .get(program.symbols.variable(var).type_id)
+            .desc
+            .as_ref();
+        let admitted = if reinterpreted {
+            program.reinterpreted_member_pointer_signature_admits(fid, desc)
+        } else {
+            program.member_pointer_signature_admits(
+                fid,
+                desc,
+                program.reference_returns.contains(&fid),
+            )
+        };
+        if !admitted {
+            return Vec::new();
+        }
+    }
+
+    let mut bound = cs.clone();
+    bound.callee_fn_id = Some(fid);
+    bound.callee_name = f.name.clone().into();
+    bound.callee_var = None;
+    // A defined points-to target already has its address-taking TU's identity.
+    // Only declarations need the shared resolver to find matching definitions.
+    bound.is_direct = !f.is_defined;
+    let mut targets = Vec::new();
+    for target in program.callees_of(&bound) {
+        let dispatched = program.virtual_call_targets(&bound, target);
+        if dispatched.is_empty() {
+            targets.push(target);
+        } else {
+            targets.extend(dispatched);
+        }
+    }
+    targets
 }
 
 fn fn_for_loc(pag: &Pag, loc: LocId) -> Option<FnId> {
@@ -3587,6 +3797,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ordinary_class_pointer_callback_keeps_its_arity_guard() {
+        use trace_ir::TypeDesc as TD;
+        let callable = TD::FnPtr {
+            ret: Box::new(TD::Void),
+            params: vec![
+                TD::Ptr(Box::new(TD::Struct {
+                    name: "Ctx".into(),
+                    fields: Vec::new(),
+                })),
+                TD::Int,
+            ],
+        };
+        assert!(matches!(
+            slot_guard_of(&callable),
+            Some(SlotGuard::FnParams(2))
+        ));
+        assert!(matches!(
+            slot_guard_of(&TD::Ptr(Box::new(callable.clone()))),
+            Some(SlotGuard::FnParams(2))
+        ));
+        let member = TD::MemberPointer {
+            qualifiers: None,
+            owner_dependent: false,
+            owner: "Ctx".into(),
+            is_function: true,
+            member: Box::new(callable),
+        };
+        assert!(slot_guard_of(&member).is_none());
+    }
+
+    #[test]
+    fn zero_argument_callback_slots_guard_known_arities() {
+        use trace_ir::TypeDesc as TD;
+        let callable = TD::FnPtr {
+            ret: Box::new(TD::Void),
+            params: Vec::new(),
+        };
+        let pointer = TD::Ptr(Box::new(callable.clone()));
+        let array = TD::Array {
+            elem: Box::new(pointer.clone()),
+            size: Some(2),
+        };
+        let (_, arities, _) = store_fixture();
+        for desc in [callable, pointer, array] {
+            let guard = slot_guard_of(&desc);
+            assert!(matches!(guard, Some(SlotGuard::FnParams(0))));
+            let filter = FnFilter::of(guard.as_ref());
+            assert!(!filter.guard_admits(&arities, LocId(0)));
+            assert!(!filter.guard_admits(&arities, LocId(1)));
+            assert!(
+                filter.guard_admits(&arities, LocId(2)),
+                "unknown arity remains conservative"
+            );
+        }
+    }
+
+    #[test]
+    fn variadic_callback_slots_have_no_fixed_arity_guard() {
+        use trace_ir::TypeDesc as TD;
+        for params in [vec![TD::Unknown], vec![TD::Int, TD::Int, TD::Unknown]] {
+            let callable = TD::FnPtr {
+                ret: Box::new(TD::Void),
+                params,
+            };
+            assert!(slot_guard_of(&callable).is_none());
+            let pointer = TD::Ptr(Box::new(callable));
+            assert!(slot_guard_of(&pointer).is_none());
+            let array = TD::Array {
+                elem: Box::new(pointer),
+                size: Some(2),
+            };
+            assert!(slot_guard_of(&array).is_none());
+        }
+        let fixed = TD::FnPtr {
+            ret: Box::new(TD::Void),
+            params: vec![TD::Int, TD::Int],
+        };
+        assert!(matches!(
+            slot_guard_of(&fixed),
+            Some(SlotGuard::FnParams(2))
+        ));
+    }
+
     /// Every `SlotGuard` maps to the filter that reproduces it, so the guard
     /// rule has one implementation rather than one per call site.
     #[test]
@@ -3944,7 +4238,7 @@ mod tests {
                 reference_params: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
-                has_pack_param: false,
+                pack_positions: Vec::new(),
                 defaulted_in_class: false,
                 declared_in_class: false,
                 is_member_template: false,

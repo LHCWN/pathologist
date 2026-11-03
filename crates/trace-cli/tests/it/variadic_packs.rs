@@ -10,6 +10,218 @@ use trace_ir::Program;
 
 analyzed_fixture!(cpp_variadic_packs);
 
+#[test]
+fn every_declared_pack_receives_all_of_its_possible_arguments() {
+    for (body, call, expected) in [
+        (
+            "(a(), ...);",
+            "invoke<F, F>(alpha, beta, gamma);",
+            &["alpha", "beta"][..],
+        ),
+        (
+            "(b(), ...);",
+            "invoke(alpha, beta);",
+            &["alpha", "beta"][..],
+        ),
+        ("(a(), ...); (b(), ...);", "invoke();", &[][..]),
+    ] {
+        let source = format!(
+            r#"
+using F = void (*)();
+void alpha() {{}}
+void beta() {{}}
+void gamma() {{}}
+template<class... A, class... B> void invoke(A... a, B... b) {{ {body} }}
+void caller() {{ {call} }}
+"#
+        );
+        let (p, a) = analyze_source(&[("main.cpp", &source)]);
+        assert!(p.diagnostics.is_empty(), "{call}: {:?}", p.diagnostics);
+        let invoke = only_function(&p, "invoke");
+        let caller = only_function(&p, "caller");
+        assert!(p.symbols.function(invoke).is_defined);
+        assert!(
+            a.call_edges
+                .iter()
+                .any(|edge| edge.caller == caller && edge.callee == invoke),
+            "{call}"
+        );
+        for target in expected {
+            assert!(indirect(&p, &a, "invoke", target), "{call}: {target}");
+        }
+    }
+}
+
+#[test]
+fn multiple_packs_preserve_fixed_parameters_and_member_signatures() {
+    for (declaration, definition, call, owner) in [
+        (
+            "",
+            "template<class... A, class... B> void invoke(F head, A... a, B... b, F tail) { head(); (a(), ...); tail(); }",
+            "invoke<F, F>(head, alpha, beta, tail);",
+            "invoke",
+        ),
+        (
+            "struct C { template<class... A, class... B> void invoke(F head, A... a, B... b, F tail); };",
+            "template<class... A, class... B> void C::invoke(F head, A... a, B... b, F tail) { head(); (a(), ...); tail(); }",
+            "C c; c.invoke<F, F>(head, alpha, beta, tail);",
+            "C::invoke",
+        ),
+    ] {
+        let source = format!(
+            r#"
+using F = void (*)();
+void head() {{}}
+void alpha() {{}}
+void beta() {{}}
+void tail() {{}}
+{declaration}
+{definition}
+void caller() {{ {call} }}
+"#
+        );
+        let (p, a) = analyze_source(&[("main.cpp", &source)]);
+        assert!(p.diagnostics.is_empty(), "{call}: {:?}", p.diagnostics);
+        for target in ["head", "alpha", "beta", "tail"] {
+            assert!(indirect(&p, &a, owner, target), "{call}: {target}");
+        }
+        let function = p.symbols.function(only_function(&p, owner));
+        let params = p.symbols.explicit_params(function).unwrap();
+        assert_eq!(params.len(), 2);
+        for i in 0..params.len() {
+            assert!(matches!(
+                p.types.get(params.get(i).unwrap()).desc.innermost().0,
+                trace_ir::TypeDesc::FnPtr { .. }
+            ));
+        }
+        let this = u32::from(p.symbols.has_this_param(function.id));
+        assert_eq!(arrivals(&p, &a, owner, "head"), [this]);
+        assert!(!arrivals(&p, &a, owner, "tail").contains(&this));
+    }
+}
+
+#[test]
+fn a_fixed_callback_after_a_pack_receives_empty_and_nonempty_pack_arguments() {
+    for call in [
+        "run(target);",
+        "run<int>(1, target);",
+        "F value = target; run(value);",
+        "F value = target; run<int>(1, value);",
+    ] {
+        let source = format!(
+            r#"
+using F = void (*)();
+void target() {{}}
+template<class... T> void run(T... xs, F cb) {{ cb(); }}
+void caller() {{ {call} }}
+"#
+        );
+        let (p, a) = analyze_source(&[("main.cpp", &source)]);
+        assert!(p.diagnostics.is_empty(), "{call}: {:?}", p.diagnostics);
+        assert!(indirect(&p, &a, "run", "target"), "{call}");
+        assert!(has_any_edge(&p, &a, "caller", "run"), "{call}");
+    }
+}
+
+#[test]
+fn a_nontrailing_pack_survives_static_template_addresses_and_thread_models() {
+    for call in [
+        "void (*f)(int, F) = &C::run<int>; f(1, target);",
+        "std::thread t(static_cast<void (*)(int, F)>(&C::run<int>), 1, target);",
+    ] {
+        let source = format!(
+            r#"
+namespace std {{ struct thread {{ template<class G, class... A> thread(G, A...); }}; }}
+using F = void (*)();
+void target() {{}}
+struct C {{ template<class... T> static void run(T... xs, F cb) {{ cb(); }} }};
+void caller() {{ {call} }}
+"#
+        );
+        let (p, a) = analyze_source(&[("main.cpp", &source)]);
+        assert!(p.diagnostics.is_empty(), "{call}: {:?}", p.diagnostics);
+        assert!(indirect(&p, &a, "C::run", "target"), "{call}");
+        assert!(has_any_edge(&p, &a, "caller", "C::run"), "{call}");
+    }
+}
+
+#[test]
+fn fixed_parameters_on_both_sides_of_a_pack_keep_their_bindings() {
+    for call in [
+        "run(first, second, third);",
+        "run<int>(first, 1, second, third);",
+    ] {
+        let source = format!(
+            r#"
+using F = void (*)();
+void first() {{}}
+void second() {{}}
+void third() {{}}
+template<class... T> void run(F head, T... xs, F cb, F tail) {{
+    head(); cb(); tail();
+}}
+void caller() {{ {call} }}
+"#
+        );
+        let (p, a) = analyze_source(&[("main.cpp", &source)]);
+        assert!(p.diagnostics.is_empty(), "{call}: {:?}", p.diagnostics);
+        for target in ["first", "second", "third"] {
+            assert!(indirect(&p, &a, "run", target), "{call}: {target}");
+        }
+        assert_eq!(arrivals(&p, &a, "run", "head"), [0]);
+        assert!(!arrivals(&p, &a, "run", "cb").contains(&0));
+        assert!(!arrivals(&p, &a, "run", "tail").contains(&0));
+    }
+}
+
+#[test]
+fn a_nontrailing_member_pack_preserves_declaration_signature_and_receiver() {
+    for (call, position) in [
+        ("c->run(target);", 1),
+        (
+            "void (C::*m)(int, F) = &C::run<int>; (c->*m)(1, target);",
+            2,
+        ),
+    ] {
+        let source = format!(
+            r#"
+using F = void (*)();
+void target() {{}}
+struct C {{ template<class... T> void run(T... xs, F cb); }};
+template<class... T> void C::run(T... xs, F cb) {{ cb(); }}
+void caller(C *c) {{ {call} }}
+"#
+        );
+        let (p, a) = analyze_source(&[("main.cpp", &source)]);
+        assert!(p.diagnostics.is_empty(), "{call}: {:?}", p.diagnostics);
+        assert!(indirect(&p, &a, "C::run", "target"), "{call}");
+        let run = p.symbols.function(only_function(&p, "C::run"));
+        let params = p.symbols.explicit_params(run).unwrap();
+        assert_eq!(params.len(), 1);
+        assert!(matches!(
+            p.types.get(params.get(0).unwrap()).desc.innermost().0,
+            trace_ir::TypeDesc::FnPtr { .. }
+        ));
+        assert_eq!(arrivals(&p, &a, "C::run", "cb"), [position]);
+    }
+}
+
+#[test]
+fn pack_positions_keep_member_template_overloads_distinct() {
+    let (p, _) = analyze_source(&[(
+        "main.cpp",
+        r#"
+using F = void (*)();
+struct C {
+    template<class... T> void run(T... xs, F cb);
+    template<class... T> void run(F cb, T... xs);
+};
+"#,
+    )]);
+    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+    assert_eq!(p.symbols.functions_named("C::run").len(), 2);
+}
+
 fn indirect(program: &Program, analysis: &AnalysisResult, caller: &str, callee: &str) -> bool {
     has_edge(program, analysis, caller, callee, ResolutionKind::Indirect)
 }

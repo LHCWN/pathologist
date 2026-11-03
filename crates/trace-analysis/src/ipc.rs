@@ -876,7 +876,7 @@ mod tests {
             reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
-            has_pack_param: false,
+            pack_positions: Vec::new(),
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,

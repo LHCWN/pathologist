@@ -28,6 +28,24 @@ pub enum MethodKind {
 }
 
 impl MethodKind {
+    /// Split a qualified function spelling into its owner and member kind.
+    /// Callers decide whether the owner denotes a class in their context.
+    pub fn of_function(name: &str) -> Option<(String, MethodKind)> {
+        let scope = crate::function_scope_spelling(name);
+        let end = scope.rfind("::")?;
+        let short = &name[end + 2..];
+        let cls = name[..end].to_owned();
+        let last_cls = cls.rsplit("::").next().unwrap_or(&cls);
+        let kind = if short.starts_with('~') {
+            MethodKind::Dtor
+        } else if short == last_cls {
+            MethodKind::Ctor
+        } else {
+            MethodKind::Named(short.to_string())
+        };
+        Some((cls, kind))
+    }
+
     /// Whether this kind participates in dynamic dispatch by default.
     pub fn is_destructor(&self) -> bool {
         matches!(self, MethodKind::Dtor)
@@ -596,7 +614,8 @@ pub struct Program {
     pub address_references: FxHashSet<crate::VarId>,
     /// Indexing-only cv qualifications of variables, preserved through header merges.
     pub var_qualifications: FxHashMap<crate::VarId, crate::CvQualification>,
-    /// Functions declared to return a reference, for expression lowering.
+    /// Functions declared to return a reference, for expression lowering and
+    /// callable signature checks during analysis. Retained until `release_flow`.
     pub reference_returns: FxHashSet<FnId>,
     /// Functions declared to return an rvalue reference (`&&`), for value-category determination.
     pub rvalue_reference_returns: FxHashSet<FnId>,
@@ -737,8 +756,6 @@ impl Program {
         self.reference_vars = FxHashSet::default();
         self.address_references = FxHashSet::default();
         self.var_qualifications = FxHashMap::default();
-        self.reference_returns = FxHashSet::default();
-        self.rvalue_reference_returns = FxHashSet::default();
         // These facts live through provenance export. Compact the append-only
         // buffers once growth is complete, without changing occurrence order.
         self.flow.shrink_to_fit();
@@ -762,6 +779,8 @@ impl Program {
         }
         self.fn_returns = IndexMap::new();
         self.default_arguments = IndexMap::new();
+        self.reference_returns = FxHashSet::default();
+        self.rvalue_reference_returns = FxHashSet::default();
     }
 
     /// List each `(source, added)`'s `added` as another target record of the
@@ -1159,6 +1178,69 @@ impl Program {
         self.base_names(cls).map(str::to_owned).collect()
     }
 
+    /// A member-function value must match both the callable signature and
+    /// any known owner hierarchy. Dependent owners remain conservative.
+    pub fn member_pointer_signature_admits(
+        &self,
+        callee: FnId,
+        signature: &crate::TypeDesc,
+        returns_reference: bool,
+    ) -> bool {
+        self.member_pointer_owner_admits(callee, signature)
+            && self.symbols.member_pointer_signature_admits(
+                callee,
+                signature,
+                &self.types,
+                returns_reference,
+            )
+    }
+
+    /// Reinterpreted invocations retain the owner and parameter checks, but
+    /// permit a different return type as a conservative ABI approximation.
+    pub fn reinterpreted_member_pointer_signature_admits(
+        &self,
+        callee: FnId,
+        signature: &crate::TypeDesc,
+    ) -> bool {
+        self.member_pointer_owner_admits(callee, signature)
+            && self.symbols.reinterpreted_callable_signature_admits(
+                callee,
+                signature,
+                &self.types,
+                true,
+            )
+    }
+
+    fn member_pointer_owner_admits(&self, callee: FnId, signature: &crate::TypeDesc) -> bool {
+        use crate::TypeDesc;
+        if signature.member_pointer().is_none() {
+            return true;
+        }
+        if let Some(TypeDesc::FnPtr { params, .. }) = signature.callable_signature() {
+            if let Some(TypeDesc::Ptr(owner)) = params.first() {
+                if let TypeDesc::Struct { name: owner, .. } = owner.as_ref() {
+                    if let Some((declaring, _)) =
+                        crate::MethodKind::of_function(&self.symbols.function(callee).name)
+                    {
+                        if self.types.declares_class(owner)
+                            && self.types.declares_class(&declaring)
+                            && !crate::symbol::member_template_names_alike(
+                                &self.types,
+                                owner,
+                                &declaring,
+                            )
+                            && !self.derives_from(owner, &declaring)
+                            && !self.derives_from(&declaring, owner)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Whether `derived` inherits from `base`, directly or transitively.
     /// Walks up from `derived`, so the cost is bounded by its ancestry, not
     /// by `base`'s subclass closure. Carries a visited set (see
@@ -1247,6 +1329,124 @@ impl Program {
         out
     }
 
+    /// Virtual alternatives of a bound call, using the same visibility,
+    /// signature, final-class and link-image rules for direct and indirect
+    /// member calls. The bound target itself remains the caller's choice.
+    pub fn virtual_call_targets(&self, cs: &crate::CallSite, fid: FnId) -> Vec<FnId> {
+        if cs.exact_receiver {
+            return Vec::new();
+        }
+        let f = self.symbols.function(fid);
+        if !f.is_cpp {
+            return Vec::new();
+        }
+        let Some((cls, kind)) = MethodKind::of_function(&f.name) else {
+            return Vec::new();
+        };
+        if matches!(kind, crate::MethodKind::Ctor) {
+            return Vec::new();
+        }
+        // Every file's anonymous namespace spells a class the same, so a
+        // member the call cannot see (in neither its file nor a header that
+        // file includes) is another class's: it does not make the callee
+        // virtual, never stops dispatch as `final`, and is no target when its
+        // class is the receiver's. When the receiver is itself such a class
+        // seen here, so is its whole hierarchy, since a subclass names it: a
+        // member of a class in that hierarchy is a target only where the call
+        // sees it, not a same-named external class's or its subclasses'. A
+        // base declared outside an anonymous namespace still dispatches to the
+        // overrides in every file.
+        //
+        // A callee bound to such a member was looked up where its class is
+        // seen, which a header can make another file than the call's.
+        let bound_in = (f.linkage == crate::Linkage::Internal).then_some(f.file);
+        let call_file = cs.scope_file();
+        let sees = |file: crate::FileId| {
+            self.symbols.file_sees(call_file, file)
+                || bound_in.is_some_and(|b| self.symbols.file_sees(b, file))
+        };
+        let visible = |t: FnId| {
+            let t = self.symbols.function(t);
+            t.linkage != crate::Linkage::Internal || sees(t.file)
+        };
+        let virtual_dispatch = kind.is_destructor()
+            || f.is_virtual
+            || self
+                .symbols
+                .functions_named(&kind.name_on(&cls))
+                .into_iter()
+                .any(|t| self.symbols.function(t).is_virtual && visible(t));
+        if !virtual_dispatch {
+            return Vec::new();
+        }
+        // A template receiver may still spell a parameter such as `T`.
+        // Dispatch conservatively from the bound member's owner in that case.
+        let root = cs
+            .receiver_class
+            .as_deref()
+            .filter(|receiver| self.types.declares_class(receiver))
+            .unwrap_or(&cls);
+        let expected_arity = self.symbols.explicit_params(f).map(|p| p.len());
+        // Filter the selected virtual slot before nearest-declaration lookup:
+        // an unrelated base or a hiding overload must not stop that walk.
+        let family = |id: FnId| {
+            let target = self.symbols.function(id);
+            target.target == f.target
+                && target.is_const_member == f.is_const_member
+                && target.ref_qualifier == f.ref_qualifier
+                && target.variadic == f.variadic
+                && crate::SymbolTable::references_alike(target, f)
+                && MethodKind::of_function(&target.name)
+                    .is_some_and(|(owner, _)| owner == cls || self.derives_from(&owner, &cls))
+                && expected_arity
+                    .zip(self.symbols.explicit_params(target).map(|p| p.len()))
+                    .is_none_or(|(a, b)| a == b)
+                && self.symbols.explicit_params_alike(
+                    target,
+                    f,
+                    &self.types,
+                    crate::SpellingTolerance::Override,
+                ) != Some(false)
+        };
+        if bound_in.is_some() || self.class_is_anonymous_in(root, sees) {
+            let hierarchy: Vec<String> = self
+                .subclass_closure(root)
+                .iter()
+                .map(|c| kind.name_on(c))
+                .collect();
+            let seen_here = |t: FnId| {
+                let target = self.symbols.function(t);
+                family(t) && visible(t) && (sees(target.file) || !hierarchy.contains(&target.name))
+            };
+            self.method_targets_among(root, &kind, &sees, &seen_here)
+        } else {
+            let own_name = kind.name_on(root);
+            let mut targets = self.method_targets_among(root, &kind, &sees, &family);
+            // A member the call cannot see is a member of another file's
+            // anonymous class: a target only when, as its own file sees it,
+            // that class derives from the receiver's class or an external
+            // class under it, not merely shares a name with one of them.
+            let hierarchy = std::cell::OnceCell::new();
+            targets.retain(|&t| {
+                let target = self.symbols.function(t);
+                if visible(t) {
+                    return true;
+                }
+                target.name != own_name
+                    && MethodKind::of_function(&target.name).is_some_and(|(owner, _)| {
+                        let hierarchy: &Vec<String> =
+                            hierarchy.get_or_init(|| self.subclass_closure(root));
+                        self.anonymous_class_derives_from(
+                            &owner,
+                            &|file| self.symbols.file_sees(target.file, file),
+                            &|base| hierarchy.iter().any(|c| c == base),
+                        )
+                    })
+            });
+            targets
+        }
+    }
+
     /// Every method that CHA may select for a virtual call whose static
     /// receiver type is `cls`. For each class in the (final-cut) subclass
     /// closure, the nearest declaration walking toward bases is a target —
@@ -1297,6 +1497,7 @@ impl Program {
                     .symbols
                     .functions_named(&kind.name_on(class))
                     .into_iter()
+                    .filter(|&id| targets(id))
                     .any(final_method)
         };
         let mut out = Vec::new();
