@@ -51,13 +51,13 @@ impl LineMap {
         // few paths. Hash path components once, rather than at every token.
         // Content fingerprints (not intern IDs) preserve cross-TU identity.
         fn fingerprint(value: impl Hash) -> u64 {
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            let mut hash = rustc_hash::FxHasher::default();
             value.hash(&mut hash);
             hash.finish()
         }
         let files: Vec<_> = self.files.iter().map(fingerprint).collect();
         let macros: Vec<_> = self.macros.iter().map(fingerprint).collect();
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let mut hash = rustc_hash::FxHasher::default();
         (cpp_standard, text).hash(&mut hash);
         for entry in &self.entries {
             (

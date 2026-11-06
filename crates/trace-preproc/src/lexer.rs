@@ -144,21 +144,56 @@ impl Token {
     /// rather than its definition coordinates.
     #[must_use]
     pub(crate) fn with_macro_hide(&self, origin: &Token, name: &str) -> Token {
-        let mut set = FxHashSet::default();
-        if let Some(h) = origin.hidden() {
-            set.extend(h.iter().cloned());
-        }
-        if let Some(h) = self.hidden() {
-            set.extend(h.iter().cloned());
-        }
-        set.insert(name.to_string());
-        let expansion_macro = origin
-            .expansion_macro()
-            .cloned()
-            .or_else(|| Some(Arc::from(name)));
         let expansion_id = expansion_fingerprint(origin, name, None, self.expansion_id());
+        self.with_macro_hide_id(origin, name, expansion_id)
+    }
+
+    /// [`Self::with_macro_hide`] with the expansion fingerprint already
+    /// computed. Painting a whole replacement list usually shares one prior
+    /// expansion id, so the invoker can hash once instead of per token.
+    pub(crate) fn with_macro_hide_id(
+        &self,
+        origin: &Token,
+        name: &str,
+        expansion_id: u64,
+    ) -> Token {
+        let hidden = None;
+        let expansion_macro = None;
+        self.with_macro_hide_parts(origin, name, expansion_id, hidden, expansion_macro)
+    }
+
+    /// Painting with the invoker's precomputed hide set and macro name.
+    /// Every token of one replacement list that starts without a hide set
+    /// ends with the same one, so the list can share it instead of rebuilding
+    /// (and reallocating) it per token.
+    pub(crate) fn with_macro_hide_parts(
+        &self,
+        origin: &Token,
+        name: &str,
+        expansion_id: u64,
+        shared_hidden: Option<&Arc<FxHashSet<String>>>,
+        shared_macro: Option<&Arc<str>>,
+    ) -> Token {
+        let hidden = match shared_hidden {
+            Some(hidden) if self.hidden().is_none() => Arc::clone(hidden),
+            _ => {
+                let mut set = FxHashSet::default();
+                if let Some(h) = origin.hidden() {
+                    set.extend(h.iter().cloned());
+                }
+                if let Some(h) = self.hidden() {
+                    set.extend(h.iter().cloned());
+                }
+                set.insert(name.to_string());
+                Arc::new(set)
+            }
+        };
+        let expansion_macro = shared_macro
+            .cloned()
+            .or_else(|| origin.expansion_macro().cloned())
+            .or_else(|| Some(Arc::from(name)));
         let prov = TokenMacroProvenance {
-            hidden: Some(Arc::new(set)),
+            hidden: Some(hidden),
             origin: Some(origin.expansion_site()),
             expansion_id,
             expansion_macro,
@@ -232,7 +267,7 @@ impl Token {
 /// Stable FNV-1a fingerprint for an expansion-chain step. File paths and
 /// coordinates describe source identity; no allocation order or process hash
 /// seed enters the value, so cached and parallel preprocessing agree.
-fn expansion_fingerprint(
+pub(crate) fn expansion_fingerprint(
     origin: &Token,
     macro_name: &str,
     parameter: Option<&Token>,
@@ -255,13 +290,15 @@ fn expansion_fingerprint(
     bytes(&origin.line.to_le_bytes());
     bytes(&origin.col.to_le_bytes());
     if let Some(path) = origin.spelling_file() {
-        bytes(path.to_string_lossy().as_bytes());
+        // Raw path bytes: `to_string_lossy` validates UTF-8 and allocates for
+        // non-UTF-8 paths, while this is only a fingerprint.
+        bytes(path.as_os_str().as_encoded_bytes());
     }
     if let Some(parameter) = parameter {
         bytes(&parameter.line.to_le_bytes());
         bytes(&parameter.col.to_le_bytes());
         if let Some(path) = parameter.spelling_file() {
-            bytes(path.to_string_lossy().as_bytes());
+            bytes(path.as_os_str().as_encoded_bytes());
         }
     }
     // Reserve zero for tokens that have no expansion provenance.

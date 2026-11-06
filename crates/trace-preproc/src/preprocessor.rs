@@ -1,4 +1,5 @@
 use crate::diagnostic::DiagnosticKey;
+use crate::lexer::expansion_fingerprint;
 use crate::macros::{lex_macro_body, MacroDef, MacroOp, MacroTable};
 use crate::{
     ArmDirective, ArmOutcome, ConditionRead, ConditionalArm, ConditionalChain, Diagnostic,
@@ -179,7 +180,11 @@ struct PreprocessorState {
     /// Replacement-list spelling paths already interned in `line_map`.
     /// Macro emission is per token, so scanning the file table there would
     /// make repeated expansions quadratic in the number of mapped files.
-    lm_spelling_files: FxHashMap<PathBuf, u32>,
+    lm_spelling_files: FxHashMap<Arc<PathBuf>, u32>,
+    /// The spelling file and interned index from the previous emitted token.
+    /// Consecutive macro tokens usually share one spelling file, so this
+    /// avoids hashing the path for every token in a replacement list.
+    lm_last_spelling: Option<(Arc<PathBuf>, u32)>,
     /// Macro names already interned in `line_map`. Avoids O(N) scans on every emitted token.
     lm_macros: FxHashMap<Arc<str>, u32>,
     /// Current nested macro-expansion depth (hide-set rescan frames).
@@ -497,6 +502,7 @@ impl PreprocessorState {
             emitted_bytes: FxHashMap::default(),
             lm_cur_file: u32::MAX,
             lm_spelling_files: FxHashMap::default(),
+            lm_last_spelling: None,
             lm_macros: FxHashMap::default(),
             expansion_depth: 0,
             expansion_limit_warned: false,
@@ -1134,9 +1140,44 @@ impl PreprocessorState {
     }
 
     fn paint_replacement(tokens: &[Token], origin: &Token, name: &str) -> Vec<Token> {
+        // Replacement-list tokens normally share one prior expansion id, so
+        // the fingerprint is the same for the whole list. Recompute only when
+        // the id actually changes (a body that itself came from an expansion).
+        let mut cached: Option<(u64, u64)> = None;
+        // A macro definition's tokens start without a hide set, so every
+        // painted token would build the same one. Build it once and share it.
+        let shared_hidden = tokens.iter().all(|t| t.hidden().is_none()).then(|| {
+            let mut set = FxHashSet::default();
+            if let Some(h) = origin.hidden() {
+                set.extend(h.iter().cloned());
+            }
+            set.insert(name.to_string());
+            Arc::new(set)
+        });
+        let shared_macro = origin
+            .expansion_macro()
+            .cloned()
+            .or_else(|| Some(Arc::from(name)));
         tokens
             .iter()
-            .map(|t| t.with_macro_hide(origin, name))
+            .map(|t| {
+                let prior = t.expansion_id();
+                let id = match cached {
+                    Some((seen, id)) if seen == prior => id,
+                    _ => {
+                        let id = expansion_fingerprint(origin, name, None, prior);
+                        cached = Some((prior, id));
+                        id
+                    }
+                };
+                t.with_macro_hide_parts(
+                    origin,
+                    name,
+                    id,
+                    shared_hidden.as_ref(),
+                    shared_macro.as_ref(),
+                )
+            })
             .collect()
     }
 
@@ -1146,13 +1187,20 @@ impl PreprocessorState {
     }
 
     /// Intern a replacement-list spelling path once per preprocessing run.
-    fn lm_spelling_file(&mut self, path: &Path) -> u32 {
+    fn lm_spelling_file(&mut self, path: &Arc<PathBuf>) -> u32 {
+        if let Some((last, file)) = &self.lm_last_spelling {
+            if Arc::ptr_eq(last, path) {
+                return *file;
+            }
+        }
         if let Some(&file) = self.lm_spelling_files.get(path) {
+            self.lm_last_spelling = Some((Arc::clone(path), file));
             return file;
         }
         // Canonical, as every origin is (`lm_current_file`).
         let file = self.line_map.intern_file(&trace_ir::canonicalize(path));
-        self.lm_spelling_files.insert(path.to_path_buf(), file);
+        self.lm_spelling_files.insert(Arc::clone(path), file);
+        self.lm_last_spelling = Some((Arc::clone(path), file));
         file
     }
 
@@ -5592,16 +5640,21 @@ fn is_access_specifier(name: &str) -> bool {
 /// and whether the name is only a builtin fallback.
 pub(crate) fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = rustc_hash::FxHasher::default();
     fallback.hash(&mut h);
-    let hash_tokens = |h: &mut std::collections::hash_map::DefaultHasher, toks: &[Token]| {
+    let hash_tokens = |h: &mut rustc_hash::FxHasher, toks: &[Token]| {
         for t in toks {
             t.adjacent_before.hash(h);
-            t.spelling_file().hash(h);
-            if t.spelling_file().is_some() {
-                // The path was hashed with the option discriminant above.
-                t.line.hash(h);
-                t.col.hash(h);
+            match t.spelling_file() {
+                Some(path) => {
+                    true.hash(h);
+                    // Raw path bytes: this is an in-memory cache fingerprint,
+                    // and `Path::hash` walks components per token.
+                    path.as_os_str().as_encoded_bytes().hash(h);
+                    t.line.hash(h);
+                    t.col.hash(h);
+                }
+                None => false.hash(h),
             }
             match &t.kind {
                 TokenKind::Identifier(sp) | TokenKind::Number(sp) => (0u8, sp.as_str()).hash(h),

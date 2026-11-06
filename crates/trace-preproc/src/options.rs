@@ -206,7 +206,7 @@ impl MacroFingerprint {
         // XOR of per-entry hashes: commutative, so insertion order drops out.
         let mut acc = u64::from(self.incompatible);
         let mut one = |tag: u8, name: &str, hash: u64| {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut h = rustc_hash::FxHasher::default();
             (tag, name, hash).hash(&mut h);
             acc ^= h.finish();
         };
@@ -217,12 +217,12 @@ impl MacroFingerprint {
             one(1, name, 0);
         }
         for (path, signature) in &self.required_headers {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut h = rustc_hash::FxHasher::default();
             (2u8, path, signature).hash(&mut h);
             acc ^= h.finish();
         }
         if let Some(size) = self.header_context_size {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut h = rustc_hash::FxHasher::default();
             (3u8, size).hash(&mut h);
             acc ^= h.finish();
         }

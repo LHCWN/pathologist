@@ -17125,24 +17125,26 @@ fn format_operation_tokens(
     language: trace_preproc::Language,
 ) -> String {
     use trace_preproc::TokenKind;
-    let spelling = |token: &TokenKind| match token {
-        TokenKind::Identifier(s)
-        | TokenKind::Number(s)
-        | TokenKind::String(s)
-        | TokenKind::Char(s) => s.clone(),
-        TokenKind::Punct(s) => (*s).to_owned(),
-        TokenKind::Hash => "#".into(),
-        _ => String::new(),
-    };
+    fn spelling(token: &TokenKind) -> &str {
+        match token {
+            TokenKind::Identifier(s)
+            | TokenKind::Number(s)
+            | TokenKind::String(s)
+            | TokenKind::Char(s) => s,
+            TokenKind::Punct(s) => s,
+            TokenKind::Hash => "#",
+            _ => "",
+        }
+    }
     let mut result = String::new();
-    let mut previous = String::new();
+    let mut previous = "";
     let mut previous_unary = false;
     for token in tokens {
         let current = spelling(token);
-        let unary = matches!(current.as_str(), "*" | "&" | "+" | "-" | "!" | "~")
+        let unary = matches!(current, "*" | "&" | "+" | "-" | "!" | "~")
             && (previous.is_empty()
                 || matches!(
-                    previous.as_str(),
+                    previous,
                     "(" | "["
                         | "{"
                         | ","
@@ -17181,16 +17183,14 @@ fn format_operation_tokens(
                         | "~"
                 ));
         let tight = matches!(
-            current.as_str(),
+            current,
             "." | "->" | "::" | "->*" | ".*" | ")" | "]" | "," | ";" | "(" | "["
-        ) || matches!(
-            previous.as_str(),
-            "." | "->" | "::" | "->*" | ".*" | "(" | "["
-        ) || (previous_unary && !matches!(token, TokenKind::Punct(_)));
+        ) || matches!(previous, "." | "->" | "::" | "->*" | ".*" | "(" | "[")
+            || (previous_unary && !matches!(token, TokenKind::Punct(_)));
         if !result.is_empty() && !tight {
             result.push(' ');
         }
-        result.push_str(&current);
+        result.push_str(current);
         previous = current;
         previous_unary = unary;
     }
