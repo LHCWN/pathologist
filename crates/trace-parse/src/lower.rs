@@ -6350,7 +6350,7 @@ fn is_member_function_template(source: &str, node: Node) -> bool {
                 }
                 cur = n.parent();
             }
-            "field_declaration_list" | "compound_statement" => return false,
+            "field_declaration_list" | "compound_statement" | "friend_declaration" => return false,
             "translation_unit" | "declaration_list" => break,
             _ => cur = n.parent(),
         }
@@ -6865,7 +6865,9 @@ fn lower_function_signature(
                     )
                 }),
             declared_in_class: ctx.class_ctx.is_some(),
-            is_member_template: ctx.is_cpp && is_member_function_template(source, node),
+            is_member_template: ctx.is_cpp
+                && eff_class.is_some()
+                && is_member_function_template(source, node),
             is_const_member: ctx.is_cpp && function_is_const_qualified(source, node),
             is_static_member: ctx.class_ctx.is_some() && declaration_is_static(node),
             is_virtual: flags.is_virtual,
@@ -12613,7 +12615,7 @@ fn lower_function_decl(
         variadic: shape.variadic,
         defaulted_in_class: false,
         declared_in_class: false,
-        is_member_template: ctx.is_cpp && is_member_function_template(source, decl),
+        is_member_template: false,
         is_const_member: ctx.is_cpp && function_is_const_qualified(source, decl),
         is_static_member: false,
         is_virtual: false,

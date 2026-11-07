@@ -12066,6 +12066,44 @@ void Run(D *p) { auto x = p->f(1); x->Good(); }
     assert!(has_any_edge(&program, &analysis, "Run", "R::Good"));
 }
 
+#[test]
+fn qualified_free_and_friend_function_templates_merge_with_declarations() {
+    let source = r#"void NormTarget() {}
+void FriendTarget() {}
+namespace geo {
+template <class T> struct Point {};
+template <class T> void norm(const Point<T> &p);
+}
+template <class T> void geo::norm(const geo::Point<T> &p) { NormTarget(); }
+template <class T> void friend_fn(T);
+struct Box {
+    template <class T> friend void friend_fn(T) { FriendTarget(); }
+};
+void Run() {
+    geo::Point<int> pt;
+    geo::norm(pt);
+    friend_fn(1);
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    for (name, target) in [("geo::norm", "NormTarget"), ("friend_fn", "FriendTarget")] {
+        let fns: Vec<_> = program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .collect();
+        assert_eq!(fns.len(), 1, "{name}: {fns:?}");
+        assert!(
+            fns[0].is_defined && !fns[0].is_member_template,
+            "{name}: {:?}",
+            fns[0]
+        );
+        assert!(has_any_edge(&program, &analysis, "Run", name));
+        assert!(has_any_edge(&program, &analysis, name, target));
+    }
+}
+
 /// The source of the one receiver copy into `result` in `func`.
 fn promotion_source(program: &Program, func: &str, result: &str) -> trace_ir::VarId {
     let result = common::local_variable(program, func, result);
