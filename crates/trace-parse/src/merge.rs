@@ -1853,6 +1853,8 @@ fn respelled_declarations(
                     f.is_defined
                         && f.linkage == trace_ir::Linkage::Internal
                         && f.variadic == declaration.variadic
+                        && f.is_const_member == declaration.is_const_member
+                        && f.is_member_template == declaration.is_member_template
                         && arity(f) == arity(declaration)
                 })
                 .collect();

@@ -1776,13 +1776,11 @@ impl SymbolTable {
                     }
                     // `R f()` and `R f() const` are two overloads, not one
                     // function redeclared: the implicit object argument tells
-                    // them apart at a call. Only a member declaration (or a
-                    // definition written as one) states the qualifier: a
-                    // definition recovered from a macro can lose it and must
-                    // still reach the declaration it belongs to.
+                    // them apart at a call. A member function template and a
+                    // non-template of the same parameter list are distinct
+                    // declarations too.
                     if existing.is_const_member != func.is_const_member
-                        && existing.declared_in_class
-                        && (func.declared_in_class || func.is_const_member)
+                        || existing.is_member_template != func.is_member_template
                     {
                         return false;
                     }
@@ -2701,6 +2699,12 @@ impl SymbolTable {
                     let cand_skip = usize::from(self.has_this_param(id));
                     let cand_explicit_len = cand.params.len().saturating_sub(cand_skip);
                     let both_cpp = f.is_cpp && cand.is_cpp;
+                    if both_cpp
+                        && (f.is_const_member != cand.is_const_member
+                            || f.is_member_template != cand.is_member_template)
+                    {
+                        return false;
+                    }
                     if f.params.is_empty() || cand.params.is_empty() {
                         if !both_cpp {
                             return true;
@@ -2910,6 +2914,8 @@ impl SymbolTable {
                         let b = self.function(local);
                         self.defined_in_tu(local, tu)
                             && a.variadic == b.variadic
+                            && a.is_const_member == b.is_const_member
+                            && a.is_member_template == b.is_member_template
                             && Self::references_alike(a, b)
                             && self.explicit_params_alike(
                                 a,

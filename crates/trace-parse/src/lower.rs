@@ -6325,24 +6325,64 @@ fn continues_previous_member(node: Node) -> bool {
 }
 
 /// Whether the member declaration or definition `node` is written as a
-/// function template in its class body (`template <class U> R f();`): a
-/// `template_declaration` inside the class body encloses it. An out-of-class
-/// definition of a class template's member (`template <class T> void
-/// H<T>::f()`) is no function template.
-fn is_member_function_template(node: Node) -> bool {
+/// function template (`template <class U> R f();`, or out-of-class
+/// `template <class U> R C::f()` / `template <class T> template <class U>
+/// R H<T>::f()`). An out-of-class definition of a class template's non-template
+/// member (`template <class T> void H<T>::f()`) has one template parameter list
+/// per templated scope segment, so it is no function template.
+fn is_member_function_template(source: &str, node: Node) -> bool {
+    let has_type_params = |tpl: Node| {
+        tpl.children(&mut tpl.walk())
+            .any(|c| c.cached_kind() == "template_parameter_list" && c.named_child_count() > 0)
+    };
     let mut cur = node.parent();
+    let mut enclosing_templates = 0usize;
     while let Some(n) = cur {
         match n.cached_kind() {
             "template_declaration" => {
-                return n
-                    .parent()
+                if has_type_params(n) {
+                    enclosing_templates += 1;
+                }
+                if n.parent()
                     .is_some_and(|p| p.cached_kind() == "field_declaration_list")
+                {
+                    return enclosing_templates > 0;
+                }
+                cur = n.parent();
             }
-            "field_declaration_list" | "translation_unit" | "compound_statement" => return false,
+            "field_declaration_list" | "compound_statement" => return false,
+            "translation_unit" | "declaration_list" => break,
             _ => cur = n.parent(),
         }
     }
-    false
+    if enclosing_templates == 0 {
+        return false;
+    }
+    let Some(qid) = find_function_declarator(node)
+        .and_then(|d| find_declarator_of_kind(d, "qualified_identifier"))
+    else {
+        return false;
+    };
+    let scope = scope_part(node_text(source, &qid));
+    !scope.is_empty() && enclosing_templates > count_template_lists(scope)
+}
+
+fn count_template_lists(scope: &str) -> usize {
+    let mut depth = 0usize;
+    let mut count = 0usize;
+    for ch in scope.chars() {
+        match ch {
+            '<' => {
+                if depth == 0 {
+                    count += 1;
+                }
+                depth += 1;
+            }
+            '>' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Whether a function declaration or definition spells `const` among its
@@ -6359,7 +6399,7 @@ fn function_is_const_qualified(source: &str, node: Node) -> bool {
     };
     let declarator =
         find_function_declarator(node).or_else(|| find_declarator_of_kind(node, "operator_cast"));
-    declarator.is_some_and(|declarator| {
+    let on_declarator = declarator.is_some_and(|declarator| {
         declarator
             .children(&mut declarator.walk())
             .any(is_const)
@@ -6373,7 +6413,27 @@ fn function_is_const_qualified(source: &str, node: Node) -> bool {
                         .children(&mut abstract_declarator.walk())
                         .any(is_const)
                 })
-    })
+    });
+    if on_declarator {
+        return true;
+    }
+    let Some(parked) = error_parked_declarator(node) else {
+        return false;
+    };
+    let end = node
+        .cached_field("body")
+        .map_or(node.end_byte(), |b| b.start_byte());
+    let Some(tail) = source.get(parked.end_byte()..end) else {
+        return false;
+    };
+    let after_params = tail.split_once(')').map_or(tail, |(_, rest)| rest);
+    let before_init = after_params
+        .split([':', '{'])
+        .next()
+        .unwrap_or(after_params);
+    before_init
+        .split(|c: char| !c.is_ascii_alphabetic() && c != '_')
+        .any(|word| word == "const")
 }
 
 /// The first node of `kind` below `node`, declaration declarators only.
@@ -6475,7 +6535,7 @@ fn register_member_prototype(
             variadic: shape.variadic,
             defaulted_in_class: false,
             declared_in_class: true,
-            is_member_template: is_member_function_template(node),
+            is_member_template: is_member_function_template(source, node),
             is_const_member: function_is_const_qualified(source, node),
             is_static_member: declaration_is_static(node),
             is_virtual: flags.is_virtual,
@@ -6805,8 +6865,8 @@ fn lower_function_signature(
                     )
                 }),
             declared_in_class: ctx.class_ctx.is_some(),
-            is_member_template: ctx.class_ctx.is_some() && is_member_function_template(node),
-            is_const_member: eff_class.is_some() && function_is_const_qualified(source, node),
+            is_member_template: ctx.is_cpp && is_member_function_template(source, node),
+            is_const_member: ctx.is_cpp && function_is_const_qualified(source, node),
             is_static_member: ctx.class_ctx.is_some() && declaration_is_static(node),
             is_virtual: flags.is_virtual,
             is_final: flags.is_final,
@@ -7445,6 +7505,7 @@ fn auto_initializer_type(
             CallResult::Overload {
                 candidates,
                 receiver,
+                receiver_is_const,
             } => {
                 let nodes = call_arg_nodes(value);
                 let args: Vec<TypeDesc> = nodes
@@ -7453,7 +7514,15 @@ fn auto_initializer_type(
                     .collect();
                 let nulls = null_constant_args(source, &nodes);
                 call_result_among(
-                    program, ctx, source, value, candidates, receiver, &args, &nulls,
+                    program,
+                    ctx,
+                    source,
+                    value,
+                    candidates,
+                    receiver,
+                    receiver_is_const,
+                    &args,
+                    &nulls,
                 )?
             }
         }
@@ -7522,6 +7591,8 @@ enum CallResult {
         /// The receiver's spelling: the class template whose arguments a
         /// member's bare-parameter return substitutes.
         receiver: Option<String>,
+        /// Whether the receiver object is `const`, when known.
+        receiver_is_const: Option<bool>,
     },
 }
 
@@ -7598,7 +7669,7 @@ fn call_result_shape(
     if let Some(extraction) = pointer_extraction(program, ctx, source, value) {
         return Some(CallResult::Decided(Some(extraction.result)));
     }
-    let (candidates, receiver) = if let Some(op) = (ctx.is_cpp)
+    let (candidates, receiver, receiver_is_const) = if let Some(op) = (ctx.is_cpp)
         .then(|| explicit_member_operator_call(value, source))
         .flatten()
     {
@@ -7611,8 +7682,9 @@ fn call_result_shape(
         } else {
             class_spelling_of_desc(&desc)?.to_string()
         };
+        let is_const = receiver_is_const(program, ctx, source, recv, arrow);
         let members = class_member_declarations(program, &receiver_lookup_name(&receiver), &field);
-        (Overloads::Declared(members), Some(receiver))
+        (Overloads::Declared(members), Some(receiver), is_const)
     } else if func.cached_kind() == "field_expression" {
         let recv = func.cached_field("argument")?;
         let field = normalize_qualified(node_text(source, &func.cached_field("field")?));
@@ -7630,8 +7702,9 @@ fn call_result_shape(
         if member_is_hidden_by_field(program, ctx, &cls, &name) {
             return None;
         }
+        let is_const = receiver_is_const(program, ctx, source, recv, arrow);
         let members = class_member_declarations(program, &cls, &name);
-        (Overloads::Declared(members), Some(receiver))
+        (Overloads::Declared(members), Some(receiver), is_const)
     } else {
         let (name, _, var) = resolve_callee(program, ctx, source, func);
         if var.is_some() {
@@ -7653,19 +7726,26 @@ fn call_result_shape(
             if let Some(desc) = undefined_singleton_result(program, ctx, source, func) {
                 return Some(CallResult::Decided(Some(desc)));
             }
+            let is_const = ctx.class_ctx.as_ref().and_then(|cc| {
+                let (cls, _) = name.rsplit_once("::")?;
+                (cls == cc.qual_name || program.derives_from(&cc.qual_name, cls))
+                    .then_some(cc.is_const)
+            });
             // A static call's receiver is its scope, named once a candidate
             // turns out to substitute ([`call_result_among`]).
-            (Overloads::ByName(name), None)
+            (Overloads::ByName(name), None, is_const)
         } else {
             // `Get()` in a member body is `this->Get()`, so the enclosing
             // class is the receiver a base's substitution facts apply to.
             let receiver = ctx.class_ctx.as_ref().map(|cc| cc.qual_name.clone());
-            (Overloads::Declared(members), receiver)
+            let is_const = ctx.class_ctx.as_ref().map(|cc| cc.is_const);
+            (Overloads::Declared(members), receiver, is_const)
         }
     };
     Some(CallResult::Overload {
         candidates,
         receiver,
+        receiver_is_const,
     })
 }
 
@@ -7873,6 +7953,7 @@ fn call_result_among(
     value: Node,
     candidates: Overloads,
     receiver: Option<String>,
+    receiver_is_const: Option<bool>,
     args: &[TypeDesc],
     null_constants: &[bool],
 ) -> Option<TypeDesc> {
@@ -7945,7 +8026,7 @@ fn call_result_among(
             return None;
         }
     }
-    let candidates = result_overloads(program, candidates, args, null_constants);
+    let candidates = result_overloads(program, candidates, args, null_constants, receiver_is_const);
     agreed(candidates.iter().map(|&f| {
         let function = program.symbols.function(f);
         let arity = method_explicit_arity(program, f)?;
@@ -7967,17 +8048,97 @@ fn result_overloads(
     candidates: Vec<FnId>,
     args: &[TypeDesc],
     null_constants: &[bool],
+    receiver_is_const: Option<bool>,
 ) -> Vec<FnId> {
     let candidates = filter_targets_by_argc(program, candidates, args.len(), args, args.is_empty());
+    let candidates = if receiver_is_const == Some(true) {
+        let const_viable: Vec<FnId> = candidates
+            .iter()
+            .copied()
+            .filter(|&id| {
+                !is_non_static_member(program, id) || program.symbols.function(id).is_const_member
+            })
+            .collect();
+        if const_viable.is_empty() {
+            candidates
+        } else {
+            const_viable
+        }
+    } else {
+        candidates
+    };
     // The candidates left must all take the arguments and agree on one
     // return type.
-    narrow_overloads(
+    let narrowed = narrow_overloads(
         program,
         candidates,
         args,
         null_constants,
         OverloadChoice::Result,
-    )
+    );
+    if narrowed.len() <= 1 {
+        return narrowed;
+    }
+    narrowed
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let f = program.symbols.function(id);
+            if f.is_member_template
+                && narrowed.iter().any(|&other| {
+                    let o = program.symbols.function(other);
+                    !o.is_member_template
+                        && o.is_const_member == f.is_const_member
+                        && same_explicit_signature(program, id, other)
+                })
+            {
+                return false;
+            }
+            if receiver_is_const == Some(false)
+                && is_non_static_member(program, id)
+                && f.is_const_member
+                && narrowed.iter().any(|&other| {
+                    let o = program.symbols.function(other);
+                    is_non_static_member(program, other)
+                        && !o.is_const_member
+                        && (!o.is_member_template || f.is_member_template)
+                        && same_explicit_signature(program, id, other)
+                })
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+fn is_non_static_member(program: &Program, fid: FnId) -> bool {
+    is_member_function(program, fid) && !program.symbols.function(fid).is_static_member
+}
+
+fn same_explicit_signature(program: &Program, a: FnId, b: FnId) -> bool {
+    let fa = program.symbols.function(a);
+    let fb = program.symbols.function(b);
+    if fa.variadic != fb.variadic || !trace_ir::SymbolTable::references_alike(fa, fb) {
+        return false;
+    }
+    let a_arity = method_explicit_arity(program, a);
+    let b_arity = method_explicit_arity(program, b);
+    if a_arity != b_arity {
+        return false;
+    }
+    if a_arity == Some(0) {
+        return true;
+    }
+    program
+        .symbols
+        .explicit_params_alike(
+            fa,
+            fb,
+            &program.types,
+            trace_ir::SpellingTolerance::Redeclaration,
+        )
+        .unwrap_or(false)
 }
 
 /// The one value a candidate set agrees on: nothing when it is empty, when a
@@ -8192,10 +8353,19 @@ fn receiver_type(program: &Program, ctx: &LowerContext, desc: TypeDesc) -> Optio
 fn held_class(program: &Program, ctx: &LowerContext, arg: &str) -> Option<String> {
     let arg = strip_cv(arg);
     let class = class_seen_from(program, ctx, &receiver_lookup_name(arg))?;
-    Some(match arg.find('<') {
-        Some(at) => format!("{class}{}", &arg[at..]),
-        None => class,
-    })
+    if !arg.contains('<') {
+        return Some(class);
+    }
+    let args = template_arguments(arg)
+        .into_iter()
+        .map(|arg| {
+            let (base, suffix) = split_pointer_suffix(&arg);
+            let base = sanitize_type_name(base);
+            let qualified = held_class(program, ctx, &base).unwrap_or(base);
+            format!("{qualified}{suffix}")
+        })
+        .collect::<Vec<_>>();
+    Some(format!("{class}<{}>{}", args.join(","), template_tail(arg)))
 }
 
 /// `spelled` without the `const` / `volatile` qualifiers written before or
@@ -8587,12 +8757,15 @@ fn from_this_result(
                 // `p->H::` on an `H<M> *p` is `H<M>`, and on a concrete
                 // receiver (`M : H<M>`) the base fact supplies it.
                 Some((class, None)) => {
-                    let instance =
-                        instantiation_reaching(program, ctx, receiver_instance.as_deref(), &class)
-                            .map(|instance| (instance, None))
-                            .or_else(|| {
-                                concrete_base_instantiation(program, &receiver_class, &class)
-                            });
+                    let instance = instantiation_reaching(
+                        program,
+                        ctx,
+                        receiver_instance.as_deref(),
+                        None,
+                        &class,
+                    )
+                    .map(|instance| (instance, None))
+                    .or_else(|| concrete_base_instantiation(program, ctx, &receiver_class, &class));
                     match instance {
                         Some((instance, scope)) => (class, Some(instance), scope),
                         None => (class, None, None),
@@ -8620,15 +8793,24 @@ fn from_this_result(
     let start = if names_base {
         start
     } else {
-        // A member body's implicit object is const when the member is; no
+        // The receiver object is const in a const member body or when the
+        // explicit receiver expression designates a const object; no
         // non-const overload can then be selected for it.
-        let object_is_const = matches!(receiver, FromThisReceiver::This)
-            && ctx.class_ctx.as_ref().is_some_and(|c| c.is_const);
+        let object_is_const = match receiver {
+            FromThisReceiver::This => ctx.class_ctx.as_ref().is_some_and(|c| c.is_const),
+            FromThisReceiver::Arrow(recv) => {
+                receiver_is_const(program, ctx, source, recv, true).unwrap_or(false)
+            }
+            FromThisReceiver::Dot(recv) => {
+                receiver_is_const(program, ctx, source, recv, false).unwrap_or(false)
+            }
+        };
         let mut memo = HashMap::default();
         match from_this_selection(program, ctx, &start, method, object_is_const, &mut memo) {
             FromThisSelection::Standard => start,
             FromThisSelection::Imported(imported) => imported,
             FromThisSelection::Hidden
+            | FromThisSelection::HiddenConst
             | FromThisSelection::NotViable
             | FromThisSelection::Template => return None,
         }
@@ -8685,6 +8867,10 @@ enum FromThisSelection {
     /// The standard member, selected through a class body's
     /// `using Base::member;`: lookup of the held class starts at `Base`.
     Imported(FromThisStart),
+    /// Non-template candidates on a non-const receiver that are all
+    /// `const`-qualified: they lose to a non-const standard member imported
+    /// into the same overload set, and hide the intrinsic otherwise.
+    HiddenConst,
     /// The name resolves only to member function templates the zero-argument
     /// call can take. A non-template selected at the same level (an imported
     /// standard member) wins, and when nothing else is selected the call is
@@ -8763,7 +8949,12 @@ fn select_from_this_level(
         let viable: Vec<FnId> = own
             .iter()
             .copied()
-            .filter(|&id| takes_no_arguments(program, id))
+            .filter(|&id| {
+                takes_no_arguments(program, id)
+                    && (!object_is_const
+                        || standard(id)
+                        || program.symbols.function(id).is_const_member)
+            })
             .collect();
         let member_template = |id: FnId| program.symbols.function(id).is_member_template;
         let hiding: Vec<FnId> = viable
@@ -8771,19 +8962,20 @@ fn select_from_this_level(
             .copied()
             .filter(|&id| !standard(id) && !member_template(id))
             .collect();
-        // An own `const` overload matches a non-const receiver's implicit
-        // object worse than the inherited non-const standard member, so it
-        // only hides the standard member when no import selects that one.
-        let deferred = !object_is_const
+        // A `const` overload matches a non-const receiver's implicit object
+        // worse than a non-const standard member, so it only hides the
+        // standard member when no import at this level selects one.
+        let mut hidden_const = !object_is_const
             && !hiding.is_empty()
             && hiding
                 .iter()
-                .all(|&id| program.symbols.function(id).is_const_member)
-            && standard_member_has_nonconst(program, &start.class, method);
-        if !hiding.is_empty() && !deferred {
+                .all(|&id| program.symbols.function(id).is_const_member);
+        if !hiding.is_empty() && !hidden_const {
             return Hidden;
         }
-        if viable.iter().any(|&id| standard(id)) {
+        if viable.iter().any(|&id| {
+            standard(id) && (!hidden_const || !program.symbols.function(id).is_const_member)
+        }) {
             return Standard;
         }
         let mut selected = None;
@@ -8808,6 +9000,7 @@ fn select_from_this_level(
             };
             match found {
                 Hidden => return Hidden,
+                HiddenConst => hidden_const = true,
                 NotViable => not_viable = true,
                 Template => template_selected = true,
                 found => {
@@ -8818,12 +9011,20 @@ fn select_from_this_level(
         // An imported non-template is preferred over an own member template
         // the call could take as well.
         if let Some(found) = selected {
-            return found;
+            let base_cls = match &found {
+                Imported(target) => &target.class,
+                _ => &start.class,
+            };
+            if !hidden_const
+                || standard_member_has_nonconst(program, base_cls, method)
+                || standard_member_has_nonconst(program, &start.class, method)
+            {
+                return found;
+            }
+            return HiddenConst;
         }
-        if !hiding.is_empty() {
-            // Deferred for a non-const standard member, which no import
-            // selected after all.
-            return Hidden;
+        if hidden_const {
+            return HiddenConst;
         }
         if template_selected || viable.iter().any(|&id| member_template(id)) {
             return Template;
@@ -8842,6 +9043,9 @@ fn standard_member_has_nonconst(program: &Program, cls: &str, method: &str) -> b
     let Some((_, base)) = from_this_base(program, cls) else {
         return false;
     };
+    if !program.types.is_struct_defined(&base) {
+        return true;
+    }
     let kind = trace_ir::MethodKind::Named(method.to_owned());
     program.ancestor_closure(&base).into_iter().any(|(cur, _)| {
         program
@@ -8872,10 +9076,14 @@ fn imported_start(
 ) -> Option<FromThisStart> {
     let (class, instance) = import_target(program, import)?;
     let Some(instance) = instance else {
+        let (instance, scope) = match base_instantiation_from(program, ctx, start, &class) {
+            Some((instance, scope)) => (Some(instance), scope),
+            None => (None, None),
+        };
         return Some(FromThisStart {
             class,
-            instance: None,
-            scope: None,
+            instance,
+            scope,
         });
     };
     let templates = unit_templates(program, ctx);
@@ -8891,25 +9099,34 @@ fn imported_start(
             scope: Some(import.class.clone()),
         });
     }
-    let substituted = template.zip(instantiation_reaching(
-        program,
-        ctx,
-        start.instance.as_deref(),
-        level,
-    ));
-    let instance = substituted.and_then(|(t, level_instance)| {
-        // Fixed names keep the scope the `using` is written in; the
-        // arguments the receiver supplies are named where `start`'s are.
-        let instance =
-            import_instance_in_declaration_scope(program, &import.class, &instance, &t.parameters);
-        let arguments =
-            crate::template_bases::bound_arguments(t, template_arguments(&level_instance));
-        crate::template_bases::substitute_parameters(&instance, &t.parameters, t.pack, &arguments)
-    });
+    let substituted = template.zip(base_instantiation_from(program, ctx, start, level));
+    let (instance, scope) = match substituted {
+        Some((t, (level_instance, level_scope))) => {
+            // Fixed names keep the scope the `using` is written in; the
+            // arguments the receiver supplies are named where `start`'s are.
+            let instance = import_instance_in_declaration_scope(
+                program,
+                &import.class,
+                &instance,
+                &t.parameters,
+            );
+            let arguments =
+                crate::template_bases::bound_arguments(t, template_arguments(&level_instance));
+            let instance = crate::template_bases::substitute_parameters(
+                &instance,
+                &t.parameters,
+                t.pack,
+                &arguments,
+            );
+            let scope = instance.as_ref().and(level_scope);
+            (instance, scope)
+        }
+        None => (None, None),
+    };
     Some(FromThisStart {
         class,
-        scope: instance.as_ref().and(start.scope.clone()),
         instance,
+        scope,
     })
 }
 
@@ -8937,34 +9154,68 @@ fn import_instance_in_declaration_scope(
     format!(
         "{}<{}>{}",
         &instance[..open],
-        args.join(", "),
+        args.join(","),
         template_tail(instance)
     )
 }
 
-/// One template argument of an import: a fixed name is qualified in the
-/// import's declaration scope, unless it mentions a parameter or is not a
-/// simple class spelling.
+/// One template argument of an import: fixed class names are qualified in the
+/// import's declaration scope, while template parameters remain as written.
 fn qualify_fixed_import_argument(
     program: &Program,
     scope: &str,
     arg: &str,
     parameters: &[Option<String>],
 ) -> String {
-    if crate::template_bases::mentions_parameters(arg, parameters) {
-        return arg.to_owned();
-    }
     let trimmed = arg.trim();
-    // A qualified or nested class spelling resolves as a whole; cv-qualified
-    // ones are left for the held-class lookup to strip.
     let (base, suffix) = split_pointer_suffix(trimmed);
-    if !suffix.is_empty() || base.contains(' ') || base.contains(['*', '&']) {
+    let stripped = strip_cv(base);
+    if crate::template_bases::mentions_parameters(stripped, parameters) {
+        if stripped.contains('<') && template_tail(stripped).trim().is_empty() {
+            let head = type_name_before_template(stripped).trim();
+            let head = if crate::template_bases::mentions_parameters(head, parameters) {
+                head.to_owned()
+            } else {
+                held_class_in_declaration_scope(program, scope, head)
+                    .unwrap_or_else(|| head.to_owned())
+            };
+            let args = template_arguments(stripped)
+                .into_iter()
+                .map(|a| qualify_fixed_import_argument(program, scope, &a, parameters))
+                .collect::<Vec<_>>();
+            if !args.is_empty() {
+                return format!("{head}<{}>{suffix}", args.join(","));
+            }
+        }
         return arg.to_owned();
     }
-    match held_class_in_declaration_scope(program, scope, base) {
+    if stripped.contains(' ') || stripped.contains(['*', '&']) {
+        return arg.to_owned();
+    }
+    match held_class_in_declaration_scope(program, scope, stripped) {
         Some(name) => format!("{name}{suffix}"),
         None => arg.to_owned(),
     }
+}
+
+/// The instantiation of class `class` that `start` is or reaches: through
+/// `start.instance` when spelled, else through a concrete template base fact
+/// of `start.class` (`M : H<M>`).
+fn base_instantiation_from(
+    program: &Program,
+    ctx: &LowerContext,
+    start: &FromThisStart,
+    class: &str,
+) -> Option<(String, Option<String>)> {
+    instantiation_reaching(
+        program,
+        ctx,
+        start.instance.as_deref(),
+        start.scope.as_deref(),
+        class,
+    )
+    .map(|instance| (instance, start.scope.clone()))
+    .or_else(|| concrete_base_instantiation(program, ctx, &start.class, class))
 }
 
 /// The instantiation of class `class` that `instance` is or reaches through
@@ -8974,28 +9225,33 @@ fn instantiation_reaching(
     program: &Program,
     ctx: &LowerContext,
     instance: Option<&str>,
+    scope: Option<&str>,
     class: &str,
 ) -> Option<String> {
     let instance = instance.filter(|i| i.contains('<'))?;
     if receiver_lookup_name(instance) == class {
         return Some(instance.to_owned());
     }
-    crate::template_bases::substituted_bases(
-        program,
-        instance,
-        &ctx.namespace_scope(),
-        unit_templates(program, ctx),
-    )
-    .into_iter()
-    .find(|base| receiver_lookup_name(base) == class)
+    let caller_scope;
+    let scope = match scope {
+        Some(scope) => scope,
+        None => {
+            caller_scope = ctx.namespace_scope();
+            &caller_scope
+        }
+    };
+    crate::template_bases::substituted_bases(program, instance, scope, unit_templates(program, ctx))
+        .into_iter()
+        .find(|base| receiver_lookup_name(base) == class)
 }
 
-/// The concrete base fact of `receiver` that names `class` with arguments
-/// (`H<M>` for `M : H<M>`), and the scope those arguments are named in. A
-/// receiver spelled without an instantiation (`M *p`) still determines its
-/// template base's arguments.
+/// The concrete base fact of `receiver` that names or reaches `class` with
+/// arguments (`H<M>` for `M : H<M>` or `M : J<M>`), and the scope those
+/// arguments are named in. A receiver spelled without an instantiation
+/// (`M *p`) still determines its template base's arguments.
 fn concrete_base_instantiation(
     program: &Program,
+    ctx: &LowerContext,
     receiver: &str,
     class: &str,
 ) -> Option<(String, Option<String>)> {
@@ -9006,12 +9262,17 @@ fn concrete_base_instantiation(
             program
                 .template_bases_of(cur)
                 .into_iter()
-                .find(|fact| {
-                    !fact.is_dependent
-                        && fact.spelling.contains('<')
-                        && receiver_lookup_name(&fact.spelling) == class
+                .filter(|fact| !fact.is_dependent && fact.spelling.contains('<'))
+                .find_map(|fact| {
+                    let instance = instantiation_reaching(
+                        program,
+                        ctx,
+                        Some(&fact.spelling),
+                        Some(&fact.declaration_scope),
+                        class,
+                    )?;
+                    Some((instance, Some(fact.declaration_scope.clone())))
                 })
-                .map(|fact| (fact.spelling.clone(), Some(fact.declaration_scope.clone())))
         })
 }
 
@@ -9083,13 +9344,18 @@ fn member_declarations_memo(
     let kind = trace_ir::MethodKind::Named(name.to_owned());
     let mut result = Vec::new();
     for (cur, _) in program.ancestor_closure(cls) {
-        let mut found = program.symbols.functions_named(&kind.name_on(cur));
+        let own = program.symbols.functions_named(&kind.name_on(cur));
+        let mut found = own.clone();
         for import in class_imports(program, cur, name) {
             let Some((class, _)) = import_target(program, import) else {
                 continue;
             };
             for member in member_declarations_memo(program, &class, name, memo) {
-                if !found.contains(&member) {
+                if !found.contains(&member)
+                    && !own
+                        .iter()
+                        .any(|&own_id| has_same_signature(program, own_id, member))
+                {
                     found.push(member);
                 }
             }
@@ -9117,7 +9383,10 @@ fn import_target(
     let (head, _) = import.target.rsplit_once("::")?;
     let head = head.trim();
     if let Some(global) = head.strip_prefix("::") {
-        let class = declared_class_of(program, global)?;
+        let class = declared_class_of(program, global).or_else(|| {
+            let lookup = receiver_lookup_name(global);
+            (last_type_segment(&lookup) == ENABLE_SHARED_FROM_THIS).then(|| lookup.into_owned())
+        })?;
         return Some((class, spelled_instantiation(program, global, global)));
     }
     if let Some(found) = qualifier_in_class_scope(program, &import.class, head) {
@@ -9137,10 +9406,17 @@ fn import_target(
             return Some((found, spelled_instantiation(program, &candidate, head)));
         }
         if scope.is_empty() {
-            return None;
+            break;
         }
         scope = scope.rsplit_once("::").map_or("", |(parent, _)| parent);
     }
+    let lookup = receiver_lookup_name(head);
+    (last_type_segment(&lookup) == ENABLE_SHARED_FROM_THIS).then(|| {
+        (
+            lookup.into_owned(),
+            spelled_instantiation(program, head, head),
+        )
+    })
 }
 
 /// The class a member qualifier `name` (`Base` in `p->Base::f()` or
@@ -9193,6 +9469,15 @@ fn declared_class_of(program: &Program, name: &str) -> Option<String> {
         .types
         .declared_class(name)
         .or_else(|| program.types.declared_class(&receiver_lookup_name(name)))
+        .or_else(|| {
+            let TypeDesc::Struct { name, .. } =
+                program.types.resolve_alias(name.trim_start_matches("::"))?
+            else {
+                return None;
+            };
+            let class = receiver_lookup_name(name);
+            (last_type_segment(&class) == ENABLE_SHARED_FROM_THIS).then(|| class.into_owned())
+        })
 }
 
 /// Whether function `id` declares the standard `enable_shared_from_this`
@@ -9628,8 +9913,11 @@ fn call_may_return_reference(
     if call.cached_kind() != "call_expression" {
         return false;
     }
-    let Some(CallResult::Overload { candidates, .. }) =
-        call_result_shape(program, ctx, source, call)
+    let Some(CallResult::Overload {
+        candidates,
+        receiver_is_const,
+        ..
+    }) = call_result_shape(program, ctx, source, call)
     else {
         return false;
     };
@@ -9652,6 +9940,7 @@ fn call_may_return_reference(
         candidates,
         &args,
         &null_constant_args(source, &nodes),
+        receiver_is_const,
     )
     .into_iter()
     .any(|candidate| ctx.reference_returns.contains(&candidate))
@@ -10195,7 +10484,7 @@ fn class_template_parameters(
 struct ClassSpelling {
     /// The class, qualified, without template arguments.
     resolved: String,
-    /// As written, whitespace removed.
+    /// As written, spacing normalized.
     written: String,
     /// `resolved` with the written arguments, for a templated spelling.
     qualified: Option<String>,
@@ -11610,6 +11899,27 @@ fn lower_one_declarator(
         ctx.reference_bindings.insert(var_id);
         ctx.address_references.insert(var_id);
     }
+    let is_ptr_type =
+        is_ptr || matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
+    let is_const_decl = object_declaration(span_node).is_some_and(|declaration| {
+        declaration_is_constant(source, declaration)
+            || (declaration
+                .cached_field("type")
+                .is_some_and(|ty| is_placeholder_type(ctx, ty))
+                && (is_ptr_type || ctx.reference_bindings.contains(&var_id))
+                && init_expr.and_then(|init| {
+                    receiver_is_const(
+                        program,
+                        ctx,
+                        source,
+                        init,
+                        is_ptr_type && !ctx.reference_bindings.contains(&var_id),
+                    )
+                }) == Some(true))
+    });
+    if is_const_decl {
+        ctx.const_variables.insert(var_id);
+    }
     let span = node_span(program, ctx, span_node);
     let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
     let is_namespaced = namespace_scoped(ctx, storage);
@@ -12258,11 +12568,11 @@ fn lower_function_decl(
     is_static: bool,
     reference_return: bool,
 ) {
-    let (name, _) = parse_declarator_name(source, decl);
-    if name.is_empty() {
+    let (raw_name, _) = parse_declarator_name(source, decl);
+    if raw_name.is_empty() {
         return;
     }
-    let name = ctx.qualify_decl(&name);
+    let name = ctx.qualify_decl(&raw_name);
     let ret_type = if return_is_dependent(ctx, source, decl) {
         program.types.unknown()
     } else {
@@ -12303,8 +12613,8 @@ fn lower_function_decl(
         variadic: shape.variadic,
         defaulted_in_class: false,
         declared_in_class: false,
-        is_member_template: false,
-        is_const_member: false,
+        is_member_template: ctx.is_cpp && is_member_function_template(source, decl),
+        is_const_member: ctx.is_cpp && function_is_const_qualified(source, decl),
         is_static_member: false,
         is_virtual: false,
         is_final: false,
@@ -14109,7 +14419,10 @@ fn rank_per_class(
     if targets.len() <= 1 {
         return targets;
     }
-    let declared = declared_members_upward(program, cls, kind);
+    let declared = match kind {
+        trace_ir::MethodKind::Named(name) => class_member_declarations(program, cls, name),
+        _ => declared_members_upward(program, cls, kind),
+    };
     let own: Vec<FnId> = targets
         .iter()
         .copied()
@@ -14454,7 +14767,10 @@ fn is_bare_callee_node(func: Node, name: &str) -> bool {
 fn has_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
     let fa = program.symbols.function(a);
     let fb = program.symbols.function(b);
-    if fa.variadic != fb.variadic {
+    if fa.variadic != fb.variadic
+        || fa.is_const_member != fb.is_const_member
+        || fa.is_member_template != fb.is_member_template
+    {
         return false;
     }
     let a_skip = usize::from(has_this_param(program, a));
@@ -17604,6 +17920,7 @@ fn receiver_desc(
                 Some(CallResult::Overload {
                     candidates,
                     receiver,
+                    receiver_is_const,
                 }) => {
                     let nodes = call_arg_nodes(node);
                     let args: Vec<TypeDesc> = nodes
@@ -17612,7 +17929,15 @@ fn receiver_desc(
                         .collect();
                     let nulls = null_constant_args(source, &nodes);
                     call_result_among(
-                        program, ctx, source, node, candidates, receiver, &args, &nulls,
+                        program,
+                        ctx,
+                        source,
+                        node,
+                        candidates,
+                        receiver,
+                        receiver_is_const,
+                        &args,
+                        &nulls,
                     )
                 }
                 None => None,
@@ -21202,8 +21527,109 @@ fn parenthesized_data_member(
 }
 
 fn declaration_is_constant(source: &str, node: Node) -> bool {
-    node.children(&mut node.walk())
-        .any(|child| matches!(node_text(source, &child), "const" | "constexpr"))
+    node.children(&mut node.walk()).any(|child| {
+        matches!(node_text(source, &child), "const" | "constexpr")
+            || (child.cached_kind() == "placeholder_type_specifier"
+                && child
+                    .children(&mut child.walk())
+                    .any(|c| matches!(node_text(source, &c), "const" | "constexpr")))
+    })
+}
+
+/// Whether the object a member call's receiver expression designates is
+/// `const` (`Some(true)`), non-`const` (`Some(false)`), or unknown (`None`).
+fn receiver_is_const(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    recv: Node,
+    arrow: bool,
+) -> Option<bool> {
+    let recv = peel_expression(recv);
+    if recv.cached_kind() == "this" {
+        return ctx.class_ctx.as_ref().map(|c| c.is_const);
+    }
+    if recv.cached_kind() == "cast_expression" {
+        let ty = recv.cached_field("type")?;
+        return Some(spelled_type_is_const(node_text(source, &ty), arrow));
+    }
+    if recv.cached_kind() == "call_expression" {
+        if let Some(func) = recv.cached_field("function") {
+            let text = node_text(source, &func);
+            let head = type_name_before_template(text).trim();
+            let head = head.strip_prefix("::").unwrap_or(head);
+            let head = head.strip_prefix("std::").unwrap_or(head);
+            if matches!(
+                head,
+                "static_cast" | "const_cast" | "reinterpret_cast" | "dynamic_cast"
+            ) {
+                let [arg]: [String; 1] = template_arguments(text).try_into().ok()?;
+                return Some(spelled_type_is_const(&arg, arrow));
+            }
+            if matches!(head, "move" | "forward") {
+                if let Some(&arg) = call_arg_nodes(recv).first() {
+                    return receiver_is_const(program, ctx, source, arg, arrow);
+                }
+            }
+        }
+        return None;
+    }
+    if let Some(operand) = (!arrow).then(|| deref_operand(source, recv)).flatten() {
+        return receiver_is_const(program, ctx, source, operand, true);
+    }
+    if recv.cached_kind() == "pointer_expression"
+        && arrow
+        && pointer_op(source, recv).as_deref() == Some("&")
+    {
+        if let Some(operand) = recv
+            .cached_field("argument")
+            .or_else(|| recv.named_child(0))
+        {
+            return receiver_is_const(program, ctx, source, operand, false);
+        }
+    }
+    if matches!(recv.cached_kind(), "identifier" | "qualified_identifier") {
+        if recv.cached_kind() == "identifier"
+            && implicit_this_field(program, ctx, source, recv).is_some()
+        {
+            if arrow || names_reference_member(program, ctx, source, recv) {
+                return None;
+            }
+            return ctx.class_ctx.as_ref().map(|c| c.is_const);
+        }
+        let var = lookup_var_node(program, ctx, source, recv)?;
+        let desc = program
+            .types
+            .get(program.symbols.variable(var).type_id)
+            .desc
+            .as_ref();
+        // An overloaded `operator->` on a smart-pointer wrapper returns its
+        // pointee type regardless of whether the wrapper variable itself is
+        // `const`.
+        if arrow && !matches!(desc, TypeDesc::Ptr(_)) {
+            return None;
+        }
+        return Some(ctx.const_variables.contains(&var));
+    }
+    if recv.cached_kind() == "field_expression" && !arrow {
+        if static_member_access(program, ctx, source, recv).is_some()
+            || names_reference_member(program, ctx, source, recv)
+        {
+            return None;
+        }
+        let base = recv.cached_field("argument")?;
+        return receiver_is_const(program, ctx, source, base, is_arrow_access(recv));
+    }
+    None
+}
+
+fn spelled_type_is_const(spelled: &str, arrow: bool) -> bool {
+    let (base, suffix) = split_pointer_suffix(spelled);
+    if arrow && !suffix.contains('*') {
+        return false;
+    }
+    let base = base.trim();
+    strip_cv(base) != base
 }
 
 /// Bounded integer folding for array extents. Unknown names and unsupported

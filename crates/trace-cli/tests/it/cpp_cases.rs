@@ -11772,6 +11772,300 @@ void Use(D *p) { auto x = p->f(); x->Good(); }
     assert!(has_any_edge(&program, &analysis, "Use", "R::Good"));
 }
 
+#[test]
+fn injected_base_import_recovers_concrete_base_specialization_without_receiver_instance() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"template <class T> struct H : std::enable_shared_from_this<T> {};
+struct M : H<M> {
+    using H::shared_from_this;
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void M::Good() {}
+void Use(M *p) { auto x = p->shared_from_this(); x->Good(); }
+template <class T> struct J : H<T> {
+    using H<T>::shared_from_this;
+};
+struct N : J<N> {
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void N::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let m_x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, m_x), "std::shared_ptr<M>", "M::Run::x");
+    assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
+    let use_x = common::local_variable(&program, "Use", "x");
+    assert_eq!(type_name(&program, use_x), "std::shared_ptr<M>", "Use::x");
+    assert!(has_any_edge(&program, &analysis, "Use", "M::Good"));
+    let n_x = common::local_variable(&program, "N::Run", "x");
+    assert_eq!(type_name(&program, n_x), "std::shared_ptr<N>", "N::Run::x");
+    assert!(has_any_edge(&program, &analysis, "N::Run", "N::Good"));
+}
+
+#[test]
+fn explicit_standard_base_import_works_without_indexed_memory_headers() {
+    let source = r#"namespace std {
+template <class T> struct shared_ptr { T *operator->() const; };
+}
+struct A { void Good(); };
+void A::Good() {}
+struct B { void Good(); };
+void B::Good() {}
+struct M : std::enable_shared_from_this<A>, std::enable_shared_from_this<B> {
+    using std::enable_shared_from_this<B>::shared_from_this;
+};
+void Run(M *p) { auto x = p->shared_from_this(); x->Good(); }
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<B>", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "B::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "A::Good"));
+}
+
+#[test]
+fn member_template_and_non_template_overload_stay_distinct() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct S { void Good(); };
+void S::Good() {}
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<S> shared_from_this();
+    template <class U = void> std::shared_ptr<Other> shared_from_this();
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void M::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<S>", "M::Run::x");
+    assert!(has_any_edge(&program, &analysis, "M::Run", "S::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "M::Run", "M::Good"));
+}
+
+#[test]
+fn out_of_class_member_definitions_match_their_cv_declaration() {
+    let source = r#"void MutableBody() {}
+void ConstBody() {}
+struct C {
+    int *f() const;
+    int *f();
+};
+int *C::f() { MutableBody(); return nullptr; }
+int *C::f() const { ConstBody(); return nullptr; }
+"#;
+    let (program, _) = common::analyze_source(&[("main.cpp", source)]);
+    let defs: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "C::f")
+        .collect();
+    assert_eq!(defs.len(), 2, "two distinct C::f overloads: {defs:?}");
+    assert!(defs.iter().all(|f| f.is_defined));
+    assert_eq!(defs.iter().filter(|f| f.is_const_member).count(), 1);
+    assert_eq!(defs.iter().filter(|f| !f.is_const_member).count(), 1);
+}
+
+#[test]
+fn explicit_const_receiver_selects_const_hiding_member() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<Other> shared_from_this() const;
+    void Good() const;
+    void Run() const { auto x = this->shared_from_this(); x->OtherOnly(); }
+};
+void M::Good() const {}
+void Use(const M *p) { auto x = p->shared_from_this(); x->OtherOnly(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for caller in ["M::Run", "Use"] {
+        let x = common::local_variable(&program, caller, "x");
+        assert_eq!(
+            type_name(&program, x),
+            "std::shared_ptr<Other>",
+            "{caller}::x"
+        );
+        assert!(has_any_edge(
+            &program,
+            &analysis,
+            caller,
+            "Other::OtherOnly"
+        ));
+        assert!(must_not_have_edge(&program, &analysis, caller, "M::Good"));
+    }
+}
+
+#[test]
+fn non_const_own_member_is_not_viable_on_const_object() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<Other> shared_from_this();
+    void Good() const;
+    void Run() const { auto x = shared_from_this(); x->Good(); }
+};
+void M::Good() const {}
+void Use(const M *p) { auto x = p->shared_from_this(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for caller in ["M::Run", "Use"] {
+        let x = common::local_variable(&program, caller, "x");
+        assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "{caller}::x");
+        assert!(has_any_edge(&program, &analysis, caller, "M::Good"));
+        assert!(must_not_have_edge(
+            &program,
+            &analysis,
+            caller,
+            "Other::OtherOnly"
+        ));
+    }
+}
+
+#[test]
+fn imported_const_overload_loses_to_imported_non_const_standard_member() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct S { void Good(); };
+void S::Good() {}
+struct A {
+    std::shared_ptr<S> shared_from_this() const;
+};
+struct M : A, std::enable_shared_from_this<M> {
+    using A::shared_from_this;
+    using std::enable_shared_from_this<M>::shared_from_this;
+    void Good();
+    void Run() { auto x = shared_from_this(); x->Good(); }
+};
+void M::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "M::Run::x");
+    assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "M::Run", "S::Good"));
+}
+
+#[test]
+fn ordinary_member_call_types_result_by_receiver_constness() {
+    let source = r#"struct R { void Good(); };
+void R::Good() {}
+struct S { void Good(); };
+void S::Good() {}
+struct C {
+    R *f() { return nullptr; }
+    S *f() const { return nullptr; }
+};
+void RunMutable(C *p) { auto x = p->f(); x->Good(); }
+void RunConst(const C *p) { auto x = p->f(); x->Good(); }
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    let mx = common::local_variable(&program, "RunMutable", "x");
+    assert_eq!(pointee_name(&program, mx), "R", "RunMutable::x");
+    assert!(has_any_edge(&program, &analysis, "RunMutable", "R::Good"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "RunMutable",
+        "S::Good"
+    ));
+    let cx = common::local_variable(&program, "RunConst", "x");
+    assert_eq!(pointee_name(&program, cx), "S", "RunConst::x");
+    assert!(has_any_edge(&program, &analysis, "RunConst", "S::Good"));
+    assert!(must_not_have_edge(
+        &program, &analysis, "RunConst", "R::Good"
+    ));
+}
+
+#[test]
+fn cv_qualified_fixed_import_argument_keeps_declaration_scope() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct A { void Good(); };
+void A::Good() {}
+namespace n {
+struct A { void Good(); };
+void A::Good() {}
+template <class T, class V> struct H : std::enable_shared_from_this<V> {};
+template <class T> struct J : H<T, const A> {
+    using n::H<T, const A>::shared_from_this;
+};
+}
+struct M {};
+void Run(n::J<M> *p) { auto x = p->shared_from_this(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<n::A>", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "n::A::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "A::Good"));
+}
+
+#[test]
+fn dependent_template_import_argument_qualifies_fixed_inner_names() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct A {};
+template <class T, class V> struct Box { void Good(); };
+template <class T, class V> void Box<T, V>::Good() {}
+namespace n {
+struct A {};
+template <class T, class V> struct Box { void Good(); };
+template <class T, class V> void Box<T, V>::Good() {}
+template <class T> struct J : std::enable_shared_from_this<Box<T, A>> {
+    using std::enable_shared_from_this<Box<T, A>>::shared_from_this;
+};
+}
+struct M {};
+void Run(n::J<M> *p) { auto x = p->shared_from_this(); x->Good(); }
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(
+        type_name(&program, x),
+        "std::shared_ptr<n::Box<M,n::A>>",
+        "Run::x"
+    );
+    assert!(has_any_edge(&program, &analysis, "Run", "n::Box::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "Box::Good"));
+}
+
+#[test]
+fn same_arity_imported_overload_is_ranked_with_own_declaration() {
+    let source = r#"struct R { void Good(); };
+void R::Good() {}
+struct Other { void Bad(); };
+void Other::Bad() {}
+struct A { R *f(int) { return nullptr; } };
+struct D : A {
+    using A::f;
+    Other *f(double) { return nullptr; }
+};
+void Run(D *p) { auto x = p->f(1); x->Good(); }
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(pointee_name(&program, x), "R", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "A::f"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "D::f"));
+    assert!(has_any_edge(&program, &analysis, "Run", "R::Good"));
+}
+
 /// The source of the one receiver copy into `result` in `func`.
 fn promotion_source(program: &Program, func: &str, result: &str) -> trace_ir::VarId {
     let result = common::local_variable(program, func, result);
