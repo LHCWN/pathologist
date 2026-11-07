@@ -11748,6 +11748,12 @@ fn pointer_depth(desc: &TypeDesc) -> usize {
 /// How many `*` a declarator puts in front of its name, through references
 /// and parentheses (`**p`, `*&p`).
 fn declarator_pointer_depth(decl: Node) -> usize {
+    pointer_declarators(decl).count()
+}
+
+/// The pointer declarators on the way from `decl` to the declared name,
+/// outermost first, through references and parentheses.
+fn pointer_declarators(decl: Node) -> impl Iterator<Item = Node> {
     std::iter::successors(Some(decl), |d| {
         d.cached_field("declarator").or_else(|| {
             matches!(
@@ -11759,7 +11765,18 @@ fn declarator_pointer_depth(decl: Node) -> usize {
         })
     })
     .filter(|d| d.cached_kind() == "pointer_declarator")
-    .count()
+}
+
+/// Whether the pointer a declarator declares is itself `const` (`T * const p`,
+/// `T * * const p`). The qualifier belongs to the pointer declarator nearest
+/// the name, so it is read from the syntax tree: a named declarator's text
+/// ends with the name, not with `const`.
+fn declarator_pointer_is_const(source: &str, decl: Node) -> bool {
+    pointer_declarators(decl).last().is_some_and(|pointer| {
+        pointer.children(&mut pointer.walk()).any(|child| {
+            child.cached_kind() == "type_qualifier" && node_text(source, &child) == "const"
+        })
+    })
 }
 
 /// Returns whether recovery also walked the declaration's evaluated expressions.
@@ -22852,7 +22869,9 @@ fn spelled_type_cv(
         }
     }
 
-    if spelled.contains('<') {
+    // A pointer or reference to a smart pointer is peeled below first; only
+    // the wrapper itself is read as one.
+    if spelled.contains('<') && peel_outer_declarator(spelled).is_none() {
         let head = type_name_before_template(spelled).trim();
         let seg = last_type_segment(head).trim();
         if matches!(
@@ -22919,8 +22938,7 @@ fn declaration_cv_qualification(
             }
             let is_ptr_decl = decl.is_some_and(|d| declarator_pointer_depth(d) > 0);
             if is_ptr_decl {
-                let decl_text = decl.map(|d| node_text(source, &d)).unwrap_or("");
-                let top_const = has_trailing_const(decl_text);
+                let top_const = decl.is_some_and(|d| declarator_pointer_is_const(source, d));
                 let pointee_const = has_decl_const
                     || receiver_is_const(program, ctx, source, init, true) == Some(true);
                 return trace_ir::CvQualification {
@@ -22947,8 +22965,7 @@ fn declaration_cv_qualification(
         }
         let is_ptr_decl = decl.is_some_and(|d| declarator_pointer_depth(d) > 0);
         if is_ptr_decl {
-            let decl_text = decl.map(|d| node_text(source, &d)).unwrap_or("");
-            let top_const = has_trailing_const(decl_text);
+            let top_const = decl.is_some_and(|d| declarator_pointer_is_const(source, d));
             return trace_ir::CvQualification {
                 object_const: if is_variable {
                     top_const || is_constexpr
@@ -22978,8 +22995,7 @@ fn declaration_cv_qualification(
         let ptr_depth = declarator_pointer_depth(decl);
         let has_ref = declares_reference(decl) || is_ref;
         if ptr_depth > 0 {
-            let decl_text = node_text(source, &decl);
-            let top_const = has_trailing_const(decl_text);
+            let top_const = declarator_pointer_is_const(source, decl);
             let pointee_const = base_cv.object_const;
             return trace_ir::CvQualification {
                 object_const: if is_variable {
@@ -27672,6 +27688,57 @@ mod spelled_cv_tests {
         assert_eq!(cv("const T* const&"), (true, Some(true)));
         assert_eq!(cv("volatile T*"), (false, Some(false)));
         assert_eq!(cv("volatile T&"), (false, None));
+    }
+
+    #[test]
+    fn pointers_and_references_to_smart_pointers_are_peeled_first() {
+        // The pointer is not the smart pointer: its pointee is the wrapper.
+        assert_eq!(cv("std::shared_ptr<T>*"), (false, Some(false)));
+        assert_eq!(cv("std::shared_ptr<const T>*"), (false, Some(false)));
+        assert_eq!(cv("std::shared_ptr<T> const*"), (false, Some(true)));
+        assert_eq!(cv("std::shared_ptr<T>* const"), (true, Some(false)));
+        assert_eq!(cv("std::shared_ptr<T>&"), (false, Some(false)));
+        assert_eq!(cv("std::shared_ptr<T> const&"), (true, Some(false)));
+        assert_eq!(cv("std::shared_ptr<const T>&"), (false, Some(true)));
+        assert_eq!(cv("const std::shared_ptr<T>&"), (true, Some(false)));
+        // The wrapper itself.
+        assert_eq!(cv("std::shared_ptr<const T>"), (false, Some(true)));
+        assert_eq!(cv("std::shared_ptr<T> const"), (true, Some(false)));
+    }
+
+    #[test]
+    fn named_declarators_report_their_own_pointer_constness() {
+        let source = "int * const a; int * b; int * * const c; int * const * d;\n\
+                      const int * e; int * const f = 0; int * * g = 0;\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let found: Vec<(String, bool)> = root
+            .named_children(&mut cursor)
+            .filter(|n| n.cached_kind() == "declaration")
+            .map(|n| {
+                let declarator = n.cached_field("declarator").unwrap();
+                let text = node_text(source, &declarator).to_string();
+                (text, declarator_pointer_is_const(source, declarator))
+            })
+            .collect();
+        let expected = [
+            ("* const a", true),
+            ("* b", false),
+            ("* * const c", true),
+            ("* const * d", false),
+            ("* e", false),
+            ("* const f = 0", true),
+            ("* * g = 0", false),
+        ];
+        assert_eq!(
+            found,
+            expected.map(|(text, is_const)| (text.to_string(), is_const))
+        );
     }
 
     #[test]
