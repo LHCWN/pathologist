@@ -11969,25 +11969,44 @@ struct C {
     R *f() { return nullptr; }
     S *f() const { return nullptr; }
 };
+C g;
+const C cg{};
 void RunMutable(C *p) { auto x = p->f(); x->Good(); }
+void RunTopConstAuto(C *c) { const auto p = c; auto x = p->f(); x->Good(); }
+void RunTopConstAutoRef(C *c) { const auto &r = c; auto x = r->f(); x->Good(); }
+void RunConstexprAuto() { constexpr auto p = &g; auto x = p->f(); x->Good(); }
+void RunConstPtr(C *const p) { auto x = p->f(); x->Good(); }
 void RunConst(const C *p) { auto x = p->f(); x->Good(); }
+void RunPointeeConstAuto(C *c) { const auto *p = c; auto x = p->f(); x->Good(); }
+void RunDeducedConstAuto(const C *c) { const auto p = c; auto x = p->f(); x->Good(); }
+void RunDeducedConstAutoRef(const C *c) { const auto &r = c; auto x = r->f(); x->Good(); }
+void RunConstexprAutoConst() { constexpr auto p = &cg; auto x = p->f(); x->Good(); }
 "#;
     let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
-    let mx = common::local_variable(&program, "RunMutable", "x");
-    assert_eq!(pointee_name(&program, mx), "R", "RunMutable::x");
-    assert!(has_any_edge(&program, &analysis, "RunMutable", "R::Good"));
-    assert!(must_not_have_edge(
-        &program,
-        &analysis,
+    for caller in [
         "RunMutable",
-        "S::Good"
-    ));
-    let cx = common::local_variable(&program, "RunConst", "x");
-    assert_eq!(pointee_name(&program, cx), "S", "RunConst::x");
-    assert!(has_any_edge(&program, &analysis, "RunConst", "S::Good"));
-    assert!(must_not_have_edge(
-        &program, &analysis, "RunConst", "R::Good"
-    ));
+        "RunTopConstAuto",
+        "RunTopConstAutoRef",
+        "RunConstexprAuto",
+        "RunConstPtr",
+    ] {
+        let mx = common::local_variable(&program, caller, "x");
+        assert_eq!(pointee_name(&program, mx), "R", "{caller}::x");
+        assert!(has_any_edge(&program, &analysis, caller, "R::Good"));
+        assert!(must_not_have_edge(&program, &analysis, caller, "S::Good"));
+    }
+    for caller in [
+        "RunConst",
+        "RunPointeeConstAuto",
+        "RunDeducedConstAuto",
+        "RunDeducedConstAutoRef",
+        "RunConstexprAutoConst",
+    ] {
+        let cx = common::local_variable(&program, caller, "x");
+        assert_eq!(pointee_name(&program, cx), "S", "{caller}::x");
+        assert!(has_any_edge(&program, &analysis, caller, "S::Good"));
+        assert!(must_not_have_edge(&program, &analysis, caller, "R::Good"));
+    }
 }
 
 #[test]

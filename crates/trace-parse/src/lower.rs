@@ -7446,7 +7446,15 @@ fn lower_parameter(
         name = format!("$arg{index}");
     }
     let var_id = program.symbols.alloc_var_id();
-    if declaration_is_constant(source, node) {
+    let is_ptr_var =
+        matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_)) && !address;
+    let is_const = if is_ptr_var {
+        declarator.is_some_and(|d| declarator_pointer_depth(d) > 0)
+            && declaration_has_const(source, node)
+    } else {
+        declaration_is_constant(source, node)
+    };
+    if is_const {
         ctx.const_variables.insert(var_id);
     }
     if let Some(declarator) = declarator {
@@ -11901,23 +11909,30 @@ fn lower_one_declarator(
         ctx.reference_bindings.insert(var_id);
         ctx.address_references.insert(var_id);
     }
-    let is_ptr_type =
-        is_ptr || matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
+    let is_ptr_var = matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_))
+        && !ctx.address_references.contains(&var_id);
+    let has_ptr_declarator = declarator_pointer_depth(decl) > 0
+        || span_node
+            .parent()
+            .is_some_and(|p| p.cached_kind() == "pointer_declarator");
     let is_const_decl = object_declaration(span_node).is_some_and(|declaration| {
-        declaration_is_constant(source, declaration)
-            || (declaration
-                .cached_field("type")
-                .is_some_and(|ty| is_placeholder_type(ctx, ty))
-                && (is_ptr_type || ctx.reference_bindings.contains(&var_id))
-                && init_expr.and_then(|init| {
-                    receiver_is_const(
-                        program,
-                        ctx,
-                        source,
-                        init,
-                        is_ptr_type && !ctx.reference_bindings.contains(&var_id),
-                    )
-                }) == Some(true))
+        let placeholder = declaration
+            .cached_field("type")
+            .is_some_and(|ty| is_placeholder_type(ctx, ty));
+        if is_ptr_var {
+            (has_ptr_declarator && declaration_has_const(source, declaration))
+                || (placeholder
+                    && init_expr
+                        .and_then(|init| receiver_is_const(program, ctx, source, init, true))
+                        == Some(true))
+        } else {
+            declaration_is_constant(source, declaration)
+                || (placeholder
+                    && ctx.reference_bindings.contains(&var_id)
+                    && init_expr
+                        .and_then(|init| receiver_is_const(program, ctx, source, init, false))
+                        == Some(true))
+        }
     });
     if is_const_decl {
         ctx.const_variables.insert(var_id);
@@ -21535,6 +21550,16 @@ fn declaration_is_constant(source: &str, node: Node) -> bool {
                 && child
                     .children(&mut child.walk())
                     .any(|c| matches!(node_text(source, &c), "const" | "constexpr")))
+    })
+}
+
+fn declaration_has_const(source: &str, node: Node) -> bool {
+    node.children(&mut node.walk()).any(|child| {
+        node_text(source, &child) == "const"
+            || (child.cached_kind() == "placeholder_type_specifier"
+                && child
+                    .children(&mut child.walk())
+                    .any(|c| node_text(source, &c) == "const"))
     })
 }
 
