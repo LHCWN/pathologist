@@ -213,7 +213,7 @@ struct LowerContext {
     type_scope: RefCell<Vec<String>>,
     /// Typedefs and `using` aliases declared in the blocks of the function
     /// being lowered, innermost last; each block drops its own on exit.
-    local_aliases: Vec<(String, TypeDesc, bool, trace_ir::CvQualification)>,
+    local_aliases: Vec<(String, TypeDesc, Option<bool>, trace_ir::CvQualification)>,
     declaration_syntax: RefCell<DeclarationSyntaxCache>,
     /// Gates C++-specific lowering (qualified members, CHA, namespaces).
     /// True for C++ TUs/headers and for `.h` files reached from a C++ TU.
@@ -4331,9 +4331,14 @@ fn register_typedef_alias(
     node: Node,
     alias: &str,
     desc: TypeDesc,
-    reference: bool,
+    ref_kind: Option<bool>,
     cv: trace_ir::CvQualification,
 ) {
+    let (reference, rvalue_reference) = match ref_kind {
+        Some(true) => (true, true),
+        Some(false) => (true, false),
+        None => (false, false),
+    };
     if ctx.is_cpp
         && node
             .parent()
@@ -4341,23 +4346,29 @@ fn register_typedef_alias(
     {
         if let Some(cls) = ctx.type_scope.borrow().last() {
             let name = format!("{cls}::{alias}");
-            program
-                .types
-                .register_alias_with_reference(&name, desc, reference);
+            program.types.register_alias_with_reference_kind(
+                &name,
+                desc,
+                reference,
+                rvalue_reference,
+            );
             program.types.register_alias_qualification(&name, cv);
         }
         return;
     }
     if ctx.is_cpp && ctx.ns_stack.iter().any(Option::is_some) {
         let qual = ctx.qualify(alias);
-        program
-            .types
-            .register_alias_with_reference(&qual, desc.clone(), reference);
+        program.types.register_alias_with_reference_kind(
+            &qual,
+            desc.clone(),
+            reference,
+            rvalue_reference,
+        );
         program.types.register_alias_qualification(&qual, cv);
     }
     program
         .types
-        .register_alias_with_reference(alias, desc, reference);
+        .register_alias_with_reference_kind(alias, desc, reference, rvalue_reference);
     if ctx.is_cpp {
         program.types.register_alias_qualification(alias, cv);
     }
@@ -4365,8 +4376,8 @@ fn register_typedef_alias(
 
 /// A `typedef` or `using Alias = T;` at namespace or class scope.
 fn lower_alias(program: &mut Program, ctx: &LowerContext, source: &str, node: Node) {
-    if let Some((alias, desc, reference, cv)) = declared_alias(program, ctx, source, node) {
-        register_typedef_alias(program, ctx, node, &alias, desc, reference, cv);
+    if let Some((alias, desc, ref_kind, cv)) = declared_alias(program, ctx, source, node) {
+        register_typedef_alias(program, ctx, node, &alias, desc, ref_kind, cv);
     }
 }
 
@@ -4378,7 +4389,7 @@ fn declared_alias(
     ctx: &LowerContext,
     source: &str,
     node: Node,
-) -> Option<(String, TypeDesc, bool, trace_ir::CvQualification)> {
+) -> Option<(String, TypeDesc, Option<bool>, trace_ir::CvQualification)> {
     let (name, desc) = match node.cached_kind() {
         "type_definition" => typedef_alias(program, ctx, source, node),
         "alias_declaration" => using_alias(program, ctx, source, node),
@@ -4389,7 +4400,7 @@ fn declared_alias(
     } else {
         node
     };
-    let reference = declaration_is_reference(program, ctx, source, declaration);
+    let ref_kind = declaration_reference_kind(program, ctx, source, declaration);
     let cv = if !ctx.is_cpp {
         trace_ir::CvQualification::default()
     } else if node.cached_kind() == "alias_declaration" {
@@ -4402,11 +4413,11 @@ fn declared_alias(
             node,
             node.cached_field("declarator"),
             None,
-            reference,
+            ref_kind.is_some(),
             false,
         )
     };
-    Some((name, desc, reference, cv))
+    Some((name, desc, ref_kind, cv))
 }
 
 /// The name a `typedef` declares and the type it stands for.
@@ -4504,13 +4515,13 @@ fn resolve_alias_cv(
     name: &str,
 ) -> Option<(trace_ir::CvQualification, bool)> {
     let name = normalize_qualified(name);
-    if let Some((_, _, reference, cv)) = ctx
+    if let Some((_, _, ref_kind, cv)) = ctx
         .local_aliases
         .iter()
         .rev()
         .find(|(alias, _, _, _)| alias == &name)
     {
-        return Some((*cv, *reference));
+        return Some((*cv, ref_kind.is_some()));
     }
     find_in_scope(program, ctx, &name, |candidate, _| {
         program.types.resolve_alias(candidate).map(|_| {
@@ -4525,6 +4536,90 @@ fn resolve_alias_cv(
     })
 }
 
+fn resolve_alias_reference_kind(program: &Program, ctx: &LowerContext, name: &str) -> Option<bool> {
+    let name = normalize_qualified(name);
+    let check = |candidate_name: &str| {
+        if let Some((_, _, ref_kind, _)) = ctx
+            .local_aliases
+            .iter()
+            .rev()
+            .find(|(alias, _, _, _)| alias == candidate_name)
+        {
+            return *ref_kind;
+        }
+        find_in_scope(program, ctx, candidate_name, |candidate, _| {
+            if program.types.alias_is_reference(candidate) {
+                Some(program.types.alias_is_rvalue_reference(candidate))
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(res) = check(&name) {
+        return Some(res);
+    }
+    let stripped = strip_cv(&name);
+    if stripped != name {
+        return check(stripped);
+    }
+    None
+}
+
+fn type_reference_kind(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    ty: Node,
+) -> Option<bool> {
+    let ty_text = node_text(source, &ty);
+    let ungrouped = ungroup_declarator(ty);
+    if declares_reference(ungrouped) {
+        return Some(is_rvalue_reference_node(source, ungrouped));
+    }
+    if let Some(d) = ty.cached_field("declarator") {
+        let ung = ungroup_declarator(d);
+        if declares_reference(ung) {
+            return Some(is_rvalue_reference_node(source, ung));
+        }
+    }
+    let name = normalize_qualified(ty_text);
+    resolve_alias_reference_kind(program, ctx, &name)
+}
+
+fn declaration_reference_kind(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<bool> {
+    let decl_kind = if let Some(declarator) = node.cached_field("declarator") {
+        let ung = ungroup_declarator(declarator);
+        if declares_reference(ung) {
+            Some(is_rvalue_reference_node(source, ung))
+        } else if matches!(
+            ung.cached_kind(),
+            "pointer_declarator" | "abstract_pointer_declarator"
+        ) {
+            return None;
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let ty_kind = node
+        .cached_field("type")
+        .and_then(|ty| type_reference_kind(program, ctx, source, ty));
+
+    match (decl_kind, ty_kind) {
+        (Some(d_rval), Some(t_rval)) => Some(d_rval && t_rval),
+        (Some(d_rval), None) => Some(d_rval),
+        (None, Some(t_rval)) => Some(t_rval),
+        (None, None) => None,
+    }
+}
+
 /// Reference identity of a declaration, including a typedef or using alias.
 /// Alias descriptors use pointer layers for references; the alias's spelling
 /// retains the distinction until parameter and argument metadata are built.
@@ -4534,43 +4629,26 @@ fn declaration_is_reference(
     source: &str,
     node: Node,
 ) -> bool {
-    if let Some(declarator) = node.cached_field("declarator") {
-        if declares_reference(declarator) {
-            return true;
-        }
-        if matches!(
-            ungroup_declarator(declarator).cached_kind(),
-            "pointer_declarator" | "abstract_pointer_declarator"
-        ) {
-            return false;
-        }
-    }
-    let Some(ty) = node.cached_field("type") else {
-        return false;
-    };
-    type_is_reference_alias(program, ctx, source, ty)
+    declaration_reference_kind(program, ctx, source, node).is_some()
 }
 
 fn type_is_reference_alias(program: &Program, ctx: &LowerContext, source: &str, ty: Node) -> bool {
-    if !program.types.has_reference_aliases() && ctx.local_aliases.is_empty() {
+    type_reference_kind(program, ctx, source, ty).is_some()
+}
+
+fn is_spelled_lvalue_reference(program: &Program, ctx: &LowerContext, spelled: &str) -> bool {
+    let s = strip_cv(spelled.trim());
+    if s.ends_with('&') && !s.ends_with("&&") {
+        return true;
+    }
+    if s.ends_with("&&") {
+        let base = strip_cv(s.trim_end_matches('&').trim());
+        if let Some(false) = resolve_alias_reference_kind(program, ctx, base) {
+            return true;
+        }
         return false;
     }
-    let name = normalize_qualified(node_text(source, &ty));
-    if let Some((_, _, reference, _)) = ctx
-        .local_aliases
-        .iter()
-        .rev()
-        .find(|(alias, _, _, _)| alias == &name)
-    {
-        return *reference;
-    }
-    find_in_scope(program, ctx, &name, |candidate, _| {
-        program
-            .types
-            .resolve_alias(candidate)
-            .map(|_| program.types.alias_is_reference(candidate))
-    })
-    .unwrap_or(false)
+    resolve_alias_reference_kind(program, ctx, s) == Some(false)
 }
 
 fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
@@ -5611,6 +5689,51 @@ fn is_rvalue_reference_node(source: &str, node: Node) -> bool {
     node.children(&mut node.walk())
         .any(|child| child.cached_kind() == "&&" || node_text(source, &child).trim() == "&&")
         || node_text(source, &node).trim_start().starts_with("&&")
+}
+
+fn function_return_reference_kind(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    function: Node,
+) -> Option<bool> {
+    if let Some(ref_node) = return_reference_node(function) {
+        return Some(is_rvalue_reference_node(source, ref_node));
+    }
+    let decl = if function.cached_kind() == "function_declarator" {
+        function
+    } else {
+        function.cached_field("declarator").unwrap_or(function)
+    };
+    let trailing = decl
+        .children(&mut decl.walk())
+        .find(|c| c.cached_kind() == "trailing_return_type")
+        .or_else(|| {
+            function
+                .children(&mut function.walk())
+                .find(|c| c.cached_kind() == "trailing_return_type")
+        });
+    if let Some(trailing) = trailing {
+        for i in 0..trailing.named_child_count() {
+            if let Some(ty) = trailing.named_child(i) {
+                if let Some(kind) = type_reference_kind(program, ctx, source, ty) {
+                    return Some(kind);
+                }
+            }
+        }
+    }
+    let ty = function
+        .cached_field("type")
+        .or_else(|| function.parent().and_then(|p| p.cached_field("type")));
+    if let Some(ty) = ty {
+        let ptr_depth = declarator_pointer_depth(decl);
+        if ptr_depth == 0 {
+            if let Some(kind) = type_reference_kind(program, ctx, source, ty) {
+                return Some(kind);
+            }
+        }
+    }
+    None
 }
 
 /// Whether a function definition or a lambda returns a reference: `S &f()`,
@@ -6802,9 +6925,9 @@ fn register_member_prototype(
         // in another scope (docs/ANALYSIS.md, "Templates").
         Some(&program.types),
     );
-    if let Some(ref_node) = return_reference_node(node) {
+    if let Some(is_rval) = function_return_reference_kind(program, ctx, source, node) {
         ctx.reference_returns.insert(fn_id);
-        if is_rvalue_reference_node(source, ref_node) {
+        if is_rval {
             ctx.rvalue_reference_returns.insert(fn_id);
         }
     }
@@ -7143,9 +7266,9 @@ fn lower_function_signature(
         Some(&program.types),
     );
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
-    if let Some(ref_node) = return_reference_node(node) {
+    if let Some(is_rval) = function_return_reference_kind(program, ctx, source, node) {
         ctx.reference_returns.insert(fn_id);
-        if is_rvalue_reference_node(source, ref_node) {
+        if is_rval {
             ctx.rvalue_reference_returns.insert(fn_id);
         }
     }
@@ -8435,7 +8558,7 @@ fn result_overloads(
         candidates
     };
     let candidates = if let Some(is_rval) = receiver_is_rvalue {
-        let mut ref_viable: Vec<FnId> = candidates
+        let ref_viable: Vec<FnId> = candidates
             .iter()
             .copied()
             .filter(|&id| {
@@ -8446,15 +8569,6 @@ fn result_overloads(
                 ref_qualifier_viable(f.ref_qualifier, f.is_const_member, is_rval)
             })
             .collect();
-        if ref_viable
-            .iter()
-            .any(|&id| program.symbols.function(id).ref_qualifier.is_some())
-        {
-            ref_viable.retain(|&id| {
-                !is_non_static_member(program, id)
-                    || program.symbols.function(id).ref_qualifier.is_some()
-            });
-        }
         if ref_viable.is_empty() {
             candidates
         } else {
@@ -8513,18 +8627,33 @@ fn result_overloads(
     if ranked.len() <= 1 {
         return ranked;
     }
-    let ranked = if receiver_is_rvalue == Some(true) {
-        let has_rval_ref = ranked.iter().any(|&id| {
+    let ranked = if receiver_is_rvalue.is_some() {
+        let has_ref_qual = ranked.iter().any(|&id| {
             is_non_static_member(program, id)
-                && program.symbols.function(id).ref_qualifier == Some(true)
+                && program.symbols.function(id).ref_qualifier.is_some()
         });
-        if has_rval_ref {
+        let is_rval = receiver_is_rvalue == Some(true);
+        if has_ref_qual {
             ranked
                 .iter()
                 .copied()
                 .filter(|&id| {
                     if is_non_static_member(program, id)
-                        && program.symbols.function(id).ref_qualifier != Some(true)
+                        && program.symbols.function(id).ref_qualifier.is_none()
+                    {
+                        !ranked.iter().any(|&other| {
+                            is_non_static_member(program, other)
+                                && program.symbols.function(other).ref_qualifier.is_some()
+                                && ref_qualifier_viable(
+                                    program.symbols.function(other).ref_qualifier,
+                                    program.symbols.function(other).is_const_member,
+                                    is_rval,
+                                )
+                                && args_compatible_prefix(program, id, other, args.len())
+                        })
+                    } else if is_rval
+                        && is_non_static_member(program, id)
+                        && program.symbols.function(id).ref_qualifier == Some(false)
                     {
                         !ranked.iter().any(|&other| {
                             is_non_static_member(program, other)
@@ -9218,10 +9347,14 @@ fn expr_is_rvalue(program: &Program, ctx: &LowerContext, source: &str, node: Nod
     if node.cached_kind() == "call_expression" {
         if let Some(func) = node.cached_field("function") {
             let text = node_text(source, &func);
-            let head = type_name_before_template(text).trim();
+            let head = normalize_qualified(type_name_before_template(text));
+            let head = head.trim();
             let is_std_prefix = head.starts_with("std::") || head.starts_with("::std::");
             let unqualified = head.strip_prefix("::").unwrap_or(head);
-            let unqualified = unqualified.strip_prefix("std::").unwrap_or(unqualified);
+            let unqualified = unqualified
+                .strip_prefix("std::")
+                .unwrap_or(unqualified)
+                .trim();
             if matches!(unqualified, "move" | "forward") {
                 let is_user_fn = !is_std_prefix && {
                     let nodes = call_arg_nodes(node);
@@ -9234,6 +9367,13 @@ fn expr_is_rvalue(program: &Program, ctx: &LowerContext, source: &str, node: Nod
                     !candidates.is_empty()
                 };
                 if !is_user_fn {
+                    if unqualified == "forward" {
+                        let templ_arg = template_arguments(text).into_iter().next();
+                        let is_lvalue_ref = templ_arg
+                            .as_deref()
+                            .is_some_and(|arg| is_spelled_lvalue_reference(program, ctx, arg));
+                        return !is_lvalue_ref;
+                    }
                     return true;
                 }
             }
@@ -10393,25 +10533,8 @@ fn pointer_extraction<'t>(
         .types
         .class_type_id(&held)
         .or_else(|| program.types.class_type_id(&receiver_lookup_name(&held)))?;
-    let spelled_arg = template_arguments(&wrapper).into_iter().next();
-    let is_held_const = spelled_arg
-        .as_deref()
-        .is_some_and(|s| spelled_type_cv(program, ctx, s).object_const);
     let name = match program.types.get(held).desc.as_ref() {
-        TypeDesc::Union { name, .. } => {
-            if is_held_const {
-                format!("const {name}")
-            } else {
-                name.clone()
-            }
-        }
-        TypeDesc::Struct { name, .. } => {
-            if is_held_const {
-                format!("const {name}")
-            } else {
-                name.clone()
-            }
-        }
+        TypeDesc::Union { name, .. } | TypeDesc::Struct { name, .. } => name.clone(),
         _ => return None,
     };
     Some(PointerExtraction {
@@ -11807,9 +11930,12 @@ fn lower_declaration(
                                     }
                                 }
                             }
-                            let ref_node = return_reference_node(child);
+                            let ref_kind =
+                                function_return_reference_kind(program, ctx, source, node).or_else(
+                                    || function_return_reference_kind(program, ctx, source, child),
+                                );
                             lower_function_decl(
-                                program, ctx, source, fdecl, ty, is_static, ref_node,
+                                program, ctx, source, fdecl, ty, is_static, ref_kind,
                             )
                         }
                     }
@@ -12473,15 +12599,9 @@ fn lower_one_declarator(
         return None;
     }
     if decl.cached_kind() == "function_declarator" && !is_function_pointer_declarator(decl) {
-        lower_function_decl(
-            program,
-            ctx,
-            source,
-            decl,
-            type_id,
-            is_static,
-            return_reference_node(decl),
-        );
+        let ref_kind = function_return_reference_kind(program, ctx, source, span_node)
+            .or_else(|| function_return_reference_kind(program, ctx, source, decl));
+        lower_function_decl(program, ctx, source, decl, type_id, is_static, ref_kind);
         return None;
     }
     let is_fn_ptr = is_function_pointer_declarator(decl);
@@ -13236,7 +13356,7 @@ fn lower_function_decl(
     decl: Node,
     ret_type: trace_ir::TypeId,
     is_static: bool,
-    ref_node: Option<Node>,
+    ref_kind: Option<bool>,
 ) {
     let (raw_name, _) = parse_declarator_name(source, decl);
     if raw_name.is_empty() {
@@ -13304,10 +13424,10 @@ fn lower_function_decl(
         tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
-    let ref_node = return_reference_node(decl).or(ref_node);
-    if let Some(ref_node) = ref_node {
+    let ref_kind = function_return_reference_kind(program, ctx, source, decl).or(ref_kind);
+    if let Some(is_rval) = ref_kind {
         ctx.reference_returns.insert(fn_id);
-        if is_rvalue_reference_node(source, ref_node) {
+        if is_rval {
             ctx.rvalue_reference_returns.insert(fn_id);
         }
     }
@@ -15295,7 +15415,7 @@ fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc])
                 .and_then(TypeDesc::pointee)
                 // A class lowering could not resolve reads as `int` here
                 // too: `const Foo &` with `Foo` out of view is `int &`.
-                .is_some_and(|pointee| class(pointee) || matches!(pointee, TypeDesc::Int))
+                .is_some_and(class)
     };
     // A class the index does not declare is a guess (an out-of-tree class,
     // or the enum-shaped `E::VALUE`): it may convert to anything, so it
@@ -15367,9 +15487,8 @@ fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc])
                 let pdesc = param_desc(c, i).unwrap_or(&TypeDesc::Unknown);
                 let adesc = arg_desc.get(i).unwrap_or(&TypeDesc::Unknown);
                 // A reference parameter is lowered one pointer layer deeper:
-                // a class argument binds `f(T &)` exactly.
+                // a class or scalar argument binds `f(T &)` exactly.
                 let binds_reference = function.reference_params.get(i) == Some(&true)
-                    && class(adesc)
                     && pdesc.pointee().is_some_and(|pointee| {
                         trace_ir::spelled_alike(
                             &program.types,
@@ -17962,15 +18081,6 @@ fn lower_lambda_expression(
         .children(&mut node.walk())
         .find(|c| c.cached_kind() == "lambda_capture_specifier")
     {
-        let cap_text = node_text(source, &cap_node);
-        if cap_text
-            .split_whitespace()
-            .collect::<String>()
-            .contains("*this")
-        {
-            captures_this = true;
-            captures_star_this = true;
-        }
         let mut prev_was_star = false;
         let mut next_is_ref = false;
         for child in cap_node.children(&mut cap_node.walk()) {
@@ -17987,9 +18097,13 @@ fn lower_lambda_expression(
                     prev_was_star = true;
                     next_is_ref = false;
                 }
+                "," => {
+                    prev_was_star = false;
+                    next_is_ref = false;
+                }
                 "pointer_expression" => {
-                    let text = node_text(source, &child).trim();
-                    if text == "*this" {
+                    let text = node_text(source, &child);
+                    if text.split_whitespace().collect::<String>() == "*this" {
                         captures_this = true;
                         captures_star_this = true;
                     }
@@ -18005,11 +18119,13 @@ fn lower_lambda_expression(
                         captures_this = true;
                     }
                     next_is_ref = false;
+                    prev_was_star = false;
                 }
                 "identifier" => {
                     let name = node_text(source, &child).to_string();
                     let is_ref = next_is_ref;
                     next_is_ref = false;
+                    prev_was_star = false;
                     captured_vars.push((name, is_ref));
                 }
                 "reference_expression" => {
@@ -18017,6 +18133,7 @@ fn lower_lambda_expression(
                     let name = text.trim_start_matches('&').trim().to_string();
                     captured_vars.push((name, true));
                     next_is_ref = false;
+                    prev_was_star = false;
                 }
                 "lambda_capture_initializer" => {
                     if let (Some(left), Some(right)) =
@@ -18027,6 +18144,7 @@ fn lower_lambda_expression(
                         init_captures.push((name, is_ref, left, right));
                     }
                     next_is_ref = false;
+                    prev_was_star = false;
                 }
                 _ => {
                     let text = node_text(source, &child).trim();
@@ -18041,6 +18159,7 @@ fn lower_lambda_expression(
                     } else if text == "&" {
                         next_is_ref = true;
                     }
+                    prev_was_star = false;
                 }
             }
         }
@@ -18182,9 +18301,9 @@ fn lower_lambda_expression(
         }
     }
 
-    if let Some(ref_node) = return_reference_node(node) {
+    if let Some(is_rval) = function_return_reference_kind(program, ctx, source, node) {
         ctx.reference_returns.insert(fn_id);
-        if is_rvalue_reference_node(source, ref_node) {
+        if is_rval {
             ctx.rvalue_reference_returns.insert(fn_id);
         }
     }
@@ -22395,6 +22514,19 @@ fn call_receiver_return_cv(
     source: &str,
     call: Node,
 ) -> Option<trace_ir::CvQualification> {
+    if let Some(extraction) = pointer_extraction(program, ctx, source, call) {
+        let is_held_const = receiver_is_const(program, ctx, source, extraction.receiver, true)
+            == Some(true)
+            || template_arguments(&extraction.wrapper)
+                .into_iter()
+                .next()
+                .as_deref()
+                .is_some_and(|s| spelled_type_cv(program, ctx, s).object_const);
+        return Some(trace_ir::CvQualification {
+            object_const: false,
+            pointee_const: Some(is_held_const),
+        });
+    }
     let func = call.cached_field("function")?;
     let nodes = call_arg_nodes(call);
     let args: Vec<_> = nodes
@@ -22611,6 +22743,24 @@ fn receiver_is_const(
     None
 }
 
+fn spelled_has_const(spelled: &str) -> bool {
+    spelled
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == "const")
+}
+
+fn strip_trailing_const(mut s: &str) -> &str {
+    loop {
+        let t = s.trim_end();
+        match t.strip_suffix("const") {
+            Some(rest) if rest.ends_with(|c: char| c.is_whitespace() || matches!(c, '*' | '&')) => {
+                s = rest;
+            }
+            _ => return t,
+        }
+    }
+}
+
 fn spelled_type_cv(
     program: &Program,
     ctx: &LowerContext,
@@ -22623,6 +22773,16 @@ fn spelled_type_cv(
     if let Some((cv, _)) = resolve_alias_cv(program, ctx, spelled) {
         return cv;
     }
+    let stripped = strip_cv(spelled);
+    if stripped != spelled {
+        if let Some((mut cv, is_ref)) = resolve_alias_cv(program, ctx, stripped) {
+            let outer_const = spelled_has_const(spelled) && !spelled_has_const(stripped);
+            if outer_const && !is_ref {
+                cv.object_const = true;
+            }
+            return cv;
+        }
+    }
 
     if spelled.contains('<') {
         let head = type_name_before_template(spelled).trim();
@@ -22631,7 +22791,7 @@ fn spelled_type_cv(
             seg,
             "shared_ptr" | "unique_ptr" | "weak_ptr" | "sptr" | "wptr"
         ) {
-            let top_const = strip_cv(head) != head || strip_trailing_cv(spelled) != spelled;
+            let top_const = spelled_has_const(head) || strip_trailing_const(spelled) != spelled;
             let inner_cv = template_arguments(spelled)
                 .first()
                 .map(|arg| spelled_type_cv(program, ctx, arg))
@@ -22645,7 +22805,7 @@ fn spelled_type_cv(
 
     let has_postfix_const_before_ptr = if let Some(idx) = spelled.find(['*', '&']) {
         let before = spelled[..idx].trim_end();
-        strip_trailing_cv(before) != before
+        strip_trailing_const(before) != before
     } else {
         false
     };
@@ -22654,20 +22814,22 @@ fn spelled_type_cv(
     if !suffix.is_empty() {
         let is_ptr = suffix.contains('*');
         let is_ref = suffix.contains('&');
-        let top_const = strip_trailing_cv(spelled) != spelled;
+        let top_const = strip_trailing_const(spelled) != spelled;
         let inner_cv = spelled_type_cv(program, ctx, base);
         if is_ptr {
             trace_ir::CvQualification {
                 object_const: top_const,
                 pointee_const: Some(
-                    has_postfix_const_before_ptr || inner_cv.object_const || strip_cv(base) != base,
+                    has_postfix_const_before_ptr
+                        || inner_cv.object_const
+                        || spelled_has_const(base),
                 ),
             }
         } else if is_ref {
             trace_ir::CvQualification {
                 object_const: has_postfix_const_before_ptr
                     || inner_cv.object_const
-                    || strip_cv(base) != base,
+                    || spelled_has_const(base),
                 pointee_const: inner_cv.pointee_const,
             }
         } else {
@@ -22677,7 +22839,7 @@ fn spelled_type_cv(
             }
         }
     } else {
-        let is_const = strip_cv(spelled) != spelled || strip_trailing_cv(spelled) != spelled;
+        let is_const = spelled_has_const(spelled);
         trace_ir::CvQualification {
             object_const: is_const,
             pointee_const: None,
@@ -22696,6 +22858,7 @@ fn declaration_cv_qualification(
     is_ref: bool,
     is_variable: bool,
 ) -> trace_ir::CvQualification {
+    let is_constexpr = is_variable && declaration_is_constant(source, node);
     let type_node = node.cached_field("type");
     let is_placeholder = type_node.is_some_and(|ty| is_placeholder_type(ctx, ty));
     if is_placeholder {
@@ -22711,11 +22874,15 @@ fn declaration_cv_qualification(
             let is_ptr_decl = decl.is_some_and(|d| declarator_pointer_depth(d) > 0);
             if is_ptr_decl {
                 let decl_text = decl.map(|d| node_text(source, &d)).unwrap_or("");
-                let top_const = strip_trailing_cv(decl_text) != decl_text;
+                let top_const = strip_trailing_const(decl_text) != decl_text;
                 let pointee_const = has_decl_const
                     || receiver_is_const(program, ctx, source, init, true) == Some(true);
                 return trace_ir::CvQualification {
-                    object_const: if is_variable { top_const } else { false },
+                    object_const: if is_variable {
+                        top_const || is_constexpr
+                    } else {
+                        false
+                    },
                     pointee_const: Some(pointee_const),
                 };
             }
@@ -22723,6 +22890,7 @@ fn declaration_cv_qualification(
                 type_node.is_some_and(|ty| node_text(source, &ty).trim() == "decltype(auto)");
             let pointee_const = receiver_is_const(program, ctx, source, init, true);
             let obj_const = has_decl_const
+                || is_constexpr
                 || (is_decltype_auto
                     && pointee_const.is_none()
                     && receiver_is_const(program, ctx, source, init, false) == Some(true));
@@ -22734,14 +22902,18 @@ fn declaration_cv_qualification(
         let is_ptr_decl = decl.is_some_and(|d| declarator_pointer_depth(d) > 0);
         if is_ptr_decl {
             let decl_text = decl.map(|d| node_text(source, &d)).unwrap_or("");
-            let top_const = strip_trailing_cv(decl_text) != decl_text;
+            let top_const = strip_trailing_const(decl_text) != decl_text;
             return trace_ir::CvQualification {
-                object_const: if is_variable { top_const } else { false },
+                object_const: if is_variable {
+                    top_const || is_constexpr
+                } else {
+                    false
+                },
                 pointee_const: Some(has_decl_const),
             };
         }
         return trace_ir::CvQualification {
-            object_const: has_decl_const,
+            object_const: has_decl_const || is_constexpr,
             pointee_const: None,
         };
     }
@@ -22752,8 +22924,7 @@ fn declaration_cv_qualification(
     } else {
         trace_ir::CvQualification::default()
     };
-    if declaration_has_const(source, node) || (is_variable && declaration_is_constant(source, node))
-    {
+    if declaration_has_const(source, node) {
         base_cv.object_const = true;
     }
 
@@ -22762,10 +22933,14 @@ fn declaration_cv_qualification(
         let has_ref = declares_reference(decl) || is_ref;
         if ptr_depth > 0 {
             let decl_text = node_text(source, &decl);
-            let top_const = strip_trailing_cv(decl_text) != decl_text;
+            let top_const = strip_trailing_const(decl_text) != decl_text;
             let pointee_const = base_cv.object_const;
             return trace_ir::CvQualification {
-                object_const: if is_variable { top_const } else { false },
+                object_const: if is_variable {
+                    top_const || is_constexpr
+                } else {
+                    false
+                },
                 pointee_const: Some(pointee_const),
             };
         } else if has_ref {
@@ -22774,6 +22949,10 @@ fn declaration_cv_qualification(
                 pointee_const: base_cv.pointee_const,
             };
         }
+    }
+
+    if is_constexpr {
+        base_cv.object_const = true;
     }
 
     base_cv

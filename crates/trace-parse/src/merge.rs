@@ -1773,7 +1773,12 @@ fn merge_types(
     }
     for (alias, desc) in src.all_aliases() {
         if dst.resolve_alias(alias).is_none() {
-            dst.register_alias_ref_with_reference(alias, desc, src.alias_is_reference(alias));
+            dst.register_alias_ref_with_reference_kind(
+                alias,
+                desc,
+                src.alias_is_reference(alias),
+                src.alias_is_rvalue_reference(alias),
+            );
             if let Some(cv) = src.alias_qualification(alias) {
                 dst.register_alias_qualification(alias, cv);
             }

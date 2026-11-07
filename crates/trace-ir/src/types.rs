@@ -521,6 +521,8 @@ pub struct TypeTable {
     /// Aliases whose outer pointer layer represents a C++ reference.
     /// Kept with alias descriptors through header caching and merging.
     reference_aliases: FxHashSet<String>,
+    /// Aliases representing a C++ rvalue reference (`&&`).
+    rvalue_reference_aliases: FxHashSet<String>,
     /// Const qualification carried by typedef and `using` aliases.
     alias_qualifications: FxHashMap<String, CvQualification>,
     /// Reference members by declaring class. Field descriptors otherwise
@@ -575,6 +577,7 @@ impl TypeTable {
             union_epoch: 0,
             aliases: IndexMap::default(),
             reference_aliases: FxHashSet::default(),
+            rvalue_reference_aliases: FxHashSet::default(),
             alias_qualifications: FxHashMap::default(),
             reference_fields: FxHashMap::default(),
             field_qualifications: FxHashMap::default(),
@@ -927,25 +930,55 @@ impl TypeTable {
         self.register_alias_ref_with_reference(alias, &desc, reference);
     }
 
+    pub fn register_alias_with_reference_kind(
+        &mut self,
+        alias: &str,
+        desc: TypeDesc,
+        reference: bool,
+        rvalue_reference: bool,
+    ) {
+        self.register_alias_ref_with_reference_kind(alias, &desc, reference, rvalue_reference);
+    }
+
     pub fn register_alias_ref_with_reference(
         &mut self,
         alias: &str,
         desc: &TypeDesc,
         reference: bool,
     ) {
+        self.register_alias_ref_with_reference_kind(alias, desc, reference, false);
+    }
+
+    pub fn register_alias_ref_with_reference_kind(
+        &mut self,
+        alias: &str,
+        desc: &TypeDesc,
+        reference: bool,
+        rvalue_reference: bool,
+    ) {
         if !alias.is_empty() {
             let shared = self.descriptors.share(desc);
             self.aliases.insert(alias.to_string(), shared);
             if reference {
                 self.reference_aliases.insert(alias.to_owned());
+                if rvalue_reference {
+                    self.rvalue_reference_aliases.insert(alias.to_owned());
+                } else {
+                    self.rvalue_reference_aliases.remove(alias);
+                }
             } else {
                 self.reference_aliases.remove(alias);
+                self.rvalue_reference_aliases.remove(alias);
             }
         }
     }
 
     pub fn alias_is_reference(&self, alias: &str) -> bool {
         self.reference_aliases.contains(alias)
+    }
+
+    pub fn alias_is_rvalue_reference(&self, alias: &str) -> bool {
+        self.rvalue_reference_aliases.contains(alias)
     }
 
     pub fn has_reference_aliases(&self) -> bool {
@@ -1139,6 +1172,7 @@ impl TypeTable {
         self.types.shrink_to_fit();
         self.aliases.shrink_to_fit();
         self.reference_aliases.shrink_to_fit();
+        self.rvalue_reference_aliases.shrink_to_fit();
         self.alias_qualifications.shrink_to_fit();
         self.reference_fields.shrink_to_fit();
         self.field_qualifications.shrink_to_fit();
