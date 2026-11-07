@@ -35,7 +35,9 @@ pub struct UnitIndex {
     pub reference_bindings: FxHashSet<VarId>,
     pub reference_vars: FxHashSet<VarId>,
     pub address_references: FxHashSet<VarId>,
+    pub var_qualifications: FxHashMap<VarId, trace_ir::CvQualification>,
     pub reference_returns: FxHashSet<FnId>,
+    pub rvalue_reference_returns: FxHashSet<FnId>,
     pub call_sites: Vec<CallSite>,
     pub flow: Vec<FlowConstraint>,
     pub flow_origins: FxHashMap<FlowConstraint, Vec<(trace_ir::Span, Arc<str>)>>,
@@ -53,6 +55,9 @@ pub struct UnitIndex {
     pub template_bases: Vec<TemplateBase>,
     /// Per-unit declared `operator->` returns (C++), merged in every mode.
     pub arrow_returns: Vec<trace_ir::ArrowReturn>,
+    /// Per-unit class-body `using Base::member;` declarations (C++), merged in
+    /// every mode so a header's imports reach the source units including it.
+    pub class_member_imports: Vec<trace_ir::ClassMemberImport>,
     pub template_returns: BTreeMap<String, BTreeMap<String, Vec<trace_ir::TemplateReturn>>>,
     /// Per-unit class template parameters and dependent bases (C++).
     pub class_templates: BTreeMap<String, trace_ir::ClassTemplate>,
@@ -99,6 +104,7 @@ impl UnitIndex {
         self.inheritance.shrink_to_fit();
         self.template_bases.shrink_to_fit();
         self.arrow_returns.shrink_to_fit();
+        self.class_member_imports.shrink_to_fit();
         self.final_classes.shrink_to_fit();
         self.cfgs.shrink_to_fit();
         self.merge_descs.shrink_to_fit();
@@ -455,6 +461,9 @@ fn merge_unit(
         if !program.arrow_returns.contains(fact) {
             program.arrow_returns.push(fact.clone());
         }
+    }
+    for import in &unit.class_member_imports {
+        program.add_class_member_import(import);
     }
     for (class, methods) in &unit.template_returns {
         for (name, facts) in methods {
@@ -1227,8 +1236,18 @@ fn merge_unit(
             .iter()
             .filter_map(|id| var_map.get(id).copied()),
     );
+    for (&id, &cv) in &unit.var_qualifications {
+        if let Some(&mapped) = var_map.get(&id) {
+            program.var_qualifications.insert(mapped, cv);
+        }
+    }
     program.reference_returns.extend(
         unit.reference_returns
+            .iter()
+            .filter_map(|id| fn_map.get(id).copied()),
+    );
+    program.rvalue_reference_returns.extend(
+        unit.rvalue_reference_returns
             .iter()
             .filter_map(|id| fn_map.get(id).copied()),
     );
@@ -1754,7 +1773,15 @@ fn merge_types(
     }
     for (alias, desc) in src.all_aliases() {
         if dst.resolve_alias(alias).is_none() {
-            dst.register_alias_ref_with_reference(alias, desc, src.alias_is_reference(alias));
+            dst.register_alias_ref_with_reference_kind(
+                alias,
+                desc,
+                src.alias_is_reference(alias),
+                src.alias_is_rvalue_reference(alias),
+            );
+            if let Some(cv) = src.alias_qualification(alias) {
+                dst.register_alias_qualification(alias, cv);
+            }
         }
     }
     map
@@ -1846,6 +1873,9 @@ fn respelled_declarations(
                     f.is_defined
                         && f.linkage == trace_ir::Linkage::Internal
                         && f.variadic == declaration.variadic
+                        && f.is_const_member == declaration.is_const_member
+                        && f.ref_qualifier == declaration.ref_qualifier
+                        && f.is_member_template == declaration.is_member_template
                         && arity(f) == arity(declaration)
                 })
                 .collect();
@@ -2578,6 +2608,10 @@ mod tests {
                 variadic: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
+                is_member_template: false,
+                is_const_member: false,
+                ref_qualifier: None,
+                return_cv: trace_ir::CvQualification::default(),
                 is_static_member: false,
                 is_virtual: false,
                 is_final: false,
@@ -2636,6 +2670,10 @@ mod tests {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_member_template: false,
+            is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -2764,6 +2802,10 @@ mod tests {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_member_template: false,
+            is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -2873,6 +2915,10 @@ mod tests {
                 variadic: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
+                is_member_template: false,
+                is_const_member: false,
+                ref_qualifier: None,
+                return_cv: trace_ir::CvQualification::default(),
                 is_static_member: false,
                 is_virtual: false,
                 is_final: false,
@@ -2944,6 +2990,10 @@ mod tests {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_member_template: false,
+            is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -3183,6 +3233,10 @@ mod tests {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_member_template: false,
+            is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -3432,6 +3486,10 @@ mod tests {
                 variadic: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
+                is_member_template: false,
+                is_const_member: false,
+                ref_qualifier: None,
+                return_cv: trace_ir::CvQualification::default(),
                 is_static_member: false,
                 is_virtual: false,
                 is_final: false,

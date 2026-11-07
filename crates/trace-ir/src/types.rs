@@ -464,6 +464,23 @@ impl std::fmt::Debug for ByAddress {
     }
 }
 
+/// Const qualification of a declared entity, alias, or return type: whether
+/// the top-level object/referent is `const`, and for a pointer or smart-pointer
+/// wrapper whether its immediate pointee is `const`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CvQualification {
+    pub object_const: bool,
+    pub pointee_const: Option<bool>,
+}
+
+/// Qualification of a non-static data member on its declaring class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldQualification {
+    pub cv: CvQualification,
+    pub is_mutable: bool,
+    pub is_reference: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeTable {
     /// Every C++ class name a specifier declared, forward declarations
@@ -504,9 +521,15 @@ pub struct TypeTable {
     /// Aliases whose outer pointer layer represents a C++ reference.
     /// Kept with alias descriptors through header caching and merging.
     reference_aliases: FxHashSet<String>,
+    /// Aliases representing a C++ rvalue reference (`&&`).
+    rvalue_reference_aliases: FxHashSet<String>,
+    /// Const qualification carried by typedef and `using` aliases.
+    alias_qualifications: FxHashMap<String, CvQualification>,
     /// Reference members by declaring class. Field descriptors otherwise
     /// describe the referent; preserve this distinction through header merges.
     reference_fields: FxHashMap<String, FxHashSet<String>>,
+    /// Const/mutable qualification of non-static data members by declaring class.
+    field_qualifications: FxHashMap<String, FxHashMap<String, FieldQualification>>,
     /// Each class's own constructor declaration metadata needed by types-only
     /// header imports, before constructor symbols merge into a translation unit.
     user_provided_ctors: FxHashSet<String>,
@@ -554,7 +577,10 @@ impl TypeTable {
             union_epoch: 0,
             aliases: IndexMap::default(),
             reference_aliases: FxHashSet::default(),
+            rvalue_reference_aliases: FxHashSet::default(),
+            alias_qualifications: FxHashMap::default(),
             reference_fields: FxHashMap::default(),
+            field_qualifications: FxHashMap::default(),
             user_provided_ctors: FxHashSet::default(),
             declared_ctors: FxHashSet::default(),
             default_ctors: FxHashMap::default(),
@@ -904,19 +930,45 @@ impl TypeTable {
         self.register_alias_ref_with_reference(alias, &desc, reference);
     }
 
+    pub fn register_alias_with_reference_kind(
+        &mut self,
+        alias: &str,
+        desc: TypeDesc,
+        reference: bool,
+        rvalue_reference: bool,
+    ) {
+        self.register_alias_ref_with_reference_kind(alias, &desc, reference, rvalue_reference);
+    }
+
     pub fn register_alias_ref_with_reference(
         &mut self,
         alias: &str,
         desc: &TypeDesc,
         reference: bool,
     ) {
+        self.register_alias_ref_with_reference_kind(alias, desc, reference, false);
+    }
+
+    pub fn register_alias_ref_with_reference_kind(
+        &mut self,
+        alias: &str,
+        desc: &TypeDesc,
+        reference: bool,
+        rvalue_reference: bool,
+    ) {
         if !alias.is_empty() {
             let shared = self.descriptors.share(desc);
             self.aliases.insert(alias.to_string(), shared);
             if reference {
                 self.reference_aliases.insert(alias.to_owned());
+                if rvalue_reference {
+                    self.rvalue_reference_aliases.insert(alias.to_owned());
+                } else {
+                    self.rvalue_reference_aliases.remove(alias);
+                }
             } else {
                 self.reference_aliases.remove(alias);
+                self.rvalue_reference_aliases.remove(alias);
             }
         }
     }
@@ -925,8 +977,22 @@ impl TypeTable {
         self.reference_aliases.contains(alias)
     }
 
+    pub fn alias_is_rvalue_reference(&self, alias: &str) -> bool {
+        self.rvalue_reference_aliases.contains(alias)
+    }
+
     pub fn has_reference_aliases(&self) -> bool {
         !self.reference_aliases.is_empty()
+    }
+
+    pub fn register_alias_qualification(&mut self, alias: &str, cv: CvQualification) {
+        if !alias.is_empty() {
+            self.alias_qualifications.insert(alias.to_owned(), cv);
+        }
+    }
+
+    pub fn alias_qualification(&self, alias: &str) -> Option<CvQualification> {
+        self.alias_qualifications.get(alias).copied()
     }
 
     pub fn note_reference_field(&mut self, class: &str, field: &str) {
@@ -934,6 +1000,20 @@ impl TypeTable {
             .entry(class.to_owned())
             .or_default()
             .insert(field.to_owned());
+    }
+
+    pub fn note_field_qualification(&mut self, class: &str, field: &str, qual: FieldQualification) {
+        self.field_qualifications
+            .entry(class.to_owned())
+            .or_default()
+            .insert(field.to_owned(), qual);
+    }
+
+    pub fn field_qualification(&self, class: &str, field: &str) -> Option<FieldQualification> {
+        self.field_qualifications
+            .get(class)
+            .and_then(|fields| fields.get(field))
+            .copied()
     }
 
     pub fn note_member_initializer(
@@ -1092,7 +1172,10 @@ impl TypeTable {
         self.types.shrink_to_fit();
         self.aliases.shrink_to_fit();
         self.reference_aliases.shrink_to_fit();
+        self.rvalue_reference_aliases.shrink_to_fit();
+        self.alias_qualifications.shrink_to_fit();
         self.reference_fields.shrink_to_fit();
+        self.field_qualifications.shrink_to_fit();
         self.user_provided_ctors.shrink_to_fit();
         self.declared_ctors.shrink_to_fit();
         self.default_ctors.shrink_to_fit();
@@ -1344,7 +1427,13 @@ impl TypeTable {
             return Some(name.to_owned());
         }
         match self.resolve_alias(name)? {
-            TypeDesc::Struct { name, .. } if self.is_struct_declared(name) => Some(name.clone()),
+            // An instantiation kept with its arguments (`using A = H<int>`,
+            // for a template whose arguments decide its members' types) names
+            // its template's class, as one whose arguments are dropped does.
+            TypeDesc::Struct { name, .. } => {
+                let class = instantiated_template(name).unwrap_or(name);
+                self.is_struct_declared(class).then(|| class.to_owned())
+            }
             _ => None,
         }
     }
@@ -1464,6 +1553,12 @@ impl TypeTable {
                 .entry(class.clone())
                 .or_default()
                 .extend(fields.iter().cloned());
+        }
+        for (class, fields) in &other.field_qualifications {
+            self.field_qualifications
+                .entry(class.clone())
+                .or_default()
+                .extend(fields.iter().map(|(k, &v)| (k.clone(), v)));
         }
     }
 
@@ -1944,8 +2039,51 @@ fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
 
+/// The class template `name` instantiates (`H` for `ns::H<A<B>>`); `None` for
+/// a name without arguments, or a member of an instantiation
+/// (`Outer<A>::Inner<B>`), which is no template's own class.
+fn instantiated_template(name: &str) -> Option<&str> {
+    let name = name.trim_end();
+    if !name.ends_with('>') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (at, c) in name.char_indices().rev() {
+        match c {
+            '>' => depth += 1,
+            '<' => {
+                depth -= 1;
+                if depth == 0 {
+                    let head = name[..at].trim_end();
+                    return (!head.contains('<')).then_some(head);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    /// An alias of an instantiation kept with its arguments names the
+    /// template's class; a member of an instantiation names none.
+    #[test]
+    fn an_alias_of_an_instantiation_names_its_template() {
+        let mut types = super::TypeTable::new();
+        types.declare_struct("ns::H");
+        let alias = |name: &str| super::TypeDesc::Struct {
+            name: name.into(),
+            fields: Vec::new(),
+        };
+        types.register_alias("ns::A", alias("ns::H<ns::X<int>>"));
+        types.register_alias("ns::B", alias("ns::H<int>::Inner<int>"));
+        types.register_alias("ns::C", alias("ns::H"));
+        assert_eq!(types.declared_class("ns::A").as_deref(), Some("ns::H"));
+        assert_eq!(types.declared_class("ns::B"), None);
+        assert_eq!(types.declared_class("ns::C").as_deref(), Some("ns::H"));
+    }
+
     /// A class name lowering only guessed registers no tag, whether the
     /// guess or a qualified spelling of the name was interned first.
     #[test]

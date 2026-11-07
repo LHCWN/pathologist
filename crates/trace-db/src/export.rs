@@ -914,7 +914,7 @@ fn param_type_name(desc: &TypeDesc) -> String {
 }
 
 fn function_signature(func: &trace_ir::Function, program: &Program) -> String {
-    if let Some(params) = program.symbols.explicit_params(func) {
+    let mut sig = if let Some(params) = program.symbols.explicit_params(func) {
         let mut parts = Vec::new();
         for i in 0..params.len() {
             if let Some(ty_id) = params.get(i) {
@@ -934,7 +934,19 @@ fn function_signature(func: &trace_ir::Function, program: &Program) -> String {
         format!("{}({})", func.name, parts.join(", "))
     } else {
         format!("{}(...)", func.name)
+    };
+    if func.is_const_member {
+        sig.push_str(" const");
     }
+    match func.ref_qualifier {
+        Some(false) => sig.push_str(" &"),
+        Some(true) => sig.push_str(" &&"),
+        None => {}
+    }
+    if func.is_member_template {
+        sig.push_str(" <template>");
+    }
+    sig
 }
 
 fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
@@ -1931,6 +1943,10 @@ mod tests {
                 variadic: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
+                is_member_template: false,
+                is_const_member: false,
+                ref_qualifier: None,
+                return_cv: trace_ir::CvQualification::default(),
                 is_static_member: false,
                 default_args: 0,
                 reference_params: Vec::new(),

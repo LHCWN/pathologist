@@ -199,12 +199,27 @@ pub struct Function {
     /// the only record that a parameterless entry is a member rather than a
     /// namespace function of the same qualified name.
     pub declared_in_class: bool,
+    /// Declared in its class body as a member function template
+    /// (`template <class U> R f();`). Overload resolution prefers a
+    /// non-template that is as good a match, so an inherited non-template a
+    /// class body imports can win over it.
+    pub is_member_template: bool,
     /// Declared `static` in its class body: a member with no receiver. Its
     /// entry still takes a `this` slot ([`SymbolTable::has_this_param`]), as
     /// every member's does; this is what tells a static member's unused one
     /// apart. An out-of-class definition does not spell `static`, so it
     /// learns this from its in-class prototype when the two merge.
     pub is_static_member: bool,
+    /// Declared `const` in its class body. The implicit object argument of a
+    /// non-const receiver matches a non-const member better, so overload
+    /// resolution prefers the inherited non-const one over an own `const`
+    /// overload of the same name and arity.
+    pub is_const_member: bool,
+    /// Trailing reference qualifier on a member declaration: `Some(false)` for
+    /// `&`, `Some(true)` for `&&`, `None` when none is written.
+    pub ref_qualifier: Option<bool>,
+    /// Const qualification of the function's declared return type.
+    pub return_cv: crate::CvQualification,
     /// How many of those parameters declare a default argument, so a call
     /// may pass `explicit_arity - default_args` up to `explicit_arity`
     /// arguments. C++ puts the defaults on the first declaration, so a merge
@@ -584,6 +599,15 @@ fn absorb_redeclaration(
     // User-provided once any declaration of it is.
     existing.defaulted_in_class &= func.defaulted_in_class;
     existing.is_static_member |= func.is_static_member;
+    existing.is_const_member |= func.is_const_member;
+    if existing.ref_qualifier.is_none() {
+        existing.ref_qualifier = func.ref_qualifier;
+    }
+    existing.return_cv.object_const |= func.return_cv.object_const;
+    if existing.return_cv.pointee_const.is_none() {
+        existing.return_cv.pointee_const = func.return_cv.pointee_const;
+    }
+    existing.is_member_template |= func.is_member_template;
     existing.default_args = existing.default_args.max(func.default_args);
     existing.is_virtual |= func.is_virtual;
     existing.is_final |= func.is_final;
@@ -1762,6 +1786,17 @@ impl SymbolTable {
                             return false;
                         }
                     }
+                    // `R f()` and `R f() const` are two overloads, not one
+                    // function redeclared: the implicit object argument tells
+                    // them apart at a call. A member function template and a
+                    // non-template of the same parameter list are distinct
+                    // declarations too.
+                    if existing.is_const_member != func.is_const_member
+                        || existing.ref_qualifier != func.ref_qualifier
+                        || existing.is_member_template != func.is_member_template
+                    {
+                        return false;
+                    }
                 }
                 if !func.is_cpp && !existing.is_cpp {
                     // Pure C: prototype + definition always collapse.
@@ -2677,6 +2712,13 @@ impl SymbolTable {
                     let cand_skip = usize::from(self.has_this_param(id));
                     let cand_explicit_len = cand.params.len().saturating_sub(cand_skip);
                     let both_cpp = f.is_cpp && cand.is_cpp;
+                    if both_cpp
+                        && (f.is_const_member != cand.is_const_member
+                            || f.ref_qualifier != cand.ref_qualifier
+                            || f.is_member_template != cand.is_member_template)
+                    {
+                        return false;
+                    }
                     if f.params.is_empty() || cand.params.is_empty() {
                         if !both_cpp {
                             return true;
@@ -2886,6 +2928,9 @@ impl SymbolTable {
                         let b = self.function(local);
                         self.defined_in_tu(local, tu)
                             && a.variadic == b.variadic
+                            && a.is_const_member == b.is_const_member
+                            && a.ref_qualifier == b.ref_qualifier
+                            && a.is_member_template == b.is_member_template
                             && Self::references_alike(a, b)
                             && self.explicit_params_alike(
                                 a,
@@ -3964,6 +4009,10 @@ mod tests {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_member_template: false,
+            is_const_member: false,
+            ref_qualifier: None,
+            return_cv: crate::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
