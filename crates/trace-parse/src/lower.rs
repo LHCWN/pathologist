@@ -9333,17 +9333,10 @@ fn standard_callee_name(text: &str) -> (bool, String) {
 
 fn expr_is_rvalue(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> bool {
     let node = peel_expression(node);
-    if node.cached_kind() == "cast_expression" {
-        if let Some(ty) = node.cached_field("type") {
-            let text = node_text(source, &ty).trim();
-            if text.ends_with("&&") {
-                return true;
-            }
-            if text.ends_with('&') {
-                return false;
-            }
-        }
-        return true;
+    // A cast is an lvalue only when it names an lvalue reference type, spelled
+    // or through an alias; any other cast yields a prvalue or an xvalue.
+    if let Some(ty) = cast_descriptor(source, node) {
+        return !is_spelled_lvalue_reference(program, ctx, node_text(source, &ty));
     }
     if node.cached_kind() == "field_expression" && !is_arrow_access(node) {
         if let Some(field_node) = node.cached_field("field") {
@@ -12886,6 +12879,18 @@ fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: 
     forget_placeholder_alias(ctx, type_node, var);
     if let Some(var) = var {
         flow_range_element(program, ctx, source, node, var);
+        // A reference bound to the elements of a const range (`auto &e : a`
+        // over `const T a[2]`) refers to const objects; a by-value variable
+        // copies them into mutable ones.
+        let binds_reference = decl.cached_kind() == "reference_declarator";
+        if placeholder
+            && binds_reference
+            && node.cached_field("right").is_some_and(|range| {
+                receiver_is_const(program, ctx, source, range, false) == Some(true)
+            })
+        {
+            ctx.var_qualifications.entry(var).or_default().object_const = true;
+        }
     }
 }
 
@@ -18879,6 +18884,14 @@ fn receiver_desc(
                 _ => None,
             }
         }
+        // `static_cast<T &&>(x)` names `T` as `(T &&)x` does (the C-style cast
+        // reaches the fallback arm below).
+        "call_expression" if ctx.is_cpp && is_named_cast(source, node) => {
+            cast_static_class(program, ctx, source, node).map(|name| TypeDesc::Struct {
+                name,
+                fields: Vec::new(),
+            })
+        }
         "call_expression" => {
             if let Some(cached) = ctx.call_receiver_cache.borrow().get(&node.id()) {
                 return Some(cached.clone());
@@ -19494,22 +19507,41 @@ fn infer_static_class(
             let fname = normalize_qualified(node_text(source, &field));
             class_field_static_class(program, &base_cls, &fname)
         }
-        "cast_expression" => {
-            // `(T *)p` names `T`; the descriptor's declarator is not part of it.
-            let descriptor = node.cached_field("type")?;
-            let type_node = descriptor.cached_field("type").unwrap_or(descriptor);
-            let raw = normalize_qualified(node_text(source, &type_node));
-            let qualified = qualify_class_name(program, ctx, &strip_template_args(&raw));
-            if program.types.class_type_id(&qualified).is_some() {
-                Some(qualified)
-            } else {
-                None
-            }
+        "cast_expression" => cast_static_class(program, ctx, source, node),
+        "call_expression" if ctx.is_cpp && is_named_cast(source, node) => {
+            cast_static_class(program, ctx, source, node)
         }
         "call_expression" => class_name_of_desc(&receiver_desc(program, ctx, source, node)?),
         "new_expression" => new_expression_class(program, ctx, source, node),
         _ => None,
     }
+}
+
+/// The class a C-style or named cast names: `(T *)p` and `static_cast<T &&>(p)`
+/// both name `T`; the descriptor's declarator is not part of it.
+fn cast_static_class(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<String> {
+    let descriptor = cast_descriptor(source, node)?;
+    let type_node = descriptor.cached_field("type").unwrap_or(descriptor);
+    let raw = normalize_qualified(node_text(source, &type_node));
+    // An alias names what it stands for (`using LRef = T &; (LRef)p`).
+    let aliased = local_alias(ctx, &raw)
+        .cloned()
+        .or_else(|| scoped_type_desc(program, ctx, &raw))
+        .or_else(|| program.types.resolve_alias(&raw).cloned())
+        .and_then(|desc| class_name_of_desc(&desc));
+    aliased.or_else(|| {
+        let qualified = qualify_class_name(program, ctx, &strip_template_args(&raw));
+        program
+            .types
+            .class_type_id(&qualified)
+            .is_some()
+            .then_some(qualified)
+    })
 }
 
 fn var_static_class(program: &Program, v: VarId) -> Option<String> {
@@ -22634,6 +22666,20 @@ fn receiver_is_const(
     if recv.cached_kind() == "this" {
         return ctx.class_ctx.as_ref().map(|c| c.is_const);
     }
+    if recv.cached_kind() == "new_expression" {
+        // `new const T` yields a pointer to const; the new object itself has
+        // no name to be const through.
+        return arrow.then(|| {
+            let ty = recv.cached_field("type");
+            let written_const = recv.children(&mut recv.walk()).any(|child| {
+                child.cached_kind() == "type_qualifier" && node_text(source, &child) == "const"
+            });
+            written_const
+                || ty.is_some_and(|ty| {
+                    spelled_type_cv(program, ctx, node_text(source, &ty)).object_const
+                })
+        });
+    }
     if recv.cached_kind() == "cast_expression" {
         let ty = recv.cached_field("type")?;
         let cv = spelled_type_cv(program, ctx, node_text(source, &ty));
@@ -23015,6 +23061,11 @@ fn declaration_cv_qualification(
 
     if is_constexpr {
         base_cv.object_const = true;
+    }
+    // An array decays to a pointer to its elements, which are as const as
+    // the array: `const T a[2]` is read through `*a` and `a + 1` as const.
+    if base_cv.pointee_const.is_none() && decl.is_some_and(declarator_is_array) {
+        base_cv.pointee_const = Some(base_cv.object_const);
     }
 
     base_cv

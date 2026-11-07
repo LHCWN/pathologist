@@ -20499,3 +20499,114 @@ void SpacedForward(const C& c) { auto x = std:: forward<const C&>(c).f(); x->bad
         );
     }
 }
+
+#[test]
+fn named_cast_receivers_are_typed_by_the_cast() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct V {
+    GoodTarget* f() & { return nullptr; }
+    BadTarget* f() && { return nullptr; }
+};
+struct K {
+    GoodTarget* f() { return nullptr; }
+    BadTarget* f() const { return nullptr; }
+};
+using LRef = V&;
+void RvalueCast(V& v) { auto x = static_cast<V&&>(v).f(); x->bad(); }
+void LvalueCast(V& v) { auto x = static_cast<V&>(v).f(); x->good(); }
+void AliasCast(V& v) { auto x = ((LRef)v).f(); x->good(); }
+void AddConst(K& k) { auto x = static_cast<const K&>(k).f(); x->bad(); }
+void AddConstPointer(K* p) { auto x = static_cast<const K*>(p)->f(); x->bad(); }
+void StripConst(const K& k) { auto x = const_cast<K&>(k).f(); x->good(); }
+void StripConstPointer(const K* p) { auto x = const_cast<K*>(p)->f(); x->good(); }
+void SamePointer(K* p) { auto x = static_cast<K*>(p)->f(); x->good(); }
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    for (func, want, other) in [
+        ("RvalueCast", "BadTarget::bad", "GoodTarget::good"),
+        ("LvalueCast", "GoodTarget::good", "BadTarget::bad"),
+        ("AliasCast", "GoodTarget::good", "BadTarget::bad"),
+        ("AddConst", "BadTarget::bad", "GoodTarget::good"),
+        ("AddConstPointer", "BadTarget::bad", "GoodTarget::good"),
+        ("StripConst", "GoodTarget::good", "BadTarget::bad"),
+        ("StripConstPointer", "GoodTarget::good", "BadTarget::bad"),
+        ("SamePointer", "GoodTarget::good", "BadTarget::bad"),
+    ] {
+        assert!(has_any_edge(&program, &analysis, func, want), "{func}");
+        assert!(!has_any_edge(&program, &analysis, func, other), "{func}");
+    }
+}
+
+#[test]
+fn const_arrays_keep_their_elements_const() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct K {
+    GoodTarget* f() { return nullptr; }
+    BadTarget* f() const { return nullptr; }
+};
+void ConstRefParam(const K (&a)[2]) { for (auto& e : a) { auto x = e.f(); x->bad(); } }
+void ConstForward(const K (&a)[2]) { for (auto&& e : a) { auto x = e.f(); x->bad(); } }
+void ConstLocal() { const K a[2] = {}; for (auto& e : a) { auto x = e.f(); x->bad(); } }
+void ConstDeref(const K (&a)[2]) { auto x = (*a).f(); x->bad(); }
+void CopyIsMutable(const K (&a)[2]) { for (auto e : a) { auto x = e.f(); x->good(); } }
+void MutableArray(K (&a)[2]) { for (auto& e : a) { auto x = e.f(); x->good(); } }
+void MutableDeref(K (&a)[2]) { auto x = (*a).f(); x->good(); }
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    for (func, want, other) in [
+        ("ConstRefParam", "BadTarget::bad", "GoodTarget::good"),
+        ("ConstForward", "BadTarget::bad", "GoodTarget::good"),
+        ("ConstLocal", "BadTarget::bad", "GoodTarget::good"),
+        ("ConstDeref", "BadTarget::bad", "GoodTarget::good"),
+        ("CopyIsMutable", "GoodTarget::good", "BadTarget::bad"),
+        ("MutableArray", "GoodTarget::good", "BadTarget::bad"),
+        ("MutableDeref", "GoodTarget::good", "BadTarget::bad"),
+    ] {
+        assert!(has_any_edge(&program, &analysis, func, want), "{func}");
+        assert!(!has_any_edge(&program, &analysis, func, other), "{func}");
+    }
+}
+
+#[test]
+fn new_through_a_const_alias_yields_a_pointer_to_const() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct K {
+    GoodTarget* f() { return nullptr; }
+    BadTarget* f() const { return nullptr; }
+};
+using ConstK = const K;
+void Mutable() { auto x = (new K)->f(); x->good(); }
+void ThroughAlias() { auto x = (new ConstK)->f(); x->bad(); }
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "Mutable",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(
+        &program,
+        &analysis,
+        "Mutable",
+        "BadTarget::bad"
+    ));
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "ThroughAlias",
+        "BadTarget::bad"
+    ));
+    assert!(!has_any_edge(
+        &program,
+        &analysis,
+        "ThroughAlias",
+        "GoodTarget::good"
+    ));
+}
