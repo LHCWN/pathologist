@@ -4365,6 +4365,12 @@ fn register_typedef_alias(
             rvalue_reference,
         );
         program.types.register_alias_qualification(&qual, cv);
+        // The bare entry is the global fallback: a namespace's alias must not
+        // replace the global alias of the same name that lookups from other
+        // scopes still reach through it.
+        if program.types.resolve_alias(alias).is_some() {
+            return;
+        }
     }
     program
         .types
@@ -4547,13 +4553,17 @@ fn resolve_alias_reference_kind(program: &Program, ctx: &LowerContext, name: &st
         {
             return *ref_kind;
         }
+        // The innermost alias of the name answers, reference or not: an
+        // outer reference alias it shadows must not leak through.
         find_in_scope(program, ctx, candidate_name, |candidate, _| {
-            if program.types.alias_is_reference(candidate) {
-                Some(program.types.alias_is_rvalue_reference(candidate))
-            } else {
-                None
-            }
+            program.types.resolve_alias(candidate).map(|_| {
+                program
+                    .types
+                    .alias_is_reference(candidate)
+                    .then(|| program.types.alias_is_rvalue_reference(candidate))
+            })
         })
+        .flatten()
     };
     if let Some(res) = check(&name) {
         return Some(res);
@@ -9308,6 +9318,19 @@ fn from_this_call<'t>(
     Some(FromThis { receiver, result })
 }
 
+/// A callee spelling reduced to its function name, template arguments and
+/// spacing around `::` removed, with whether it was written in `std::` (and
+/// the name without that prefix). Shared by every check that tells the
+/// standard casts and `move` / `forward` from a user function of that name.
+fn standard_callee_name(text: &str) -> (bool, String) {
+    let head = normalize_qualified(type_name_before_template(text));
+    let head = head.trim();
+    let is_std = head.starts_with("std::") || head.starts_with("::std::");
+    let unqualified = head.strip_prefix("::").unwrap_or(head);
+    let unqualified = unqualified.strip_prefix("std::").unwrap_or(unqualified);
+    (is_std, unqualified.trim().to_string())
+}
+
 fn expr_is_rvalue(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> bool {
     let node = peel_expression(node);
     if node.cached_kind() == "cast_expression" {
@@ -9347,14 +9370,8 @@ fn expr_is_rvalue(program: &Program, ctx: &LowerContext, source: &str, node: Nod
     if node.cached_kind() == "call_expression" {
         if let Some(func) = node.cached_field("function") {
             let text = node_text(source, &func);
-            let head = normalize_qualified(type_name_before_template(text));
-            let head = head.trim();
-            let is_std_prefix = head.starts_with("std::") || head.starts_with("::std::");
-            let unqualified = head.strip_prefix("::").unwrap_or(head);
-            let unqualified = unqualified
-                .strip_prefix("std::")
-                .unwrap_or(unqualified)
-                .trim();
+            let (is_std_prefix, unqualified) = standard_callee_name(text);
+            let unqualified = unqualified.as_str();
             if matches!(unqualified, "move" | "forward") {
                 let is_user_fn = !is_std_prefix && {
                     let nodes = call_arg_nodes(node);
@@ -22612,10 +22629,8 @@ fn receiver_is_const(
     if recv.cached_kind() == "call_expression" {
         if let Some(func) = recv.cached_field("function") {
             let text = node_text(source, &func);
-            let head = type_name_before_template(text).trim();
-            let is_std_prefix = head.starts_with("std::") || head.starts_with("::std::");
-            let unqualified = head.strip_prefix("::").unwrap_or(head);
-            let unqualified = unqualified.strip_prefix("std::").unwrap_or(unqualified);
+            let (is_std_prefix, unqualified) = standard_callee_name(text);
+            let unqualified = unqualified.as_str();
             if matches!(
                 unqualified,
                 "static_cast" | "const_cast" | "reinterpret_cast" | "dynamic_cast"
@@ -22743,22 +22758,75 @@ fn receiver_is_const(
     None
 }
 
+/// Whether `const` is written at the outermost level of a type spelling,
+/// not inside a template argument list, parameter list or array bound:
+/// `const Box<int>` and `Box<int> const` are const, `Box<const int>` is not.
 fn spelled_has_const(spelled: &str) -> bool {
-    spelled
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|word| word == "const")
-}
-
-fn strip_trailing_const(mut s: &str) -> &str {
-    loop {
-        let t = s.trim_end();
-        match t.strip_suffix("const") {
-            Some(rest) if rest.ends_with(|c: char| c.is_whitespace() || matches!(c, '*' | '&')) => {
-                s = rest;
+    let mut depth = 0usize;
+    let mut word = String::new();
+    let mut found = false;
+    for ch in spelled.chars().chain(std::iter::once(' ')) {
+        if ch.is_alphanumeric() || ch == '_' {
+            if depth == 0 {
+                word.push(ch);
             }
-            _ => return t,
+            continue;
+        }
+        found |= word == "const";
+        word.clear();
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
+    found
+}
+
+/// `s` without the `const` / `volatile` qualifiers written after it, and
+/// whether one of them was `const`. A qualifier is a whole word: the text
+/// before it is empty, spaced, or ends in declarator punctuation (`T*const`,
+/// `Box<int>const`).
+fn peel_trailing_cv(s: &str) -> (&str, bool) {
+    let mut s = s.trim_end();
+    let mut is_const = false;
+    'peel: loop {
+        for (word, qualifier_is_const) in [("const", true), ("volatile", false)] {
+            if let Some(rest) = s.strip_suffix(word) {
+                let whole_word = rest.is_empty()
+                    || rest.ends_with(|c: char| {
+                        c.is_whitespace() || matches!(c, '*' | '&' | '>' | ')')
+                    });
+                if whole_word {
+                    is_const |= qualifier_is_const;
+                    s = rest.trim_end();
+                    continue 'peel;
+                }
+            }
+        }
+        return (s, is_const);
+    }
+}
+
+fn has_trailing_const(s: &str) -> bool {
+    peel_trailing_cv(s).1
+}
+
+/// `spelled` split at its outermost pointer or reference declarator: the
+/// type it points to or refers to (any `const` / `volatile` after the
+/// declarator dropped) and whether the declarator is a pointer. `T const * const`
+/// is (`T const`, pointer); `Box<T*>` has none.
+fn peel_outer_declarator(spelled: &str) -> Option<(&str, bool)> {
+    let (declarator, _) = peel_trailing_cv(spelled);
+    let declarator = declarator.trim_end();
+    if let Some(rest) = declarator.strip_suffix('*') {
+        return Some((rest.trim_end(), true));
+    }
+    let mut rest = declarator.strip_suffix('&')?;
+    if let Some(inner) = rest.strip_suffix('&') {
+        rest = inner;
+    }
+    Some((rest.trim_end(), false))
 }
 
 fn spelled_type_cv(
@@ -22791,7 +22859,7 @@ fn spelled_type_cv(
             seg,
             "shared_ptr" | "unique_ptr" | "weak_ptr" | "sptr" | "wptr"
         ) {
-            let top_const = spelled_has_const(head) || strip_trailing_const(spelled) != spelled;
+            let top_const = spelled_has_const(head) || has_trailing_const(spelled);
             let inner_cv = template_arguments(spelled)
                 .first()
                 .map(|arg| spelled_type_cv(program, ctx, arg))
@@ -22803,47 +22871,25 @@ fn spelled_type_cv(
         }
     }
 
-    let has_postfix_const_before_ptr = if let Some(idx) = spelled.find(['*', '&']) {
-        let before = spelled[..idx].trim_end();
-        strip_trailing_const(before) != before
-    } else {
-        false
-    };
-
-    let (base, suffix) = split_pointer_suffix(spelled);
-    if !suffix.is_empty() {
-        let is_ptr = suffix.contains('*');
-        let is_ref = suffix.contains('&');
-        let top_const = strip_trailing_const(spelled) != spelled;
-        let inner_cv = spelled_type_cv(program, ctx, base);
-        if is_ptr {
+    // Only the outermost declarator is peeled: what it points to carries its
+    // own qualification (`const T**` points to a mutable `const T*`), found
+    // by asking the same question of that remainder.
+    match peel_outer_declarator(spelled) {
+        Some((pointee, true)) => trace_ir::CvQualification {
+            object_const: has_trailing_const(spelled),
+            pointee_const: Some(spelled_type_cv(program, ctx, pointee).object_const),
+        },
+        Some((referent, false)) => {
+            let inner_cv = spelled_type_cv(program, ctx, referent);
             trace_ir::CvQualification {
-                object_const: top_const,
-                pointee_const: Some(
-                    has_postfix_const_before_ptr
-                        || inner_cv.object_const
-                        || spelled_has_const(base),
-                ),
-            }
-        } else if is_ref {
-            trace_ir::CvQualification {
-                object_const: has_postfix_const_before_ptr
-                    || inner_cv.object_const
-                    || spelled_has_const(base),
+                object_const: inner_cv.object_const,
                 pointee_const: inner_cv.pointee_const,
             }
-        } else {
-            trace_ir::CvQualification {
-                object_const: top_const,
-                pointee_const: None,
-            }
         }
-    } else {
-        let is_const = spelled_has_const(spelled);
-        trace_ir::CvQualification {
-            object_const: is_const,
+        None => trace_ir::CvQualification {
+            object_const: spelled_has_const(spelled),
             pointee_const: None,
-        }
+        },
     }
 }
 
@@ -22874,7 +22920,7 @@ fn declaration_cv_qualification(
             let is_ptr_decl = decl.is_some_and(|d| declarator_pointer_depth(d) > 0);
             if is_ptr_decl {
                 let decl_text = decl.map(|d| node_text(source, &d)).unwrap_or("");
-                let top_const = strip_trailing_const(decl_text) != decl_text;
+                let top_const = has_trailing_const(decl_text);
                 let pointee_const = has_decl_const
                     || receiver_is_const(program, ctx, source, init, true) == Some(true);
                 return trace_ir::CvQualification {
@@ -22902,7 +22948,7 @@ fn declaration_cv_qualification(
         let is_ptr_decl = decl.is_some_and(|d| declarator_pointer_depth(d) > 0);
         if is_ptr_decl {
             let decl_text = decl.map(|d| node_text(source, &d)).unwrap_or("");
-            let top_const = strip_trailing_const(decl_text) != decl_text;
+            let top_const = has_trailing_const(decl_text);
             return trace_ir::CvQualification {
                 object_const: if is_variable {
                     top_const || is_constexpr
@@ -22933,7 +22979,7 @@ fn declaration_cv_qualification(
         let has_ref = declares_reference(decl) || is_ref;
         if ptr_depth > 0 {
             let decl_text = node_text(source, &decl);
-            let top_const = strip_trailing_const(decl_text) != decl_text;
+            let top_const = has_trailing_const(decl_text);
             let pointee_const = base_cv.object_const;
             return trace_ir::CvQualification {
                 object_const: if is_variable {
@@ -27559,5 +27605,91 @@ mod unit_program_tests {
         let unit = program_into_unit(PathBuf::from("/t/a.c"), program, None);
         let functions: Vec<FnId> = unit.cfgs.iter().map(|c| c.function).collect();
         assert_eq!(functions, [FnId(1), FnId(3)]);
+    }
+}
+
+#[cfg(test)]
+mod spelled_cv_tests {
+    use super::*;
+
+    fn cv(spelled: &str) -> (bool, Option<bool>) {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/r.cpp"));
+        let ctx = super::qualified_variable_lookup_tests::test_ctx(
+            file,
+            None,
+            Vec::new(),
+            HashMap::default(),
+        );
+        let cv = spelled_type_cv(&program, &ctx, spelled);
+        (cv.object_const, cv.pointee_const)
+    }
+
+    #[test]
+    fn const_inside_template_arguments_is_not_the_types_own() {
+        assert!(!spelled_has_const("Box<const int>"));
+        assert!(!spelled_has_const("Box<int const*>"));
+        assert!(!spelled_has_const("Fn<void(const int)>"));
+        assert!(spelled_has_const("const Box<const int>"));
+        assert!(spelled_has_const("Box<int> const"));
+        assert!(spelled_has_const("const"));
+        assert!(!spelled_has_const("constant"));
+        assert_eq!(cv("Box<const int>&"), (false, None));
+        assert_eq!(cv("Box<const int>*"), (false, Some(false)));
+        assert_eq!(cv("Box<int const*>*"), (false, Some(false)));
+        assert_eq!(cv("Box<int const*>&"), (false, None));
+    }
+
+    #[test]
+    fn trailing_const_is_a_whole_word_after_any_declarator() {
+        assert!(has_trailing_const("const"));
+        assert!(has_trailing_const("T const"));
+        assert!(has_trailing_const("T*const"));
+        assert!(has_trailing_const("Box<int> const"));
+        assert!(has_trailing_const("Box<int>const"));
+        assert!(has_trailing_const("T* const volatile"));
+        assert!(!has_trailing_const("T* volatile"));
+        assert!(!has_trailing_const("volatile"));
+        assert!(!has_trailing_const("myconst"));
+        assert!(!has_trailing_const("Box<const int>"));
+        assert_eq!(peel_trailing_cv("const"), ("", true));
+    }
+
+    #[test]
+    fn outermost_declarator_alone_decides_pointee_and_object_const() {
+        assert_eq!(cv("const T*"), (false, Some(true)));
+        assert_eq!(cv("T const*"), (false, Some(true)));
+        assert_eq!(cv("T* const"), (true, Some(false)));
+        assert_eq!(cv("T const* const"), (true, Some(true)));
+        assert_eq!(cv("T const* const volatile"), (true, Some(true)));
+        // The inner level is const, the outer pointee is a mutable pointer.
+        assert_eq!(cv("const T**"), (false, Some(false)));
+        assert_eq!(cv("T const**"), (false, Some(false)));
+        assert_eq!(cv("T* const*"), (false, Some(true)));
+        assert_eq!(cv("const T&"), (true, None));
+        assert_eq!(cv("T const&"), (true, None));
+        assert_eq!(cv("T* const&"), (true, Some(false)));
+        assert_eq!(cv("const T* const&"), (true, Some(true)));
+        assert_eq!(cv("volatile T*"), (false, Some(false)));
+        assert_eq!(cv("volatile T&"), (false, None));
+    }
+
+    #[test]
+    fn standard_callee_names_ignore_spacing_and_template_arguments() {
+        for text in [
+            "std::move",
+            "std :: move",
+            "std:: move",
+            ":: std::move",
+            "::std::move",
+        ] {
+            assert_eq!(standard_callee_name(text), (true, "move".into()), "{text}");
+        }
+        assert_eq!(
+            standard_callee_name("std::forward<C&>"),
+            (true, "forward".into())
+        );
+        assert_eq!(standard_callee_name("move"), (false, "move".into()));
+        assert_eq!(standard_callee_name("n::move"), (false, "n::move".into()));
     }
 }

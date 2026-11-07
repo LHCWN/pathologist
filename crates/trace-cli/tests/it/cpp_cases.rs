@@ -20382,3 +20382,120 @@ void test(C& c) {
     ));
     assert!(!has_any_edge(&program, &analysis, "test", "BadTarget::bad"));
 }
+
+#[test]
+fn inner_non_reference_alias_shadows_outer_reference_alias() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    GoodTarget* f() & { return nullptr; }
+    BadTarget* f() && { return nullptr; }
+};
+using Ref = C&;
+namespace N {
+    using Ref = C;
+    Ref Get();
+    void test() { auto x = Get().f(); x->bad(); }
+}
+namespace M {
+    Ref Get();
+    void test() { auto x = Get().f(); x->good(); }
+}
+namespace Early {
+    using Ref2 = C;
+    Ref2 Get();
+    void test() { auto x = Get().f(); x->bad(); }
+}
+using Ref2 = C&;
+namespace Late {
+    Ref2 Get();
+    void test() { auto x = Get().f(); x->good(); }
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    for (func, want, other) in [
+        ("N::test", "BadTarget::bad", "GoodTarget::good"),
+        ("M::test", "GoodTarget::good", "BadTarget::bad"),
+        ("Early::test", "BadTarget::bad", "GoodTarget::good"),
+        ("Late::test", "GoodTarget::good", "BadTarget::bad"),
+    ] {
+        assert!(has_any_edge(&program, &analysis, func, want), "{func}");
+        assert!(!has_any_edge(&program, &analysis, func, other), "{func}");
+    }
+}
+
+#[test]
+fn template_argument_qualifiers_do_not_qualify_the_receiver() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+template <class T> struct Box {
+    GoodTarget* f() { return nullptr; }
+    BadTarget* f() const { return nullptr; }
+};
+void ConstArgPointer(Box<const int>* p) { auto x = p->f(); x->good(); }
+void ConstArgReference(Box<const int>& r) { auto x = r.f(); x->good(); }
+void ConstPointerArgPointer(Box<int const*>* p) { auto x = p->f(); x->good(); }
+void ConstPointerArgReference(Box<int const*>& r) { auto x = r.f(); x->good(); }
+void ConstBoxPointer(Box<int const*> const* p) { auto x = p->f(); x->bad(); }
+void ConstBoxReference(Box<const int> const& r) { auto x = r.f(); x->bad(); }
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    for func in [
+        "ConstArgPointer",
+        "ConstArgReference",
+        "ConstPointerArgPointer",
+        "ConstPointerArgReference",
+    ] {
+        assert!(
+            has_any_edge(&program, &analysis, func, "GoodTarget::good"),
+            "{func}"
+        );
+        assert!(
+            !has_any_edge(&program, &analysis, func, "BadTarget::bad"),
+            "{func}"
+        );
+    }
+    for func in ["ConstBoxPointer", "ConstBoxReference"] {
+        assert!(
+            has_any_edge(&program, &analysis, func, "BadTarget::bad"),
+            "{func}"
+        );
+        assert!(
+            !has_any_edge(&program, &analysis, func, "GoodTarget::good"),
+            "{func}"
+        );
+    }
+}
+
+#[test]
+fn standard_cast_spelling_variants_keep_receiver_constness() {
+    let source = r#"
+namespace std {
+    template <class T> T&& move(T& t);
+    template <class T> T&& forward(T& t);
+}
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    GoodTarget* f() { return nullptr; }
+    BadTarget* f() const { return nullptr; }
+};
+void Plain(const C& c) { auto x = std::move(c).f(); x->bad(); }
+void SpacedScope(const C& c) { auto x = std :: move(c).f(); x->bad(); }
+void SpacedLead(const C& c) { auto x = :: std::move(c).f(); x->bad(); }
+void SpacedForward(const C& c) { auto x = std:: forward<const C&>(c).f(); x->bad(); }
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    for func in ["Plain", "SpacedScope", "SpacedLead", "SpacedForward"] {
+        assert!(
+            has_any_edge(&program, &analysis, func, "BadTarget::bad"),
+            "{func}"
+        );
+        assert!(
+            !has_any_edge(&program, &analysis, func, "GoodTarget::good"),
+            "{func}"
+        );
+    }
+}
