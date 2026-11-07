@@ -4371,3 +4371,31 @@ fn merged_const_overloads_on_same_source_line_remain_distinct() {
     assert_eq!(fns[0].1, "C::f()");
     assert_eq!(fns[1].1, "C::f() const");
 }
+
+#[test]
+fn merged_member_template_overloads_on_same_source_line_remain_distinct() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let source = "void TBody() {} void NBody() {}\nstruct A { template<class U=void> void f(){TBody();} void f(){NBody();} };\n";
+    fs::write(repo.join("main.cpp"), source).unwrap();
+    let db = tmp.path().join("in.db");
+    analyze_repo(&repo, &db);
+    let out = tmp.path().join("out.db");
+    merge_into(&[db], &out);
+    let c = Connection::open(out).unwrap();
+    let fns: Vec<(String, String)> = c
+        .prepare("SELECT name, signature FROM functions WHERE name = 'A::f' ORDER BY signature")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        fns.len(),
+        2,
+        "two distinct A::f overloads in merged database: {fns:?}"
+    );
+    assert_eq!(fns[0].1, "A::f()");
+    assert_eq!(fns[1].1, "A::f() <template>");
+}

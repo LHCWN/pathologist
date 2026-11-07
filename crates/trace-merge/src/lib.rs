@@ -426,10 +426,11 @@ fn prefer_definitions(
 }
 
 fn matching_definitions<'a>(defs: &'a [DefRecord], signature: &str) -> (Vec<&'a DefRecord>, bool) {
-    let bare_sig = signature
+    let bare_sig = signature.strip_suffix(" <template>").unwrap_or(signature);
+    let bare_sig = bare_sig
         .strip_suffix(" &&")
-        .or_else(|| signature.strip_suffix(" &"))
-        .unwrap_or(signature);
+        .or_else(|| bare_sig.strip_suffix(" &"))
+        .unwrap_or(bare_sig);
     let bare_sig = bare_sig.strip_suffix(" const").unwrap_or(bare_sig);
     if !signature.contains('(') || bare_sig.ends_with("(...)") {
         return (defs.iter().collect(), true);

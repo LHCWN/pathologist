@@ -943,6 +943,9 @@ fn function_signature(func: &trace_ir::Function, program: &Program) -> String {
         Some(true) => sig.push_str(" &&"),
         None => {}
     }
+    if func.is_member_template {
+        sig.push_str(" <template>");
+    }
     sig
 }
 

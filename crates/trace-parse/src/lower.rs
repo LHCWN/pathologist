@@ -5280,7 +5280,11 @@ fn lower_struct_specifier(
                                 program.types.note_field_qualification(
                                     &reg_name,
                                     &fname,
-                                    trace_ir::FieldQualification { cv, is_mutable },
+                                    trace_ir::FieldQualification {
+                                        cv,
+                                        is_mutable,
+                                        is_reference: is_ref,
+                                    },
                                 );
                                 if let Some(initializer) = initializer {
                                     note_member_initializer(
@@ -7739,6 +7743,7 @@ fn auto_initializer_type(
                 candidates,
                 receiver,
                 receiver_is_const,
+                receiver_is_rvalue,
             } => {
                 let nodes = call_arg_nodes(value);
                 let args: Vec<TypeDesc> = nodes
@@ -7754,6 +7759,7 @@ fn auto_initializer_type(
                     candidates,
                     receiver,
                     receiver_is_const,
+                    receiver_is_rvalue,
                     &args,
                     &nulls,
                 )?
@@ -7826,6 +7832,8 @@ enum CallResult {
         receiver: Option<String>,
         /// Whether the receiver object is `const`, when known.
         receiver_is_const: Option<bool>,
+        /// Whether the receiver object is an rvalue, when known.
+        receiver_is_rvalue: Option<bool>,
     },
 }
 
@@ -7902,7 +7910,8 @@ fn call_result_shape(
     if let Some(extraction) = pointer_extraction(program, ctx, source, value) {
         return Some(CallResult::Decided(Some(extraction.result)));
     }
-    let (candidates, receiver, receiver_is_const) = if let Some(op) = (ctx.is_cpp)
+    let (candidates, receiver, receiver_is_const, receiver_is_rvalue) = if let Some(op) = (ctx
+        .is_cpp)
         .then(|| explicit_member_operator_call(value, source))
         .flatten()
     {
@@ -7917,7 +7926,17 @@ fn call_result_shape(
         };
         let is_const = receiver_is_const(program, ctx, source, recv, arrow);
         let members = class_member_declarations(program, &receiver_lookup_name(&receiver), &field);
-        (Overloads::Declared(members), Some(receiver), is_const)
+        let has_ref_qualifiers = members
+            .iter()
+            .any(|&f| program.symbols.function(f).ref_qualifier.is_some());
+        let is_rvalue =
+            (!arrow && has_ref_qualifiers).then(|| expr_is_rvalue(program, ctx, source, recv));
+        (
+            Overloads::Declared(members),
+            Some(receiver),
+            is_const,
+            is_rvalue,
+        )
     } else if func.cached_kind() == "field_expression" {
         let recv = func.cached_field("argument")?;
         let field = normalize_qualified(node_text(source, &func.cached_field("field")?));
@@ -7937,7 +7956,17 @@ fn call_result_shape(
         }
         let is_const = receiver_is_const(program, ctx, source, recv, arrow);
         let members = class_member_declarations(program, &cls, &name);
-        (Overloads::Declared(members), Some(receiver), is_const)
+        let has_ref_qualifiers = members
+            .iter()
+            .any(|&f| program.symbols.function(f).ref_qualifier.is_some());
+        let is_rvalue =
+            (!arrow && has_ref_qualifiers).then(|| expr_is_rvalue(program, ctx, source, recv));
+        (
+            Overloads::Declared(members),
+            Some(receiver),
+            is_const,
+            is_rvalue,
+        )
     } else {
         let (name, _, var) = resolve_callee(program, ctx, source, func);
         if var.is_some() {
@@ -7966,19 +7995,25 @@ fn call_result_shape(
             });
             // A static call's receiver is its scope, named once a candidate
             // turns out to substitute ([`call_result_among`]).
-            (Overloads::ByName(name), None, is_const)
+            (Overloads::ByName(name), None, is_const, None)
         } else {
             // `Get()` in a member body is `this->Get()`, so the enclosing
             // class is the receiver a base's substitution facts apply to.
             let receiver = ctx.class_ctx.as_ref().map(|cc| cc.qual_name.clone());
             let is_const = ctx.class_ctx.as_ref().map(|cc| cc.is_const);
-            (Overloads::Declared(members), receiver, is_const)
+            (
+                Overloads::Declared(members),
+                receiver,
+                is_const,
+                Some(false),
+            )
         }
     };
     Some(CallResult::Overload {
         candidates,
         receiver,
         receiver_is_const,
+        receiver_is_rvalue,
     })
 }
 
@@ -8187,6 +8222,7 @@ fn call_result_among(
     candidates: Overloads,
     receiver: Option<String>,
     receiver_is_const: Option<bool>,
+    receiver_is_rvalue: Option<bool>,
     args: &[TypeDesc],
     null_constants: &[bool],
 ) -> Option<TypeDesc> {
@@ -8266,6 +8302,7 @@ fn call_result_among(
         args,
         null_constants,
         receiver_is_const,
+        receiver_is_rvalue,
         spells_template_args,
     );
     agreed(candidates.iter().map(|&f| {
@@ -8319,6 +8356,7 @@ fn result_overloads(
     args: &[TypeDesc],
     null_constants: &[bool],
     receiver_is_const: Option<bool>,
+    receiver_is_rvalue: Option<bool>,
     spells_template_args: bool,
 ) -> Vec<FnId> {
     let candidates = filter_targets_by_argc(program, candidates, args.len(), args, args.is_empty());
@@ -8332,6 +8370,45 @@ fn result_overloads(
             candidates
         } else {
             templates
+        }
+    } else {
+        candidates
+    };
+    let candidates = if let Some(is_rval) = receiver_is_rvalue {
+        let mut ref_viable: Vec<FnId> = candidates
+            .iter()
+            .copied()
+            .filter(|&id| {
+                if !is_non_static_member(program, id) {
+                    return true;
+                }
+                let f = program.symbols.function(id);
+                ref_qualifier_viable(f.ref_qualifier, f.is_const_member, is_rval)
+            })
+            .collect();
+        if ref_viable
+            .iter()
+            .any(|&id| program.symbols.function(id).ref_qualifier.is_some())
+        {
+            ref_viable.retain(|&id| {
+                !is_non_static_member(program, id)
+                    || program.symbols.function(id).ref_qualifier.is_some()
+            });
+        }
+        if is_rval
+            && ref_viable
+                .iter()
+                .any(|&id| program.symbols.function(id).ref_qualifier == Some(true))
+        {
+            ref_viable.retain(|&id| {
+                !is_non_static_member(program, id)
+                    || program.symbols.function(id).ref_qualifier == Some(true)
+            });
+        }
+        if ref_viable.is_empty() {
+            candidates
+        } else {
+            ref_viable
         }
     } else {
         candidates
@@ -8364,7 +8441,7 @@ fn result_overloads(
     if narrowed.len() <= 1 {
         return narrowed;
     }
-    let ranked = if receiver_is_const == Some(false) {
+    let ranked = if receiver_is_const == Some(false) && receiver_is_rvalue != Some(true) {
         let has_non_const = narrowed.iter().any(|&id| {
             is_non_static_member(program, id) && !program.symbols.function(id).is_const_member
         });
@@ -8405,7 +8482,7 @@ fn result_overloads(
                     let o = program.symbols.function(other);
                     !o.is_member_template
                         && o.is_const_member == f.is_const_member
-                        && same_explicit_signature(program, id, other)
+                        && args_compatible_prefix(program, id, other, args.len())
                 }))
         })
         .collect()
@@ -8435,33 +8512,16 @@ fn args_compatible_prefix(program: &Program, a: FnId, b: FnId, argc: usize) -> b
     }
 }
 
-fn is_non_static_member(program: &Program, fid: FnId) -> bool {
-    is_member_function(program, fid) && !program.symbols.function(fid).is_static_member
+fn ref_qualifier_viable(ref_qual: Option<bool>, is_const: bool, is_rvalue: bool) -> bool {
+    match ref_qual {
+        None => true,
+        Some(true) => is_rvalue,
+        Some(false) => !is_rvalue || is_const,
+    }
 }
 
-fn same_explicit_signature(program: &Program, a: FnId, b: FnId) -> bool {
-    let fa = program.symbols.function(a);
-    let fb = program.symbols.function(b);
-    if fa.variadic != fb.variadic || !trace_ir::SymbolTable::references_alike(fa, fb) {
-        return false;
-    }
-    let a_arity = method_explicit_arity(program, a);
-    let b_arity = method_explicit_arity(program, b);
-    if a_arity != b_arity {
-        return false;
-    }
-    if a_arity == Some(0) {
-        return true;
-    }
-    program
-        .symbols
-        .explicit_params_alike(
-            fa,
-            fb,
-            &program.types,
-            trace_ir::SpellingTolerance::Redeclaration,
-        )
-        .unwrap_or(false)
+fn is_non_static_member(program: &Program, fid: FnId) -> bool {
+    is_member_function(program, fid) && !program.symbols.function(fid).is_static_member
 }
 
 /// The one value a candidate set agrees on: nothing when it is empty, when a
@@ -8501,12 +8561,14 @@ fn substituted_template_return(
             fact.arity as usize == arity
                 && fact.is_const_member == func.is_const_member
                 && fact.ref_qualifier == func.ref_qualifier
+                && fact.is_member_template == func.is_member_template
         })
     };
     let declared = program.symbols.explicit_params(func);
     let its_own = |fact: &&trace_ir::TemplateReturn| {
         fact.is_const_member == func.is_const_member
             && fact.ref_qualifier == func.ref_qualifier
+            && fact.is_member_template == func.is_member_template
             && declared.as_ref().is_some_and(|params| {
                 params.len() == fact.params.len()
                     && fact.params.iter().enumerate().all(|(i, desc)| {
@@ -9044,10 +9106,23 @@ fn expr_is_rvalue(program: &Program, ctx: &LowerContext, source: &str, node: Nod
         if let Some(func) = node.cached_field("function") {
             let text = node_text(source, &func);
             let head = type_name_before_template(text).trim();
+            let is_std_prefix = head.starts_with("std::") || head.starts_with("::std::");
             let unqualified = head.strip_prefix("::").unwrap_or(head);
             let unqualified = unqualified.strip_prefix("std::").unwrap_or(unqualified);
             if matches!(unqualified, "move" | "forward") {
-                return true;
+                let is_user_fn = !is_std_prefix && {
+                    let nodes = call_arg_nodes(node);
+                    let args: Vec<_> = nodes
+                        .iter()
+                        .map(|&arg| known_arg_type(program, ctx, source, arg))
+                        .collect();
+                    let candidates =
+                        cpp_callee_candidates(program, ctx, source, func, unqualified, &args);
+                    !candidates.is_empty()
+                };
+                if !is_user_fn {
+                    return true;
+                }
             }
         }
         return !call_may_return_reference(program, ctx, source, node);
@@ -9173,7 +9248,7 @@ fn from_this_result(
             FromThisReceiver::Dot(recv) => expr_is_rvalue(program, ctx, source, recv),
         };
         let mut memo = HashMap::default();
-        match from_this_selection(
+        let sel = from_this_selection(
             program,
             ctx,
             &start,
@@ -9181,7 +9256,8 @@ fn from_this_result(
             object_is_const,
             object_is_rvalue,
             &mut memo,
-        ) {
+        );
+        match sel {
             FromThisSelection::Standard => start,
             FromThisSelection::Imported(imported) => imported,
             FromThisSelection::Hidden
@@ -9340,7 +9416,7 @@ fn select_from_this_level(
                     return false;
                 }
                 if let Some(rval) = f.ref_qualifier {
-                    if rval != object_is_rvalue {
+                    if !ref_qualifier_viable(Some(rval), f.is_const_member, object_is_rvalue) {
                         return false;
                     }
                 }
@@ -9357,6 +9433,7 @@ fn select_from_this_level(
         // worse than a non-const standard member, so it only hides the
         // standard member when no import at this level selects one.
         let mut hidden_const = !object_is_const
+            && !object_is_rvalue
             && !hiding.is_empty()
             && hiding
                 .iter()
@@ -10316,6 +10393,7 @@ fn call_may_return_reference(
     let Some(CallResult::Overload {
         candidates,
         receiver_is_const,
+        receiver_is_rvalue,
         ..
     }) = call_result_shape(program, ctx, source, call)
     else {
@@ -10344,6 +10422,7 @@ fn call_may_return_reference(
         &args,
         &null_constant_args(source, &nodes),
         receiver_is_const,
+        receiver_is_rvalue,
         spells_template_args,
     )
     .into_iter()
@@ -11273,6 +11352,7 @@ fn register_template_return(
             .is_cpp
             .then(|| function_ref_qualifier(source, node))
             .flatten(),
+        is_member_template: ctx.is_cpp && is_member_function_template(source, node),
         parameter,
         pointer_depth,
         // As spelled: which class it names is read from the template's own
@@ -17734,9 +17814,13 @@ fn lower_lambda_expression(
         .children(&mut node.walk())
         .find(|c| c.cached_kind() == "lambda_capture_specifier")
     {
+        let mut next_is_ref = false;
         for child in cap_node.children(&mut cap_node.walk()) {
             match child.cached_kind() {
-                "this" => captures_this = true,
+                "this" => {
+                    captures_this = true;
+                    next_is_ref = false;
+                }
                 "lambda_default_capture" => {
                     default_capture_all = true;
                     if node_text(source, &child).contains('&') {
@@ -17745,15 +17829,19 @@ fn lower_lambda_expression(
                     if saved_class.is_some() || saved_locals.contains_key("this") {
                         captures_this = true;
                     }
+                    next_is_ref = false;
                 }
                 "identifier" => {
                     let name = node_text(source, &child).to_string();
-                    captured_vars.push((name, false));
+                    let is_ref = next_is_ref;
+                    next_is_ref = false;
+                    captured_vars.push((name, is_ref));
                 }
                 "reference_expression" => {
                     let text = node_text(source, &child);
                     let name = text.trim_start_matches('&').trim().to_string();
                     captured_vars.push((name, true));
+                    next_is_ref = false;
                 }
                 "lambda_capture_initializer" => {
                     if let (Some(left), Some(right)) =
@@ -17763,11 +17851,20 @@ fn lower_lambda_expression(
                         let name = node_text(source, &left).trim().to_string();
                         init_captures.push((name, is_ref, left, right));
                     }
+                    next_is_ref = false;
                 }
                 _ => {
                     let text = node_text(source, &child).trim();
                     if let Some(name) = text.strip_prefix('&') {
-                        captured_vars.push((name.trim().to_string(), true));
+                        let name = name.trim();
+                        if !name.is_empty() {
+                            captured_vars.push((name.to_string(), true));
+                            next_is_ref = false;
+                        } else {
+                            next_is_ref = true;
+                        }
+                    } else if text == "&" {
+                        next_is_ref = true;
                     }
                 }
             }
@@ -17777,19 +17874,38 @@ fn lower_lambda_expression(
     let mut lambda_locals: HashMap<String, VarId> = HashMap::default();
     let mut closure_const_vars = HashSet::default();
 
+    let mut explicit_captures: HashMap<String, bool> = HashMap::default();
+    for (name, is_ref) in captured_vars {
+        explicit_captures.insert(name, is_ref);
+    }
+
     if default_capture_all {
         for (name, &var_id) in &saved_locals {
             if name != "this" {
                 lambda_locals.insert(name.clone(), var_id);
-                if (!is_mutable && !default_capture_is_ref)
-                    || (default_capture_is_ref && ctx.closure_const_vars.contains(&var_id))
+                let is_ref = explicit_captures
+                    .get(name)
+                    .copied()
+                    .unwrap_or(default_capture_is_ref);
+                if (!is_mutable && !is_ref) || (is_ref && ctx.closure_const_vars.contains(&var_id))
                 {
                     closure_const_vars.insert(var_id);
                 }
             }
         }
+        for (name, is_ref) in explicit_captures {
+            if let Some(&var_id) = saved_locals.get(&name) {
+                lambda_locals.insert(name, var_id);
+                if (!is_mutable && !is_ref) || (is_ref && ctx.closure_const_vars.contains(&var_id))
+                {
+                    closure_const_vars.insert(var_id);
+                } else if is_ref && !ctx.closure_const_vars.contains(&var_id) {
+                    closure_const_vars.remove(&var_id);
+                }
+            }
+        }
     } else {
-        for (name, is_ref) in captured_vars {
+        for (name, is_ref) in explicit_captures {
             if let Some(&var_id) = saved_locals.get(&name) {
                 lambda_locals.insert(name, var_id);
                 if (!is_mutable && !is_ref) || (is_ref && ctx.closure_const_vars.contains(&var_id))
@@ -17812,6 +17928,11 @@ fn lower_lambda_expression(
                 .or_else(|| lookup_var(ctx, program, right_text));
             if let Some(orig_var) = orig_var {
                 lambda_locals.insert(name, orig_var);
+                if ctx.closure_const_vars.contains(&orig_var)
+                    || receiver_is_const(program, ctx, source, right, false) == Some(true)
+                {
+                    closure_const_vars.insert(orig_var);
+                }
                 continue;
             }
         }
@@ -17841,6 +17962,9 @@ fn lower_lambda_expression(
             pointee_const: receiver_is_const(program, ctx, source, right, true),
         };
         ctx.var_qualifications.insert(var_id, cv);
+        if cv.object_const {
+            closure_const_vars.insert(var_id);
+        }
         program.symbols.add_variable(Variable {
             temp: None,
             is_defined: false,
@@ -18428,6 +18552,7 @@ fn receiver_desc(
                     candidates,
                     receiver,
                     receiver_is_const,
+                    receiver_is_rvalue,
                 }) => {
                     let nodes = call_arg_nodes(node);
                     let args: Vec<TypeDesc> = nodes
@@ -18443,6 +18568,7 @@ fn receiver_desc(
                         candidates,
                         receiver,
                         receiver_is_const,
+                        receiver_is_rvalue,
                         &args,
                         &nulls,
                     )
@@ -22091,16 +22217,34 @@ fn call_receiver_return_cv(
         .iter()
         .map(|&arg| known_arg_type(program, ctx, source, arg))
         .collect();
-    let (name, _, _) = resolve_callee(program, ctx, source, func);
-    let candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
     let null_constants = null_constant_args(source, &nodes);
     let spells_template_args = callee_spells_template_args(func);
+
+    let (candidates, receiver_is_const, receiver_is_rvalue) =
+        match call_result_shape(program, ctx, source, call)? {
+            CallResult::Decided(_) => return None,
+            CallResult::Overload {
+                candidates,
+                receiver_is_const,
+                receiver_is_rvalue,
+                ..
+            } => {
+                let found = match candidates {
+                    Overloads::Declared(f) => f,
+                    Overloads::ByName(name) => {
+                        cpp_callee_candidates(program, ctx, source, func, &name, &args)
+                    }
+                };
+                (found, receiver_is_const, receiver_is_rvalue)
+            }
+        };
     let selected = result_overloads(
         program,
         candidates,
         &args,
         &null_constants,
-        None,
+        receiver_is_const,
+        receiver_is_rvalue,
         spells_template_args,
     );
     if let Some(&first) = selected.first() {
@@ -22152,9 +22296,13 @@ fn receiver_is_const(
             }
             if matches!(unqualified, "move" | "forward") {
                 let is_user_fn = !is_std_prefix && {
-                    let candidates = program
-                        .symbols
-                        .resolve_function_candidates(unqualified, Some(ctx.current_file));
+                    let nodes = call_arg_nodes(recv);
+                    let args: Vec<_> = nodes
+                        .iter()
+                        .map(|&arg| known_arg_type(program, ctx, source, arg))
+                        .collect();
+                    let candidates =
+                        cpp_callee_candidates(program, ctx, source, func, unqualified, &args);
                     !candidates.is_empty()
                 };
                 if !is_user_fn {
@@ -22197,6 +22345,9 @@ fn receiver_is_const(
                     if arrow {
                         return fq.cv.pointee_const;
                     }
+                    if fq.is_reference {
+                        return Some(fq.cv.object_const);
+                    }
                     if fq.is_mutable {
                         return Some(false);
                     }
@@ -22219,6 +22370,14 @@ fn receiver_is_const(
         return Some(cv.object_const);
     }
     if recv.cached_kind() == "field_expression" {
+        if let Some(var) = static_member_access(program, ctx, source, recv) {
+            let cv = var_cv(program, ctx, var);
+            return if arrow {
+                cv.pointee_const
+            } else {
+                Some(cv.object_const)
+            };
+        }
         let field_node = recv.cached_field("field");
         let base = recv.cached_field("argument")?;
         let base_is_arrow = is_arrow_access(recv);
@@ -22229,6 +22388,9 @@ fn receiver_is_const(
                 if let Some(fq) = field_qualification_upward(program, &base_cls, field_name) {
                     if arrow {
                         return fq.cv.pointee_const;
+                    }
+                    if fq.is_reference {
+                        return Some(fq.cv.object_const);
                     }
                     if fq.is_mutable {
                         return Some(false);
@@ -22262,10 +22424,9 @@ fn spelled_type_cv(
 
     if spelled.contains('<') {
         let head = type_name_before_template(spelled).trim();
-        let unqual = head.strip_prefix("::").unwrap_or(head);
-        let unqual = unqual.strip_prefix("std::").unwrap_or(unqual).trim();
+        let seg = last_type_segment(head).trim();
         if matches!(
-            unqual,
+            seg,
             "shared_ptr" | "unique_ptr" | "weak_ptr" | "sptr" | "wptr"
         ) {
             let top_const = strip_cv(head) != head || strip_trailing_cv(spelled) != spelled;
@@ -22356,9 +22517,12 @@ fn declaration_cv_qualification(
                     pointee_const: Some(pointee_const),
                 };
             }
+            let is_decltype_auto =
+                type_node.is_some_and(|ty| node_text(source, &ty).trim() == "decltype(auto)");
             let pointee_const = receiver_is_const(program, ctx, source, init, true);
             let obj_const = has_decl_const
-                || (pointee_const.is_none()
+                || (is_decltype_auto
+                    && pointee_const.is_none()
                     && receiver_is_const(program, ctx, source, init, false) == Some(true));
             return trace_ir::CvQualification {
                 object_const: obj_const,

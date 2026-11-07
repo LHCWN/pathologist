@@ -478,6 +478,7 @@ pub struct CvQualification {
 pub struct FieldQualification {
     pub cv: CvQualification,
     pub is_mutable: bool,
+    pub is_reference: bool,
 }
 
 #[derive(Debug, Clone)]

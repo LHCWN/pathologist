@@ -486,6 +486,7 @@ pub struct TemplateReturn {
     pub arity: u32,
     pub is_const_member: bool,
     pub ref_qualifier: Option<bool>,
+    pub is_member_template: bool,
     /// None blocks inference for an unsupported same-arity return.
     pub parameter: Option<usize>,
     pub pointer_depth: usize,
@@ -1355,6 +1356,7 @@ mod tests {
             arity: 1,
             is_const_member: false,
             ref_qualifier: None,
+            is_member_template: false,
             parameter: Some(0),
             pointer_depth: 0,
             wrapper: None,

@@ -19439,3 +19439,338 @@ fn cpp_undeclared_receiver_skips_return_types_of_in_body_declarations() {
         "the return type of `Unreturned Get();` is not a guessed class"
     );
 }
+
+#[test]
+fn namespaced_user_move_keeps_return_cv() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+namespace n {
+    struct R { void RGood() {} };
+    struct S { void SGood() {} };
+    struct C {
+        R* f() { return nullptr; }
+        S* f() const { return nullptr; }
+    };
+    C* move(const C*);
+}
+using namespace n;
+void test(const C* c) {
+    auto x = move(c)->f();
+    x->RGood();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    let x = common::local_variable(&program, "test", "x");
+    assert_eq!(pointee_name(&program, x), "n::R", "test::x");
+    assert!(has_any_edge(&program, &analysis, "test", "n::R::RGood"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "test",
+        "n::S::SGood"
+    ));
+}
+
+#[test]
+fn by_value_auto_copy_drops_top_level_const() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+struct C {
+    void mutate() {}
+    void inspect() const {}
+};
+void test(const C& c) {
+    auto copy = c;
+    copy.mutate();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "test", "C::mutate"));
+}
+
+#[test]
+fn reference_member_independent_of_owner_constness() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+struct C {
+    void mutate() {}
+};
+struct Holder {
+    C& ref;
+    void call() const {
+        ref.mutate();
+    }
+};
+void test(const Holder& h) {
+    h.ref.mutate();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "test", "C::mutate"));
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "Holder::call",
+        "C::mutate"
+    ));
+}
+
+#[test]
+fn static_member_access_independent_of_receiver_constness() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+struct C {
+    void mutate() {}
+};
+struct Holder {
+    static C s;
+};
+C Holder::s;
+void test(const Holder& h) {
+    h.s.mutate();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "test", "C::mutate"));
+}
+
+#[test]
+fn member_call_result_keeps_return_cv() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+struct C {
+    void f() {}
+};
+struct Holder {
+    C* get() const { return nullptr; }
+};
+void test(const Holder& h) {
+    h.get()->f();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "test", "C::f"));
+}
+
+#[test]
+fn ref_qualified_member_overload_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+struct R { void RGood() {} };
+struct S { void SGood() {} };
+struct C {
+    C() {}
+    R* f() & { return nullptr; }
+    S* f() && { return nullptr; }
+};
+void test_lval(C& c) {
+    auto x = c.f();
+    x->RGood();
+}
+void test_rval() {
+    auto x = C().f();
+    x->SGood();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    let x_lval = common::local_variable(&program, "test_lval", "x");
+    let x_rval = common::local_variable(&program, "test_rval", "x");
+    assert_eq!(pointee_name(&program, x_lval), "R", "test_lval::x");
+    assert_eq!(pointee_name(&program, x_rval), "S", "test_rval::x");
+    assert!(has_any_edge(&program, &analysis, "test_lval", "R::RGood"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "test_lval",
+        "S::SGood"
+    ));
+    assert!(has_any_edge(&program, &analysis, "test_rval", "S::SGood"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "test_rval",
+        "R::RGood"
+    ));
+}
+
+#[test]
+fn member_template_distinct_in_template_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+struct Target { void run() {} };
+struct Svc {
+    template <typename T>
+    T* get() { return nullptr; }
+    Target* get() { return nullptr; }
+};
+void test(Svc& s) {
+    s.get()->run();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "test", "Target::run"));
+}
+
+#[test]
+fn non_template_tie_break_with_defaulted_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+struct Target { void run() {} };
+struct Svc {
+    Target* query(int a, int b = 0) { return nullptr; }
+    template <typename T>
+    T query(int a) { return nullptr; }
+};
+void test(Svc& s) {
+    s.query(42)->run();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "test", "Target::run"));
+}
+
+#[test]
+fn lambda_capture_reference_and_overlay_and_init_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+struct C {
+    void mutate() {}
+    void inspect() const {}
+};
+void test_ref_capture(C& c) {
+    auto l = [&c]() {
+        c.mutate();
+    };
+    l();
+}
+void test_overlay(C c1, C c2) {
+    auto l = [=, &c1]() mutable {
+        c1.mutate();
+        c2.inspect();
+    };
+    l();
+}
+void test_init_capture_const(const C& c) {
+    auto l = [&q = c]() {
+        q.inspect();
+    };
+    l();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(analysis.call_edges.iter().any(|e| {
+        program
+            .symbols
+            .function(e.callee)
+            .name
+            .contains("C::mutate")
+    }));
+    assert!(analysis.call_edges.iter().any(|e| {
+        program
+            .symbols
+            .function(e.callee)
+            .name
+            .contains("C::inspect")
+    }));
+}
+
+#[test]
+fn const_lvalue_ref_member_callable_on_rvalue() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct Other { void OtherGood() {} };
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<Other> shared_from_this() const & { return nullptr; }
+};
+M Make();
+void test_rvalue() {
+    auto x = Make().shared_from_this();
+    x->OtherGood();
+}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "test_rvalue", "x");
+    assert_eq!(
+        type_name(&program, x),
+        "std::shared_ptr<Other>",
+        "test_rvalue::x"
+    );
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test_rvalue",
+        "Other::OtherGood"
+    ));
+}
+
+#[test]
+fn namespaced_sptr_wrapper_inspects_pointee_cv() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+namespace OHOS {
+    template <typename T> struct sptr {
+        T* operator->() const { return nullptr; }
+    };
+}
+struct C {
+    void mutate() {}
+};
+void test(const OHOS::sptr<C>& p) {
+    p->mutate();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "test", "C::mutate"));
+}
