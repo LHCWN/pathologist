@@ -215,6 +215,11 @@ pub struct Function {
     /// resolution prefers the inherited non-const one over an own `const`
     /// overload of the same name and arity.
     pub is_const_member: bool,
+    /// Trailing reference qualifier on a member declaration: `Some(false)` for
+    /// `&`, `Some(true)` for `&&`, `None` when none is written.
+    pub ref_qualifier: Option<bool>,
+    /// Const qualification of the function's declared return type.
+    pub return_cv: crate::CvQualification,
     /// How many of those parameters declare a default argument, so a call
     /// may pass `explicit_arity - default_args` up to `explicit_arity`
     /// arguments. C++ puts the defaults on the first declaration, so a merge
@@ -595,6 +600,13 @@ fn absorb_redeclaration(
     existing.defaulted_in_class &= func.defaulted_in_class;
     existing.is_static_member |= func.is_static_member;
     existing.is_const_member |= func.is_const_member;
+    if existing.ref_qualifier.is_none() {
+        existing.ref_qualifier = func.ref_qualifier;
+    }
+    existing.return_cv.object_const |= func.return_cv.object_const;
+    if existing.return_cv.pointee_const.is_none() {
+        existing.return_cv.pointee_const = func.return_cv.pointee_const;
+    }
     existing.is_member_template |= func.is_member_template;
     existing.default_args = existing.default_args.max(func.default_args);
     existing.is_virtual |= func.is_virtual;
@@ -1780,6 +1792,7 @@ impl SymbolTable {
                     // non-template of the same parameter list are distinct
                     // declarations too.
                     if existing.is_const_member != func.is_const_member
+                        || existing.ref_qualifier != func.ref_qualifier
                         || existing.is_member_template != func.is_member_template
                     {
                         return false;
@@ -2701,6 +2714,7 @@ impl SymbolTable {
                     let both_cpp = f.is_cpp && cand.is_cpp;
                     if both_cpp
                         && (f.is_const_member != cand.is_const_member
+                            || f.ref_qualifier != cand.ref_qualifier
                             || f.is_member_template != cand.is_member_template)
                     {
                         return false;
@@ -2915,6 +2929,7 @@ impl SymbolTable {
                         self.defined_in_tu(local, tu)
                             && a.variadic == b.variadic
                             && a.is_const_member == b.is_const_member
+                            && a.ref_qualifier == b.ref_qualifier
                             && a.is_member_template == b.is_member_template
                             && Self::references_alike(a, b)
                             && self.explicit_params_alike(
@@ -3996,6 +4011,8 @@ mod tests {
             declared_in_class: false,
             is_member_template: false,
             is_const_member: false,
+            ref_qualifier: None,
+            return_cv: crate::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,

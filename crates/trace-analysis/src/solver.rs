@@ -3738,6 +3738,8 @@ mod tests {
                 declared_in_class: false,
                 is_member_template: false,
                 is_const_member: false,
+                ref_qualifier: None,
+                return_cv: trace_ir::CvQualification::default(),
                 is_static_member: false,
                 is_virtual: false,
                 is_final: false,

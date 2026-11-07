@@ -35,6 +35,7 @@ pub struct UnitIndex {
     pub reference_bindings: FxHashSet<VarId>,
     pub reference_vars: FxHashSet<VarId>,
     pub address_references: FxHashSet<VarId>,
+    pub var_qualifications: FxHashMap<VarId, trace_ir::CvQualification>,
     pub reference_returns: FxHashSet<FnId>,
     pub call_sites: Vec<CallSite>,
     pub flow: Vec<FlowConstraint>,
@@ -1234,6 +1235,11 @@ fn merge_unit(
             .iter()
             .filter_map(|id| var_map.get(id).copied()),
     );
+    for (&id, &cv) in &unit.var_qualifications {
+        if let Some(&mapped) = var_map.get(&id) {
+            program.var_qualifications.insert(mapped, cv);
+        }
+    }
     program.reference_returns.extend(
         unit.reference_returns
             .iter()
@@ -1762,6 +1768,9 @@ fn merge_types(
     for (alias, desc) in src.all_aliases() {
         if dst.resolve_alias(alias).is_none() {
             dst.register_alias_ref_with_reference(alias, desc, src.alias_is_reference(alias));
+            if let Some(cv) = src.alias_qualification(alias) {
+                dst.register_alias_qualification(alias, cv);
+            }
         }
     }
     map
@@ -1854,6 +1863,7 @@ fn respelled_declarations(
                         && f.linkage == trace_ir::Linkage::Internal
                         && f.variadic == declaration.variadic
                         && f.is_const_member == declaration.is_const_member
+                        && f.ref_qualifier == declaration.ref_qualifier
                         && f.is_member_template == declaration.is_member_template
                         && arity(f) == arity(declaration)
                 })
@@ -2589,6 +2599,8 @@ mod tests {
                 declared_in_class: false,
                 is_member_template: false,
                 is_const_member: false,
+                ref_qualifier: None,
+                return_cv: trace_ir::CvQualification::default(),
                 is_static_member: false,
                 is_virtual: false,
                 is_final: false,
@@ -2649,6 +2661,8 @@ mod tests {
             declared_in_class: false,
             is_member_template: false,
             is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -2779,6 +2793,8 @@ mod tests {
             declared_in_class: false,
             is_member_template: false,
             is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -2890,6 +2906,8 @@ mod tests {
                 declared_in_class: false,
                 is_member_template: false,
                 is_const_member: false,
+                ref_qualifier: None,
+                return_cv: trace_ir::CvQualification::default(),
                 is_static_member: false,
                 is_virtual: false,
                 is_final: false,
@@ -2963,6 +2981,8 @@ mod tests {
             declared_in_class: false,
             is_member_template: false,
             is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -3204,6 +3224,8 @@ mod tests {
             declared_in_class: false,
             is_member_template: false,
             is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: false,
             is_virtual: false,
             is_final: false,
@@ -3455,6 +3477,8 @@ mod tests {
                 declared_in_class: false,
                 is_member_template: false,
                 is_const_member: false,
+                ref_qualifier: None,
+                return_cv: trace_ir::CvQualification::default(),
                 is_static_member: false,
                 is_virtual: false,
                 is_final: false,

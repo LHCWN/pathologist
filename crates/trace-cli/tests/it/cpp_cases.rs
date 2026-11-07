@@ -12065,6 +12065,486 @@ void Run(n::J<M> *p) { auto x = p->shared_from_this(); x->Good(); }
 }
 
 #[test]
+fn field_qualifiers_determine_receiver_overload() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct Other { void OtherGood(); };
+void Other::OtherGood() {}
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<Other> shared_from_this() const;
+    void MGood();
+};
+void M::MGood() {}
+struct R { void RGood(); };
+void R::RGood() {}
+struct S { void SGood(); };
+void S::SGood() {}
+struct C {
+    R *f() { return nullptr; }
+    S *f() const { return nullptr; }
+};
+struct H {
+    const M m;
+    const M *p;
+    mutable C c;
+    void Run() {
+        auto x = m.shared_from_this();
+        x->OtherGood();
+        auto y = p->shared_from_this();
+        y->OtherGood();
+    }
+    void RunConst() const {
+        auto z = c.f();
+        z->RGood();
+    }
+};
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "H::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "H::Run::x");
+    assert!(has_any_edge(&program, &analysis, "H::Run", "Other::OtherGood"));
+    assert!(must_not_have_edge(&program, &analysis, "H::Run", "M::MGood"));
+    let y = common::local_variable(&program, "H::Run", "y");
+    assert_eq!(type_name(&program, y), "std::shared_ptr<Other>", "H::Run::y");
+    let z = common::local_variable(&program, "H::RunConst", "z");
+    assert_eq!(pointee_name(&program, z), "R", "H::RunConst::z");
+    assert!(has_any_edge(&program, &analysis, "H::RunConst", "R::RGood"));
+    assert!(must_not_have_edge(&program, &analysis, "H::RunConst", "S::SGood"));
+}
+
+#[test]
+fn call_expression_receiver_keeps_return_type_cv() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct Other { void OtherGood(); };
+void Other::OtherGood() {}
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<Other> shared_from_this() const;
+    void MGood();
+};
+void M::MGood() {}
+const M &Get();
+const M *GetPtr();
+struct R { void RGood(); };
+void R::RGood() {}
+struct S { void SGood(); };
+void S::SGood() {}
+struct C {
+    R *f() { return nullptr; }
+    S *f() const { return nullptr; }
+};
+C *move(const C *p) { return nullptr; }
+void RunRef() {
+    auto x = Get().shared_from_this();
+    x->OtherGood();
+}
+void RunPtr() {
+    auto x = GetPtr()->shared_from_this();
+    x->OtherGood();
+}
+void RunUserMove(const C *p) {
+    auto x = move(p)->f();
+    x->RGood();
+}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let xref = common::local_variable(&program, "RunRef", "x");
+    assert_eq!(type_name(&program, xref), "std::shared_ptr<Other>", "RunRef::x");
+    assert!(has_any_edge(&program, &analysis, "RunRef", "Other::OtherGood"));
+    assert!(must_not_have_edge(&program, &analysis, "RunRef", "M::MGood"));
+    let xptr = common::local_variable(&program, "RunPtr", "x");
+    assert_eq!(type_name(&program, xptr), "std::shared_ptr<Other>", "RunPtr::x");
+    assert!(has_any_edge(&program, &analysis, "RunPtr", "Other::OtherGood"));
+    assert!(must_not_have_edge(&program, &analysis, "RunPtr", "M::MGood"));
+    let xmove = common::local_variable(&program, "RunUserMove", "x");
+    assert_eq!(pointee_name(&program, xmove), "R", "RunUserMove::x");
+    assert!(has_any_edge(&program, &analysis, "RunUserMove", "R::RGood"));
+    assert!(must_not_have_edge(&program, &analysis, "RunUserMove", "S::SGood"));
+}
+
+#[test]
+fn postfix_const_on_cast_selects_const_overload() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct Other { void OtherGood(); };
+void Other::OtherGood() {}
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<Other> shared_from_this() const;
+    void MGood();
+};
+void M::MGood() {}
+void Run(M *p) {
+    auto x = ((M const*)p)->shared_from_this();
+    x->OtherGood();
+}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "Other::OtherGood"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "M::MGood"));
+}
+
+#[test]
+fn receiver_cv_preserved_through_aliases_init_captures_and_smart_pointers() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct Other { void OtherGood(); };
+void Other::OtherGood() {}
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<Other> shared_from_this() const;
+    void MGood();
+};
+void M::MGood() {}
+using CM = const M;
+using CMP = const M*;
+void RunAlias(CM *p) {
+    auto x = p->shared_from_this();
+    x->OtherGood();
+}
+void RunAliasPtr(CMP p) {
+    auto x = p->shared_from_this();
+    x->OtherGood();
+}
+void RunCapture(const M *p) {
+    auto l = [q = p] {
+        auto x = q->shared_from_this();
+        x->OtherGood();
+    };
+    l();
+}
+void RunSmartPtr(std::shared_ptr<const M> p) {
+    auto x = p->shared_from_this();
+    x->OtherGood();
+}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    for caller in ["RunAlias", "RunAliasPtr", "RunSmartPtr"] {
+        let x = common::local_variable(&program, caller, "x");
+        assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "{caller}::x");
+        assert!(has_any_edge(&program, &analysis, caller, "Other::OtherGood"));
+        assert!(must_not_have_edge(&program, &analysis, caller, "M::MGood"));
+    }
+    let lambda = common::lambda_in(&program, "RunCapture");
+    let x = common::local_variable(&program, &lambda.name, "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "lambda::x");
+    assert!(has_any_edge(&program, &analysis, &lambda.name, "Other::OtherGood"));
+    assert!(must_not_have_edge(&program, &analysis, &lambda.name, "M::MGood"));
+}
+
+#[test]
+fn static_hiding_member_viable_on_const_object() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct Other { void OtherGood(); };
+void Other::OtherGood() {}
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    static std::shared_ptr<Other> shared_from_this() { return nullptr; }
+    void MGood();
+    void Run() const {
+        auto x = shared_from_this();
+        x->OtherGood();
+    }
+};
+void M::MGood() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "M::Run::x");
+    assert!(has_any_edge(&program, &analysis, "M::Run", "Other::OtherGood"));
+    assert!(must_not_have_edge(&program, &analysis, "M::Run", "M::MGood"));
+}
+
+#[test]
+fn ref_qualified_rvalue_import_does_not_hide_standard_lvalue_member() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct Other {};
+struct A {
+    std::shared_ptr<Other> shared_from_this() &&;
+};
+struct M : A, std::enable_shared_from_this<M> {
+    using A::shared_from_this;
+    using std::enable_shared_from_this<M>::shared_from_this;
+    void Good();
+    void Run() {
+        auto x = shared_from_this();
+        x->Good();
+    }
+};
+void M::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "M::Run::x");
+    assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
+}
+
+#[test]
+fn implicit_object_ranked_before_template_tie_break() {
+    let source = r#"struct R { void Good(); };
+void R::Good() {}
+struct S { void Bad(); };
+void S::Bad() {}
+struct C {
+    template <class U = void> R *f() { return nullptr; }
+    S *f() const { return nullptr; }
+};
+void Run(C *p) {
+    auto x = p->f();
+    x->Good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(pointee_name(&program, x), "R", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "R::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "S::Bad"));
+}
+
+#[test]
+fn specialized_enclosing_scope_preserves_member_template() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"struct Other { void Bad(); };
+void Other::Bad() {}
+struct M;
+template <class T> struct H : std::enable_shared_from_this<T> {
+    using std::enable_shared_from_this<T>::shared_from_this;
+    template <class U = void> std::shared_ptr<Other> shared_from_this();
+};
+template <> template <class U> std::shared_ptr<Other> H<M>::shared_from_this() {
+    return nullptr;
+}
+struct M : H<M> {
+    void Good();
+    void Run() {
+        auto x = shared_from_this();
+        x->Good();
+    }
+};
+void M::Good() {}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "M::Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "M::Run::x");
+    assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "M::Run", "Other::Bad"));
+}
+
+#[test]
+fn elaborated_fixed_import_argument_qualifies_in_import_scope() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"namespace n {
+struct A { void Good(); };
+void A::Good() {}
+template <class T, class V> struct H : std::enable_shared_from_this<V> {};
+template <class T> struct J : H<T, struct A> {
+    using n::H<T, struct A>::shared_from_this;
+};
+}
+struct M {};
+void Run(n::J<M> *p) {
+    auto x = p->shared_from_this();
+    x->Good();
+}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(type_name(&program, x), "std::shared_ptr<n::A>", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "n::A::Good"));
+}
+
+#[test]
+fn callee_template_args_exclude_non_templates() {
+    let source = r#"struct R { void Good(); };
+void R::Good() {}
+struct S { void Bad(); };
+void S::Bad() {}
+struct C {
+    template <class U = void> R *f() { return nullptr; }
+    S *f() { return nullptr; }
+};
+void Run(C *p) {
+    auto x = p->f<void>();
+    x->Good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(pointee_name(&program, x), "R", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "R::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "S::Bad"));
+}
+
+#[test]
+fn receiver_conversion_ranked_with_differing_defaulted_parameters() {
+    let source = r#"struct R { void Good(); };
+void R::Good() {}
+struct S { void Bad(); };
+void S::Bad() {}
+struct C {
+    R *f(int) { return nullptr; }
+    S *f(int, int = 0) const { return nullptr; }
+};
+void Run(C *p) {
+    auto x = p->f(1);
+    x->Good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(pointee_name(&program, x), "R", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "R::Good"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "S::Bad"));
+}
+
+#[test]
+fn template_return_preserves_cv_overload_identity() {
+    let source = r#"struct R { void RGood(); };
+void R::RGood() {}
+struct S { void SGood(); };
+void S::SGood() {}
+template <class T, class U> struct C {
+    T *f() { return nullptr; }
+    U *f() const { return nullptr; }
+};
+void RunMut(C<R, S> *p) {
+    auto x = p->f();
+    x->RGood();
+}
+void RunConst(const C<R, S> *p) {
+    auto x = p->f();
+    x->SGood();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    let mx = common::local_variable(&program, "RunMut", "x");
+    assert_eq!(pointee_name(&program, mx), "R", "RunMut::x");
+    assert!(has_any_edge(&program, &analysis, "RunMut", "R::RGood"));
+    assert!(must_not_have_edge(&program, &analysis, "RunMut", "S::SGood"));
+    let cx = common::local_variable(&program, "RunConst", "x");
+    assert_eq!(pointee_name(&program, cx), "S", "RunConst::x");
+    assert!(has_any_edge(&program, &analysis, "RunConst", "S::SGood"));
+    assert!(must_not_have_edge(&program, &analysis, "RunConst", "R::RGood"));
+}
+
+#[test]
+fn bare_declarator_without_initializer_records_constness() {
+    let source = r#"struct R { void RGood(); };
+void R::RGood() {}
+struct S { void SGood(); };
+void S::SGood() {}
+struct C {
+    C() {}
+    R *f() { return nullptr; }
+    S *f() const { return nullptr; }
+};
+extern const C extern_c;
+void RunBare() {
+    const C c;
+    auto x = c.f();
+    x->SGood();
+}
+void RunExtern() {
+    auto x = extern_c.f();
+    x->SGood();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    for caller in ["RunBare", "RunExtern"] {
+        let x = common::local_variable(&program, caller, "x");
+        assert_eq!(pointee_name(&program, x), "S", "{caller}::x");
+        assert!(has_any_edge(&program, &analysis, caller, "S::SGood"));
+        assert!(must_not_have_edge(&program, &analysis, caller, "R::RGood"));
+    }
+}
+
+#[test]
+fn variable_constness_preserved_across_shared_header() {
+    let header = r#"struct R { void RGood(); };
+struct S { void SGood(); };
+struct C {
+    R *f() { return nullptr; }
+    S *f() const { return nullptr; }
+};
+extern const C *gp;
+"#;
+    let source1 = r#"#include "common.h"
+const C *gp = nullptr;
+"#;
+    let source2 = r#"#include "common.h"
+void S::SGood() {}
+void Run() {
+    auto x = gp->f();
+    x->SGood();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[
+        ("common.h", header),
+        ("tu1.cpp", source1),
+        ("tu2.cpp", source2),
+    ]);
+    let x = common::local_variable(&program, "Run", "x");
+    assert_eq!(pointee_name(&program, x), "S", "Run::x");
+    assert!(has_any_edge(&program, &analysis, "Run", "S::SGood"));
+    assert!(must_not_have_edge(&program, &analysis, "Run", "R::RGood"));
+}
+
+#[test]
+fn lambda_by_value_capture_applies_closure_constness() {
+    let source = r#"struct R { void RGood(); };
+void R::RGood() {}
+struct S { void SGood(); };
+void S::SGood() {}
+struct C {
+    R *f() { return nullptr; }
+    S *f() const { return nullptr; }
+};
+void RunConst(C c) {
+    auto l = [c] {
+        auto x = c.f();
+        x->SGood();
+    };
+    l();
+}
+void RunMut(C c) {
+    auto l = [c]() mutable {
+        auto x = c.f();
+        x->RGood();
+    };
+    l();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    let l_const = common::lambda_in(&program, "RunConst");
+    let cx = common::local_variable(&program, &l_const.name, "x");
+    assert_eq!(pointee_name(&program, cx), "S", "RunConst lambda::x");
+    assert!(has_any_edge(&program, &analysis, &l_const.name, "S::SGood"));
+    assert!(must_not_have_edge(&program, &analysis, &l_const.name, "R::RGood"));
+
+    let l_mut = common::lambda_in(&program, "RunMut");
+    let mx = common::local_variable(&program, &l_mut.name, "x");
+    assert_eq!(pointee_name(&program, mx), "R", "RunMut lambda::x");
+    assert!(has_any_edge(&program, &analysis, &l_mut.name, "R::RGood"));
+    assert!(must_not_have_edge(&program, &analysis, &l_mut.name, "S::SGood"));
+}
+
+#[test]
 fn same_arity_imported_overload_is_ranked_with_own_declaration() {
     let source = r#"struct R { void Good(); };
 void R::Good() {}

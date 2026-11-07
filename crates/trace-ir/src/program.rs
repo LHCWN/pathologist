@@ -484,6 +484,8 @@ impl MergeDedup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateReturn {
     pub arity: u32,
+    pub is_const_member: bool,
+    pub ref_qualifier: Option<bool>,
     /// None blocks inference for an unsupported same-arity return.
     pub parameter: Option<usize>,
     pub pointer_depth: usize,
@@ -589,6 +591,8 @@ pub struct Program {
     pub reference_vars: FxHashSet<crate::VarId>,
     /// References lowered with the referent's address as their declared type.
     pub address_references: FxHashSet<crate::VarId>,
+    /// Indexing-only cv qualifications of variables, preserved through header merges.
+    pub var_qualifications: FxHashMap<crate::VarId, crate::CvQualification>,
     /// Functions declared to return a reference, for expression lowering.
     pub reference_returns: FxHashSet<FnId>,
     pub flow: Vec<crate::FlowConstraint>,
@@ -718,6 +722,7 @@ impl Program {
         self.reference_bindings = FxHashSet::default();
         self.reference_vars = FxHashSet::default();
         self.address_references = FxHashSet::default();
+        self.var_qualifications = FxHashMap::default();
         self.reference_returns = FxHashSet::default();
         // These facts live through provenance export. Compact the append-only
         // buffers once growth is complete, without changing occurrence order.
@@ -1348,6 +1353,8 @@ mod tests {
         let mut program = Program::default();
         let first = TemplateReturn {
             arity: 1,
+            is_const_member: false,
+            ref_qualifier: None,
             parameter: Some(0),
             pointer_depth: 0,
             wrapper: None,

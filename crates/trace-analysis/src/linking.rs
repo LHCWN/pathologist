@@ -111,6 +111,8 @@ pub fn link_graph_facts_in_targets(
             declared_in_class: true,
             is_member_template: false,
             is_const_member: false,
+            ref_qualifier: None,
+            return_cv: trace_ir::CvQualification::default(),
             is_static_member: f.static_member,
             default_args: 0,
             reference_params: vec![],
