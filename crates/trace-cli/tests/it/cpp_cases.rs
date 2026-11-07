@@ -19774,3 +19774,337 @@ void test(const OHOS::sptr<C>& p) {
     let (_pag, analysis) = analyze(&program);
     assert!(has_any_edge(&program, &analysis, "test", "C::mutate"));
 }
+
+#[test]
+fn arrow_receiver_reaches_lvalue_object() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    GoodTarget f() & { return GoodTarget{}; }
+    BadTarget f() && { return BadTarget{}; }
+};
+void test(C* p) {
+    auto res = p->f();
+    res.good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(&program, &analysis, "test", "BadTarget::bad"));
+}
+
+#[test]
+fn qualified_member_call_retains_lvalue_implicit_this() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    GoodTarget f() & { return GoodTarget{}; }
+    BadTarget f() && { return BadTarget{}; }
+    void run() {
+        auto res = C::f();
+        res.good();
+    }
+};
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "C::run",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(
+        &program,
+        &analysis,
+        "C::run",
+        "BadTarget::bad"
+    ));
+}
+
+#[test]
+fn receiver_const_viable_checked_before_rvalue_ref_preference() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    GoodTarget f() const & { return GoodTarget{}; }
+    BadTarget f() && { return BadTarget{}; }
+};
+const C Make();
+void test() {
+    auto res = Make().f();
+    res.good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(&program, &analysis, "test", "BadTarget::bad"));
+}
+
+#[test]
+fn explicit_argument_narrowing_takes_precedence_over_ref_binding() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    GoodTarget f(int) const & { return GoodTarget{}; }
+    BadTarget f(double) && { return BadTarget{}; }
+};
+C Make();
+void test() {
+    auto res = Make().f(1);
+    res.good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(&program, &analysis, "test", "BadTarget::bad"));
+}
+
+#[test]
+fn mutable_and_const_rvalue_ref_overloads_ranked_on_rvalue() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    GoodTarget f() && { return GoodTarget{}; }
+    BadTarget f() const && { return BadTarget{}; }
+};
+C Make();
+void test() {
+    auto res = Make().f();
+    res.good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(&program, &analysis, "test", "BadTarget::bad"));
+}
+
+#[test]
+fn args_compatible_prefix_distinguishes_reference_parameters() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    GoodTarget f(int& x) const { return GoodTarget{}; }
+    BadTarget f(int x) { return BadTarget{}; }
+};
+void test(C& c, int& x) {
+    auto res = c.f(x);
+    res.good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(&program, &analysis, "test", "BadTarget::bad"));
+}
+
+#[test]
+fn rvalue_reference_returns_produce_xvalue_receivers() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"
+struct Other { void OtherGood() {} };
+struct M : std::enable_shared_from_this<M> {
+    using std::enable_shared_from_this<M>::shared_from_this;
+    std::shared_ptr<Other> shared_from_this() && { return nullptr; }
+};
+M&& GetM();
+void test_m() {
+    auto x = GetM().shared_from_this();
+    x->OtherGood();
+}
+
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    BadTarget f() & { return BadTarget{}; }
+    GoodTarget f() && { return GoodTarget{}; }
+};
+C&& GetC();
+void test_c() {
+    auto res = GetC().f();
+    res.good();
+}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test_m",
+        "Other::OtherGood"
+    ));
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test_c",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(
+        &program,
+        &analysis,
+        "test_c",
+        "BadTarget::bad"
+    ));
+}
+
+#[test]
+fn recognize_xvalues_from_casts_and_member_access() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    BadTarget f() & { return BadTarget{}; }
+    GoodTarget f() && { return GoodTarget{}; }
+};
+struct Holder {
+    C c;
+};
+Holder MakeHolder();
+void test_cast(C& c) {
+    auto res = ((C&&)c).f();
+    res.good();
+}
+void test_member() {
+    auto res = MakeHolder().c.f();
+    res.good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test_cast",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(
+        &program,
+        &analysis,
+        "test_cast",
+        "BadTarget::bad"
+    ));
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test_member",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(
+        &program,
+        &analysis,
+        "test_member",
+        "BadTarget::bad"
+    ));
+}
+
+#[test]
+fn constexpr_variables_are_implicitly_const() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    BadTarget f() { return BadTarget{}; }
+    GoodTarget f() const { return GoodTarget{}; }
+};
+void test() {
+    constexpr C c{};
+    auto res = c.f();
+    res.good();
+}
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(&program, &analysis, "test", "BadTarget::bad"));
+}
+
+#[test]
+fn lambda_captures_star_this_is_const_qualified_when_not_mutable() {
+    let source = r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+struct C {
+    BadTarget f() { return BadTarget{}; }
+    GoodTarget f() const { return GoodTarget{}; }
+    void run() {
+        [*this] {
+            auto res = f();
+            res.good();
+        }();
+    }
+};
+"#;
+    let (program, analysis) = common::analyze_source(&[("main.cpp", source)]);
+    assert!(analysis.call_edges.iter().any(|e| {
+        let caller = &program.symbols.function(e.caller).name;
+        let callee = &program.symbols.function(e.callee).name;
+        caller.contains("C::run") && callee.contains("GoodTarget::good")
+    }));
+    assert!(!analysis.call_edges.iter().any(|e| {
+        let callee = &program.symbols.function(e.callee).name;
+        callee.contains("BadTarget::bad")
+    }));
+}
+
+#[test]
+fn decided_call_result_preserves_cv_qualification() {
+    let source = format!(
+        "{FROM_THIS_STUB}{}",
+        r#"
+struct GoodTarget { void good() {} };
+struct BadTarget { void bad() {} };
+namespace std {
+    template <typename T> struct shared_ptr {
+        GoodTarget mutate() { return GoodTarget{}; }
+        BadTarget mutate() const { return BadTarget{}; }
+    };
+}
+struct M : std::enable_shared_from_this<M> {};
+void test(M& m) {
+    auto res = m.shared_from_this().mutate();
+    res.good();
+}
+"#
+    );
+    let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "test",
+        "GoodTarget::good"
+    ));
+    assert!(!has_any_edge(&program, &analysis, "test", "BadTarget::bad"));
+}

@@ -596,6 +596,8 @@ pub struct Program {
     pub var_qualifications: FxHashMap<crate::VarId, crate::CvQualification>,
     /// Functions declared to return a reference, for expression lowering.
     pub reference_returns: FxHashSet<FnId>,
+    /// Functions declared to return an rvalue reference (`&&`), for value-category determination.
+    pub rvalue_reference_returns: FxHashSet<FnId>,
     pub flow: Vec<crate::FlowConstraint>,
     /// Source operation sites, independent of solver constraints.
     pub flow_origins: FxHashMap<crate::FlowConstraint, Vec<(crate::Span, Arc<str>)>>,
@@ -725,6 +727,7 @@ impl Program {
         self.address_references = FxHashSet::default();
         self.var_qualifications = FxHashMap::default();
         self.reference_returns = FxHashSet::default();
+        self.rvalue_reference_returns = FxHashSet::default();
         // These facts live through provenance export. Compact the append-only
         // buffers once growth is complete, without changing occurrence order.
         self.flow.shrink_to_fit();

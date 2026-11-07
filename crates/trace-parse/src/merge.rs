@@ -37,6 +37,7 @@ pub struct UnitIndex {
     pub address_references: FxHashSet<VarId>,
     pub var_qualifications: FxHashMap<VarId, trace_ir::CvQualification>,
     pub reference_returns: FxHashSet<FnId>,
+    pub rvalue_reference_returns: FxHashSet<FnId>,
     pub call_sites: Vec<CallSite>,
     pub flow: Vec<FlowConstraint>,
     pub flow_origins: FxHashMap<FlowConstraint, Vec<(trace_ir::Span, Arc<str>)>>,
@@ -1242,6 +1243,11 @@ fn merge_unit(
     }
     program.reference_returns.extend(
         unit.reference_returns
+            .iter()
+            .filter_map(|id| fn_map.get(id).copied()),
+    );
+    program.rvalue_reference_returns.extend(
+        unit.rvalue_reference_returns
             .iter()
             .filter_map(|id| fn_map.get(id).copied()),
     );
