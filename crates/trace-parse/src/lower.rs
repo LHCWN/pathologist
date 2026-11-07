@@ -27747,6 +27747,9 @@ mod spelled_cv_tests {
         assert_eq!(cv("std::shared_ptr<T>*"), (false, Some(false)));
         assert_eq!(cv("std::shared_ptr<const T>*"), (false, Some(false)));
         assert_eq!(cv("std::shared_ptr<T> const*"), (false, Some(true)));
+        assert_eq!(cv("const std::shared_ptr<T>*"), (false, Some(true)));
+        assert_eq!(cv("const std::shared_ptr<const T>*"), (false, Some(true)));
+        assert_eq!(cv("const std::shared_ptr<T>* const"), (true, Some(true)));
         assert_eq!(cv("std::shared_ptr<T>* const"), (true, Some(false)));
         assert_eq!(cv("std::shared_ptr<T>&"), (false, Some(false)));
         assert_eq!(cv("std::shared_ptr<T> const&"), (true, Some(false)));
