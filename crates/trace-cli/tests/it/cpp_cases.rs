@@ -10530,21 +10530,32 @@ void HN::Handle() {}
 fn shared_from_this_hidden_by_static_member_and_class_using() {
     let source = format!(
         "{FROM_THIS_STUB}{}",
-        r#"struct StaticField : std::enable_shared_from_this<StaticField> {
+        r#"struct StaticField;
+StaticField *self;
+struct StaticField : std::enable_shared_from_this<StaticField> {
     static std::shared_ptr<Other> (*shared_from_this)();
+    void HolderOnly();
     void Run() {
         auto arrow = this->shared_from_this();
+        arrow->HolderOnly();
         auto through = self->shared_from_this();
+        through->HolderOnly();
     }
 };
-StaticField *self;
+void StaticField::HolderOnly() {}
 struct A {
     std::shared_ptr<Other> shared_from_this();
 };
 struct Imported : std::enable_shared_from_this<Imported>, A {
     using A::shared_from_this;
-    void Run() { auto imported = shared_from_this(); imported->OtherOnly(); }
+    void HolderOnly();
+    void Run() {
+        auto imported = shared_from_this();
+        imported->OtherOnly();
+        imported->HolderOnly();
+    }
 };
+void Imported::HolderOnly() {}
 "#
     );
     let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
@@ -10566,7 +10577,7 @@ struct Imported : std::enable_shared_from_this<Imported>, A {
             &program,
             &analysis,
             "StaticField::Run",
-            "StaticField::OtherOnly"
+            "StaticField::HolderOnly"
         ),
         "a static function-pointer member is not the intrinsic"
     );
@@ -10575,7 +10586,7 @@ struct Imported : std::enable_shared_from_this<Imported>, A {
         "the class using declaration selects A's member"
     );
     assert!(
-        must_not_have_edge(&program, &analysis, "Imported::Run", "Imported::OtherOnly"),
+        must_not_have_edge(&program, &analysis, "Imported::Run", "Imported::HolderOnly"),
         "the imported member's result is not the holder's"
     );
 }
