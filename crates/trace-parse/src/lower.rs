@@ -5273,7 +5273,9 @@ fn lower_struct_specifier(
                                 );
                                 let is_mutable = child.children(&mut child.walk()).any(|c| {
                                     c.cached_kind() == "mutable_specifier"
-                                        || node_text(source, &c).split_whitespace().any(|w| w == "mutable")
+                                        || node_text(source, &c)
+                                            .split_whitespace()
+                                            .any(|w| w == "mutable")
                                 });
                                 program.types.note_field_qualification(
                                     &reg_name,
@@ -6543,7 +6545,10 @@ fn function_is_const_qualified(source: &str, node: Node) -> bool {
 
 fn function_ref_qualifier(source: &str, node: Node) -> Option<bool> {
     let ref_qual = |qualifier: Node| {
-        if !matches!(qualifier.cached_kind(), "ref_qualifier" | "reference_qualifier") {
+        if !matches!(
+            qualifier.cached_kind(),
+            "ref_qualifier" | "reference_qualifier"
+        ) {
             return None;
         }
         match node_text(source, &qualifier).trim() {
@@ -7086,7 +7091,10 @@ fn lower_function_signature(
                 && eff_class.is_some()
                 && is_member_function_template(source, node),
             is_const_member: ctx.is_cpp && function_is_const_qualified(source, node),
-            ref_qualifier: ctx.is_cpp.then(|| function_ref_qualifier(source, node)).flatten(),
+            ref_qualifier: ctx
+                .is_cpp
+                .then(|| function_ref_qualifier(source, node))
+                .flatten(),
             return_cv: function_return_cv(program, ctx, source, node, None),
             is_static_member: ctx.class_ctx.is_some() && declaration_is_static(node),
             is_virtual: flags.is_virtual,
@@ -7678,14 +7686,7 @@ fn lower_parameter(
     if ctx.is_cpp {
         let is_ref = ctx.reference_bindings.contains(&var_id);
         let cv = declaration_cv_qualification(
-            program,
-            ctx,
-            source,
-            node,
-            declarator,
-            None,
-            is_ref,
-            true,
+            program, ctx, source, node, declarator, None, is_ref, true,
         );
         ctx.var_qualifications.insert(var_id, cv);
     }
@@ -8302,10 +8303,12 @@ fn callee_spells_template_args(func: Node) -> bool {
             break;
         }
     }
-    matches!(target.cached_kind(), "template_function" | "template_method")
-        || target
-            .children(&mut target.walk())
-            .any(|child| child.cached_kind() == "template_argument_list")
+    matches!(
+        target.cached_kind(),
+        "template_function" | "template_method"
+    ) || target
+        .children(&mut target.walk())
+        .any(|child| child.cached_kind() == "template_argument_list")
 }
 
 /// The overloads deciding both a call's static result type and whether
@@ -8397,17 +8400,13 @@ fn result_overloads(
         .copied()
         .filter(|&id| {
             let f = program.symbols.function(id);
-            if f.is_member_template
+            !(f.is_member_template
                 && ranked.iter().any(|&other| {
                     let o = program.symbols.function(other);
                     !o.is_member_template
                         && o.is_const_member == f.is_const_member
                         && same_explicit_signature(program, id, other)
-                })
-            {
-                return false;
-            }
-            true
+                }))
         })
         .collect()
 }
@@ -8421,8 +8420,8 @@ fn args_compatible_prefix(program: &Program, a: FnId, b: FnId, argc: usize) -> b
     let params_a = program.symbols.explicit_params(fa);
     let params_b = program.symbols.explicit_params(fb);
     match (params_a, params_b) {
-        (Some(pa), Some(pb)) if pa.len() >= argc && pb.len() >= argc => (0..argc).all(|i| {
-            match (pa.get(i), pb.get(i)) {
+        (Some(pa), Some(pb)) if pa.len() >= argc && pb.len() >= argc => {
+            (0..argc).all(|i| match (pa.get(i), pb.get(i)) {
                 (Some(ta), Some(tb)) => trace_ir::spelled_alike(
                     &program.types,
                     program.types.get(ta).desc.as_ref(),
@@ -8430,8 +8429,8 @@ fn args_compatible_prefix(program: &Program, a: FnId, b: FnId, argc: usize) -> b
                     trace_ir::SpellingTolerance::Redeclaration,
                 ),
                 _ => false,
-            }
-        }),
+            })
+        }
         _ => true,
     }
 }
@@ -8504,25 +8503,23 @@ fn substituted_template_return(
                 && fact.ref_qualifier == func.ref_qualifier
         })
     };
-    let declared = program
-        .symbols
-        .explicit_params(func);
+    let declared = program.symbols.explicit_params(func);
     let its_own = |fact: &&trace_ir::TemplateReturn| {
         fact.is_const_member == func.is_const_member
             && fact.ref_qualifier == func.ref_qualifier
             && declared.as_ref().is_some_and(|params| {
-            params.len() == fact.params.len()
-                && fact.params.iter().enumerate().all(|(i, desc)| {
-                    params.get(i).is_none_or(|ty| {
-                        trace_ir::spelled_alike(
-                            &program.types,
-                            program.types.get(ty).desc.as_ref(),
-                            desc,
-                            trace_ir::SpellingTolerance::Redeclaration,
-                        )
+                params.len() == fact.params.len()
+                    && fact.params.iter().enumerate().all(|(i, desc)| {
+                        params.get(i).is_none_or(|ty| {
+                            trace_ir::spelled_alike(
+                                &program.types,
+                                program.types.get(ty).desc.as_ref(),
+                                desc,
+                                trace_ir::SpellingTolerance::Redeclaration,
+                            )
+                        })
                     })
-                })
-        })
+            })
     };
     let substitute = |fact: &trace_ir::TemplateReturn| {
         substituted_parameter(program, ctx, owner, &args, scope, fact)
@@ -9347,10 +9344,7 @@ fn select_from_this_level(
                         return false;
                     }
                 }
-                !object_is_const
-                    || f.is_static_member
-                    || standard(id)
-                    || f.is_const_member
+                !object_is_const || f.is_static_member || standard(id) || f.is_const_member
             })
             .collect();
         let member_template = |id: FnId| program.symbols.function(id).is_member_template;
@@ -11275,7 +11269,10 @@ fn register_template_return(
     let fact = trace_ir::TemplateReturn {
         arity,
         is_const_member: ctx.is_cpp && function_is_const_qualified(source, node),
-        ref_qualifier: ctx.is_cpp.then(|| function_ref_qualifier(source, node)).flatten(),
+        ref_qualifier: ctx
+            .is_cpp
+            .then(|| function_ref_qualifier(source, node))
+            .flatten(),
         parameter,
         pointer_depth,
         // As spelled: which class it names is read from the template's own
@@ -13065,7 +13062,10 @@ fn lower_function_decl(
         declared_in_class: false,
         is_member_template: false,
         is_const_member: ctx.is_cpp && function_is_const_qualified(source, decl),
-        ref_qualifier: ctx.is_cpp.then(|| function_ref_qualifier(source, decl)).flatten(),
+        ref_qualifier: ctx
+            .is_cpp
+            .then(|| function_ref_qualifier(source, decl))
+            .flatten(),
         return_cv: function_return_cv(
             program,
             ctx,
@@ -15228,10 +15228,11 @@ fn has_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
     if fa.variadic != fb.variadic || fa.is_member_template != fb.is_member_template {
         return false;
     }
-    if !fa.is_static_member && !fb.is_static_member {
-        if fa.is_const_member != fb.is_const_member || fa.ref_qualifier != fb.ref_qualifier {
-            return false;
-        }
+    if !fa.is_static_member
+        && !fb.is_static_member
+        && (fa.is_const_member != fb.is_const_member || fa.ref_qualifier != fb.ref_qualifier)
+    {
+        return false;
     }
     let a_skip = usize::from(has_this_param(program, a));
     let b_skip = usize::from(has_this_param(program, b));
@@ -17791,7 +17792,8 @@ fn lower_lambda_expression(
         for (name, is_ref) in captured_vars {
             if let Some(&var_id) = saved_locals.get(&name) {
                 lambda_locals.insert(name, var_id);
-                if (!is_mutable && !is_ref) || (is_ref && ctx.closure_const_vars.contains(&var_id)) {
+                if (!is_mutable && !is_ref) || (is_ref && ctx.closure_const_vars.contains(&var_id))
+                {
                     closure_const_vars.insert(var_id);
                 }
             }
@@ -22186,28 +22188,28 @@ fn receiver_is_const(
         }
     }
     if matches!(recv.cached_kind(), "identifier" | "qualified_identifier") {
-        if recv.cached_kind() == "identifier" {
-            if implicit_this_field(program, ctx, source, recv).is_some() {
-                let field_name = node_text(source, &recv);
-                if let Some(c) = ctx.class_ctx.as_ref() {
-                    if let Some(fq) = field_qualification_upward(program, &c.qual_name, field_name) {
-                        if arrow {
-                            return fq.cv.pointee_const;
-                        }
-                        if fq.is_mutable {
-                            return Some(false);
-                        }
-                        if fq.cv.object_const {
-                            return Some(true);
-                        }
-                        return Some(c.is_const);
+        if recv.cached_kind() == "identifier"
+            && implicit_this_field(program, ctx, source, recv).is_some()
+        {
+            let field_name = node_text(source, &recv);
+            if let Some(c) = ctx.class_ctx.as_ref() {
+                if let Some(fq) = field_qualification_upward(program, &c.qual_name, field_name) {
+                    if arrow {
+                        return fq.cv.pointee_const;
                     }
+                    if fq.is_mutable {
+                        return Some(false);
+                    }
+                    if fq.cv.object_const {
+                        return Some(true);
+                    }
+                    return Some(c.is_const);
                 }
-                if arrow || names_reference_member(program, ctx, source, recv) {
-                    return None;
-                }
-                return ctx.class_ctx.as_ref().map(|c| c.is_const);
             }
+            if arrow || names_reference_member(program, ctx, source, recv) {
+                return None;
+            }
+            return ctx.class_ctx.as_ref().map(|c| c.is_const);
         }
         let var = lookup_var_node(program, ctx, source, recv)?;
         let cv = var_cv(program, ctx, var);
@@ -22222,7 +22224,8 @@ fn receiver_is_const(
         let base_is_arrow = is_arrow_access(recv);
         if let Some(field_node) = field_node {
             let field_name = node_text(source, &field_node);
-            if let Some(base_cls) = member_receiver_class(program, ctx, source, base, base_is_arrow) {
+            if let Some(base_cls) = member_receiver_class(program, ctx, source, base, base_is_arrow)
+            {
                 if let Some(fq) = field_qualification_upward(program, &base_cls, field_name) {
                     if arrow {
                         return fq.cv.pointee_const;
@@ -22294,9 +22297,7 @@ fn spelled_type_cv(
             trace_ir::CvQualification {
                 object_const: top_const,
                 pointee_const: Some(
-                    has_postfix_const_before_ptr
-                        || inner_cv.object_const
-                        || strip_cv(base) != base,
+                    has_postfix_const_before_ptr || inner_cv.object_const || strip_cv(base) != base,
                 ),
             }
         } else if is_ref {
@@ -22321,6 +22322,7 @@ fn spelled_type_cv(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn declaration_cv_qualification(
     program: &Program,
     ctx: &LowerContext,
@@ -22409,7 +22411,6 @@ fn declaration_cv_qualification(
 
     base_cv
 }
-
 
 /// Bounded integer folding for array extents. Unknown names and unsupported
 /// expressions stay unknown; they are never substituted with zero.

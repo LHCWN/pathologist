@@ -12103,15 +12103,35 @@ struct H {
     );
     let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
     let x = common::local_variable(&program, "H::Run", "x");
-    assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "H::Run::x");
-    assert!(has_any_edge(&program, &analysis, "H::Run", "Other::OtherGood"));
-    assert!(must_not_have_edge(&program, &analysis, "H::Run", "M::MGood"));
+    assert_eq!(
+        type_name(&program, x),
+        "std::shared_ptr<Other>",
+        "H::Run::x"
+    );
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "H::Run",
+        "Other::OtherGood"
+    ));
+    assert!(must_not_have_edge(
+        &program, &analysis, "H::Run", "M::MGood"
+    ));
     let y = common::local_variable(&program, "H::Run", "y");
-    assert_eq!(type_name(&program, y), "std::shared_ptr<Other>", "H::Run::y");
+    assert_eq!(
+        type_name(&program, y),
+        "std::shared_ptr<Other>",
+        "H::Run::y"
+    );
     let z = common::local_variable(&program, "H::RunConst", "z");
     assert_eq!(pointee_name(&program, z), "R", "H::RunConst::z");
     assert!(has_any_edge(&program, &analysis, "H::RunConst", "R::RGood"));
-    assert!(must_not_have_edge(&program, &analysis, "H::RunConst", "S::SGood"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "H::RunConst",
+        "S::SGood"
+    ));
 }
 
 #[test]
@@ -12153,17 +12173,44 @@ void RunUserMove(const C *p) {
     );
     let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
     let xref = common::local_variable(&program, "RunRef", "x");
-    assert_eq!(type_name(&program, xref), "std::shared_ptr<Other>", "RunRef::x");
-    assert!(has_any_edge(&program, &analysis, "RunRef", "Other::OtherGood"));
-    assert!(must_not_have_edge(&program, &analysis, "RunRef", "M::MGood"));
+    assert_eq!(
+        type_name(&program, xref),
+        "std::shared_ptr<Other>",
+        "RunRef::x"
+    );
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "RunRef",
+        "Other::OtherGood"
+    ));
+    assert!(must_not_have_edge(
+        &program, &analysis, "RunRef", "M::MGood"
+    ));
     let xptr = common::local_variable(&program, "RunPtr", "x");
-    assert_eq!(type_name(&program, xptr), "std::shared_ptr<Other>", "RunPtr::x");
-    assert!(has_any_edge(&program, &analysis, "RunPtr", "Other::OtherGood"));
-    assert!(must_not_have_edge(&program, &analysis, "RunPtr", "M::MGood"));
+    assert_eq!(
+        type_name(&program, xptr),
+        "std::shared_ptr<Other>",
+        "RunPtr::x"
+    );
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "RunPtr",
+        "Other::OtherGood"
+    ));
+    assert!(must_not_have_edge(
+        &program, &analysis, "RunPtr", "M::MGood"
+    ));
     let xmove = common::local_variable(&program, "RunUserMove", "x");
     assert_eq!(pointee_name(&program, xmove), "R", "RunUserMove::x");
     assert!(has_any_edge(&program, &analysis, "RunUserMove", "R::RGood"));
-    assert!(must_not_have_edge(&program, &analysis, "RunUserMove", "S::SGood"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "RunUserMove",
+        "S::SGood"
+    ));
 }
 
 #[test]
@@ -12229,15 +12276,38 @@ void RunSmartPtr(std::shared_ptr<const M> p) {
     let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
     for caller in ["RunAlias", "RunAliasPtr", "RunSmartPtr"] {
         let x = common::local_variable(&program, caller, "x");
-        assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "{caller}::x");
-        assert!(has_any_edge(&program, &analysis, caller, "Other::OtherGood"));
+        assert_eq!(
+            type_name(&program, x),
+            "std::shared_ptr<Other>",
+            "{caller}::x"
+        );
+        assert!(has_any_edge(
+            &program,
+            &analysis,
+            caller,
+            "Other::OtherGood"
+        ));
         assert!(must_not_have_edge(&program, &analysis, caller, "M::MGood"));
     }
     let lambda = common::lambda_in(&program, "RunCapture");
     let x = common::local_variable(&program, &lambda.name, "x");
-    assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "lambda::x");
-    assert!(has_any_edge(&program, &analysis, &lambda.name, "Other::OtherGood"));
-    assert!(must_not_have_edge(&program, &analysis, &lambda.name, "M::MGood"));
+    assert_eq!(
+        type_name(&program, x),
+        "std::shared_ptr<Other>",
+        "lambda::x"
+    );
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        &lambda.name,
+        "Other::OtherGood"
+    ));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        &lambda.name,
+        "M::MGood"
+    ));
 }
 
 #[test]
@@ -12260,9 +12330,20 @@ void M::MGood() {}
     );
     let (program, analysis) = common::analyze_source(&[("main.cpp", &source)]);
     let x = common::local_variable(&program, "M::Run", "x");
-    assert_eq!(type_name(&program, x), "std::shared_ptr<Other>", "M::Run::x");
-    assert!(has_any_edge(&program, &analysis, "M::Run", "Other::OtherGood"));
-    assert!(must_not_have_edge(&program, &analysis, "M::Run", "M::MGood"));
+    assert_eq!(
+        type_name(&program, x),
+        "std::shared_ptr<Other>",
+        "M::Run::x"
+    );
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "M::Run",
+        "Other::OtherGood"
+    ));
+    assert!(must_not_have_edge(
+        &program, &analysis, "M::Run", "M::MGood"
+    ));
 }
 
 #[test]
@@ -12341,7 +12422,12 @@ void M::Good() {}
     let x = common::local_variable(&program, "M::Run", "x");
     assert_eq!(type_name(&program, x), "std::shared_ptr<M>", "M::Run::x");
     assert!(has_any_edge(&program, &analysis, "M::Run", "M::Good"));
-    assert!(must_not_have_edge(&program, &analysis, "M::Run", "Other::Bad"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "M::Run",
+        "Other::Bad"
+    ));
 }
 
 #[test]
@@ -12436,11 +12522,15 @@ void RunConst(const C<R, S> *p) {
     let mx = common::local_variable(&program, "RunMut", "x");
     assert_eq!(pointee_name(&program, mx), "R", "RunMut::x");
     assert!(has_any_edge(&program, &analysis, "RunMut", "R::RGood"));
-    assert!(must_not_have_edge(&program, &analysis, "RunMut", "S::SGood"));
+    assert!(must_not_have_edge(
+        &program, &analysis, "RunMut", "S::SGood"
+    ));
     let cx = common::local_variable(&program, "RunConst", "x");
     assert_eq!(pointee_name(&program, cx), "S", "RunConst::x");
     assert!(has_any_edge(&program, &analysis, "RunConst", "S::SGood"));
-    assert!(must_not_have_edge(&program, &analysis, "RunConst", "R::RGood"));
+    assert!(must_not_have_edge(
+        &program, &analysis, "RunConst", "R::RGood"
+    ));
 }
 
 #[test]
@@ -12535,13 +12625,23 @@ void RunMut(C c) {
     let cx = common::local_variable(&program, &l_const.name, "x");
     assert_eq!(pointee_name(&program, cx), "S", "RunConst lambda::x");
     assert!(has_any_edge(&program, &analysis, &l_const.name, "S::SGood"));
-    assert!(must_not_have_edge(&program, &analysis, &l_const.name, "R::RGood"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        &l_const.name,
+        "R::RGood"
+    ));
 
     let l_mut = common::lambda_in(&program, "RunMut");
     let mx = common::local_variable(&program, &l_mut.name, "x");
     assert_eq!(pointee_name(&program, mx), "R", "RunMut lambda::x");
     assert!(has_any_edge(&program, &analysis, &l_mut.name, "R::RGood"));
-    assert!(must_not_have_edge(&program, &analysis, &l_mut.name, "S::SGood"));
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        &l_mut.name,
+        "S::SGood"
+    ));
 }
 
 #[test]

@@ -4363,7 +4363,11 @@ fn merged_const_overloads_on_same_source_line_remain_distinct() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(fns.len(), 2, "two distinct C::f overloads in merged database: {fns:?}");
+    assert_eq!(
+        fns.len(),
+        2,
+        "two distinct C::f overloads in merged database: {fns:?}"
+    );
     assert_eq!(fns[0].1, "C::f()");
     assert_eq!(fns[1].1, "C::f() const");
 }

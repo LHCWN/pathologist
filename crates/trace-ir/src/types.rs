@@ -968,12 +968,7 @@ impl TypeTable {
             .insert(field.to_owned());
     }
 
-    pub fn note_field_qualification(
-        &mut self,
-        class: &str,
-        field: &str,
-        qual: FieldQualification,
-    ) {
+    pub fn note_field_qualification(&mut self, class: &str, field: &str, qual: FieldQualification) {
         self.field_qualifications
             .entry(class.to_owned())
             .or_default()
