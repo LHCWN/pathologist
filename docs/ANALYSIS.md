@@ -4016,7 +4016,14 @@ C++-aware only where it must be — everything else reuses the C machinery.
   participate in indirect-call resolution. Other types whose last segment
   is `function` stay ordinary classes. Lambdas lower to synthetic
   `$lambda` functions with `AddrOfFn` on init/assign/arg (captures
-  unmodeled). Functors (`operator()`) are member calls, including `obj()`
+  unmodeled). A lambda invoked where it is written (`[&] { ... }()`,
+  parenthesized or not, the expansion of an `IN_PROCESS_CALL`-style wrapper)
+  is a direct call site bound to that function by its generated name, with
+  its arguments bound to the lambda's parameters and its returns reaching the
+  call's destination. Lambdas one macro
+  expansion writes all take the invocation's position, so a later lambda with
+  a different body takes the next free column in its generated name, and
+  lambdas with equal bodies share one function. Functors (`operator()`) are member calls, including `obj()`
   and `h->field()` when `field`'s type declares `operator()`. Callable
   data members that are not methods fall through to the C fn-ptr
   field-load path.

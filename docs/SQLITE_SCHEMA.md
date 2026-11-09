@@ -221,7 +221,11 @@ this interface.
 `functions` excludes generated lambda functions. `call_edges` contracts each
 recorded path from a visible caller through one or more lambdas to the next
 visible callee. It stops at visible functions and does not infer invocation
-from lexical ownership: an uninvoked lambda creates no call edge. Nested and
+from lexical ownership: an uninvoked lambda creates no call edge. An
+immediately invoked lambda is entered by a direct edge from a site whose
+public `callee_text` is `<lambda>`; `raw_call_sites` keeps its generated name.
+A lambda that reaches no visible callee leaves that site without a public edge.
+Nested and
 shared lambdas and cycles are supported. A contracted edge retains the first
 edge's call site and resolution, expressing reachability without implying
 synchronous execution.
