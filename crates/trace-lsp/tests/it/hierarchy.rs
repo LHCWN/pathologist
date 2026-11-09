@@ -536,6 +536,9 @@ fn startup_rejects_missing_invalid_and_incompatible_databases() {
         [trace_db::SCHEMA_VERSION],
     )
     .unwrap();
+    // Deliberately break dependent views to exercise reader validation;
+    // SQLite's normal ALTER validation would reject the corrupt fixture.
+    conn.execute_batch("PRAGMA legacy_alter_table=ON").unwrap();
     conn.execute(
         "ALTER TABLE call_sites_data RENAME COLUMN expansion_col TO unavailable_col",
         [],

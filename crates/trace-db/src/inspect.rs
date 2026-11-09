@@ -587,8 +587,16 @@ fn load_projected_unresolved(
     conn: &Connection,
     root: i64,
 ) -> Result<Vec<(i64, i64, String, EdgeSite)>> {
-    let sql = format!(
-        r#"{cte}
+    let sql = if crate::projection::public_projection_active(conn)? {
+        format!(
+            "{} SELECT cs.call_site_id,cs.caller_fn_id,cs.callee_text,p.path,cs.line,cs.col
+            FROM unresolved_calls_no_lambdas cs JOIN files p ON p.id=cs.file_id
+            JOIN walk w ON w.kind=0 AND w.visible_id=cs.caller_fn_id",
+            projection_walk_cte(Direction::Down)
+        )
+    } else {
+        format!(
+            r#"{cte}
 SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col
 FROM call_sites cs
 JOIN walk w ON w.kind = 0 AND w.visible_id = cs.caller_fn_id
@@ -602,8 +610,9 @@ JOIN walk l ON l.kind = 1 AND l.lambda_fn_id = cs.caller_fn_id
 JOIN files p ON p.id = cs.file_id
 WHERE cs.is_direct = 0
   AND NOT EXISTS (SELECT 1 FROM call_edges ce WHERE ce.call_site_id = cs.id)"#,
-        cte = projection_walk_cte(Direction::Down)
-    );
+            cte = projection_walk_cte(Direction::Down)
+        )
+    };
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([root], |row| {
         Ok((
@@ -981,7 +990,9 @@ fn call_graph_impl(
     let mut adj = load_call_adjacency(conn, dir, view, root_fn_id)?;
     if dir == Direction::Down {
         let mut seen = FxHashSet::default();
-        if view == CallGraphView::WithoutLambdas {
+        if view == CallGraphView::WithoutLambdas
+            || crate::projection::public_projection_active(conn)?
+        {
             for (site_id, caller, name, site) in load_projected_unresolved(conn, root_fn_id)? {
                 insert_unresolved(
                     &mut labels,
@@ -1030,7 +1041,7 @@ fn call_graph_impl(
 
     // Different entering edges can project to the same visible edge, with
     // other neighbors between the duplicates in entry-edge order.
-    if view == CallGraphView::WithoutLambdas {
+    if view == CallGraphView::WithoutLambdas || crate::projection::public_projection_active(conn)? {
         sort_call_adjacency(&mut adj);
     }
 

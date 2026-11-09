@@ -1790,6 +1790,14 @@ pub fn value_slice(
     start: &SliceStart,
     opts: &SliceOptions,
 ) -> Result<ValueSlice> {
+    crate::projection::with_raw_relations(conn, || value_slice_complete(conn, start, opts))
+}
+
+fn value_slice_complete(
+    conn: &Connection,
+    start: &SliceStart,
+    opts: &SliceOptions,
+) -> Result<ValueSlice> {
     require_slice_schema(conn)?;
     let mut db = FlowDb::new(conn);
     let starts: FxHashSet<i64> = start.nodes.iter().copied().collect();

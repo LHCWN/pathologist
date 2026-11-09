@@ -186,6 +186,9 @@ enum InspectCommands {
         /// Contract lambda intermediates before traversal; depth counts visible hops.
         #[arg(long)]
         hide_lambdas: bool,
+        /// Inspect the complete graph, including synthetic lambda functions.
+        #[arg(long, conflicts_with = "hide_lambdas")]
+        show_lambdas: bool,
         /// File path substring (e.g. basename) locating the start function.
         #[arg(long)]
         file: String,
@@ -269,6 +272,9 @@ enum InspectCommands {
         /// Contract lambda intermediates before traversal; depth counts visible hops.
         #[arg(long)]
         hide_lambdas: bool,
+        /// Inspect the complete graph, including synthetic lambda functions.
+        #[arg(long, conflicts_with = "hide_lambdas")]
+        show_lambdas: bool,
         /// Start function name, C++ qualified suffix, or FILE:LINE (e.g. `main` or `main.c:10`).
         #[arg(long)]
         from: Option<String>,
@@ -961,6 +967,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
         }
         InspectCommands::Callgraph {
             hide_lambdas,
+            show_lambdas,
             file,
             line,
             depth,
@@ -968,6 +975,9 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             format,
             callgraph_filter,
         } => {
+            if show_lambdas {
+                trace_db::use_raw_relations(&conn)?;
+            }
             let dir = trace_db::Direction::parse(&direction)?;
             if depth == 0 {
                 anyhow::bail!("depth must be >= 1");
@@ -1134,6 +1144,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
         }
         InspectCommands::Callchain {
             hide_lambdas,
+            show_lambdas,
             from,
             to,
             from_file,
@@ -1146,6 +1157,9 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             format,
             callgraph_filter,
         } => {
+            if show_lambdas {
+                trace_db::use_raw_relations(&conn)?;
+            }
             let dir = trace_db::Direction::parse(&direction)?;
             let view = if hide_lambdas {
                 trace_db::CallGraphView::WithoutLambdas

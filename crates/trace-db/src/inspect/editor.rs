@@ -174,6 +174,7 @@ mod tests {
             (8, crate::SCHEMA_V8),
             (6, crate::SCHEMA_V7),
             (9, crate::SCHEMA_V8),
+            (10, crate::SCHEMA_V8),
         ] {
             let path = dir.path().join(format!("v{version}.db"));
             let conn = Connection::open(&path).unwrap();
@@ -185,7 +186,7 @@ mod tests {
             .unwrap();
             drop(conn);
             let snapshot = open_editor_snapshot(&path);
-            if version == 7 || version == 8 {
+            if crate::SUPPORTED_SCHEMA_VERSIONS.contains(&version) {
                 let snapshot = snapshot.unwrap();
                 assert!(snapshot.execute("DELETE FROM analysis_run", []).is_err());
                 assert!(editor_file_paths(&snapshot).unwrap().is_empty());

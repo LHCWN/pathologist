@@ -2,8 +2,9 @@ use super::*;
 use anyhow::Context;
 use trace_ir::FnId;
 
-/// The complete analysis graph or its stable lambda-free SQL projection.
-/// Projection precedes traversal, so hidden lambdas consume no depth.
+/// The connection's graph or its stable lambda-free SQL projection. New
+/// snapshots expose the projection by default; `use_raw_relations` selects
+/// their complete graph. Legacy snapshots keep their original defaults.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CallGraphView {
     #[default]
