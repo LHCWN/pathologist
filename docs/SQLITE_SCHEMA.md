@@ -230,9 +230,12 @@ Ordinary edges retain their IDs. Contracted edge IDs are deterministic
 hashes of the original entering-edge ID and visible target identity; merged
 targets use their inherited stable function identities, so adding unrelated
 inputs does not renumber unchanged contracted edges. A hash collision rejects
-publication instead of assigning an order-dependent ID. `lambda_call_provenance(edge_id, entry_edge_id)` maps every
-public edge to its original `raw_call_edges.id`. One entering edge can have
-multiple projected leaves. SQL row order is unspecified; use `ORDER BY`.
+publication instead of assigning an order-dependent ID. Public edges are
+deduplicated on `(caller_fn_id, callee_fn_id, call_site_id, resolution)`;
+`lambda_call_provenance(edge_id, entry_edge_id)` maps every public edge to its
+original `raw_call_edges.id` entering edges. One entering edge can have
+multiple projected leaves, and a public edge reached via multiple entering
+edges links to each one. SQL row order is unspecified; use `ORDER BY`.
 
 `lambda_owners(lambda_fn_id, owner_fn_id)` records the enclosing non-lambda
 function in the same file and link image. File-scope lambdas have a NULL owner.
@@ -531,9 +534,10 @@ cost once, after writing its rows and before building secondary indexes;
 each merge pays it for every legacy input without a stored identity.
 Reading a valid stored identity only reads the singleton metadata row.
 
-Exports record the identity after writing every analysis row and before
-publication. Published databases are immutable: a tool deliberately changing
-their analysis rows must call `trace_db::record_database_identity` afterward.
+Exports record the identity after writing and publishing every analysis
+and projection row, before persisting the output file. Published databases
+are immutable: a tool deliberately changing their analysis rows must call
+`trace_db::record_database_identity` afterward.
 The merger trusts a valid stored identity, rejects unsupported algorithms or
 malformed digests, and computes the same digest read-only for older databases
 without the table or row. Its input duplicate detection uses this identity,

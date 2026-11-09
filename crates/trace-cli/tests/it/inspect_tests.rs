@@ -176,6 +176,67 @@ fn lambda_free_callgraph_deduplicates_shared_callees_in_text_and_json() {
     }
 }
 
+#[test]
+fn lambda_free_calls_deduplicates_calls_from_shared_site() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    for full in [false, true] {
+        let db = export_tree_with(&fixture("lambda_call_view"), "lambda_calls", full);
+        let conn = open_db(&db).unwrap();
+
+        // 1. Verify via trace_db::call_edges API directly
+        let edges = trace_db::call_edges(
+            &conn,
+            &CallEdgeFilter {
+                from: Some("A"),
+                to: None,
+                file: None,
+                exclude_deps: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            edges.len(),
+            2,
+            "calls from A should contain exactly 2 edges (A->B and A->C)"
+        );
+        let mut callees: Vec<_> = edges.iter().map(|e| e.callee_name.as_str()).collect();
+        callees.sort();
+        assert_eq!(callees, vec!["B", "C"]);
+
+        // 2. Verify via CLI `inspect calls --from A`
+        let output = Command::new(bin)
+            .args(["inspect", db.to_str().unwrap(), "calls", "--from", "A"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = stdout.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "{stdout}");
+        assert!(stdout.contains("-> B"), "{stdout}");
+        assert!(stdout.contains("-> C"), "{stdout}");
+
+        // 3. Verify provenance table retains both entering edges for each public edge
+        let provenance_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM lambda_call_provenance p \
+                 JOIN call_edges e ON e.id = p.edge_id \
+                 JOIN functions caller ON caller.id = e.caller_fn_id \
+                 WHERE caller.name = 'A'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance_count, 4,
+            "both entering edges should be tracked for each of the 2 projected edges"
+        );
+    }
+}
+
 /// Build the tree at `root` and export it minimally to a scratch database.
 fn export_tree(root: &std::path::Path, name: &str) -> TempDb {
     export_tree_with(root, name, false)

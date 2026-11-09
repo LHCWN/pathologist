@@ -47,8 +47,8 @@ pub fn database_identity(conn: &Connection) -> Result<DatabaseIdentity> {
     compute(conn)
 }
 
-/// Compute and store the identity after all analysis rows have been written,
-/// inside the producer's export transaction and before publication.
+/// Compute and store the identity after all analysis rows and projected relations
+/// have been written and published, inside the producer's export transaction.
 pub fn record_database_identity(conn: &Connection) -> Result<DatabaseIdentity> {
     let identity = compute(conn)?;
     conn.execute_batch(crate::DATABASE_IDENTITY_TABLE)?;

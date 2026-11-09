@@ -282,7 +282,8 @@ fn project_call_ids(conn: &Connection) -> Result<()> {
     // do not silently assign an order-dependent identity.
     conn.execute_batch(
         "CREATE UNIQUE INDEX temp.projected_call_ids ON projected_calls(projected_id)",
-    )?;
+    )
+    .context("hash collision detected while assigning deterministic projected call edge IDs")?;
     Ok(())
 }
 
@@ -309,9 +310,10 @@ CREATE TABLE lambda_owners (
     owner_fn_id INTEGER REFERENCES functions(id)
 );
 CREATE TABLE lambda_call_provenance (
-    edge_id INTEGER PRIMARY KEY REFERENCES call_edges_data(id),
-    entry_edge_id INTEGER NOT NULL
-);
+    edge_id INTEGER NOT NULL REFERENCES call_edges_data(id),
+    entry_edge_id INTEGER NOT NULL,
+    PRIMARY KEY (edge_id, entry_edge_id)
+) WITHOUT ROWID;
 -- Preserve unresolved-path semantics before lifting lexical ownership. In
 -- particular, an uninvoked lambda must not add unresolved calls to its parent.
 CREATE TABLE lambda_unresolved_calls (
@@ -345,9 +347,24 @@ SELECT id,owner FROM (
 ) WHERE rank=1;
 
 -- Materialize before changing either endpoint relation. An entering edge can
--- reach multiple leaves, so its ID is provenance, not a projected primary key.
+-- reach multiple leaves, and multiple entering edges can reach the same
+-- visible callee from the same site. Deduplicate public edges on
+-- (caller, callee, call_site, resolution) while preserving every entering edge
+-- in provenance.
+CREATE TEMP TABLE projected_call_provenance AS
+SELECT * FROM _projection_call_edges;
+
 CREATE TEMP TABLE projected_calls AS
-SELECT p.*,CAST(NULL AS INTEGER) AS projected_id FROM _projection_call_edges p;
+SELECT
+    CASE WHEN min(CASE WHEN r.callee_fn_id = p.callee_fn_id THEN p.entry_edge_id END) IS NOT NULL
+         THEN min(CASE WHEN r.callee_fn_id = p.callee_fn_id THEN p.entry_edge_id END)
+         ELSE min(p.entry_edge_id)
+    END AS entry_edge_id,
+    p.call_site_id, p.caller_fn_id, p.callee_fn_id, p.resolution,
+    CAST(NULL AS INTEGER) AS projected_id
+FROM projected_call_provenance p
+JOIN raw_call_edges_data r ON r.id = p.entry_edge_id
+GROUP BY p.caller_fn_id, p.callee_fn_id, p.call_site_id, p.resolution;
 "#,
     )?;
     project_call_ids(conn)?;
@@ -358,8 +375,15 @@ SELECT p.projected_id,p.call_site_id,p.caller_fn_id,p.callee_fn_id,r.resolution_
 FROM projected_calls p JOIN raw_call_edges_data r ON r.id=p.entry_edge_id;
 
 INSERT INTO lambda_call_provenance
-SELECT projected_id,entry_edge_id FROM projected_calls;
+SELECT DISTINCT p.projected_id, prov.entry_edge_id
+FROM projected_calls p
+JOIN projected_call_provenance prov
+  ON prov.caller_fn_id = p.caller_fn_id
+ AND prov.callee_fn_id = p.callee_fn_id
+ AND prov.call_site_id = p.call_site_id
+ AND prov.resolution = p.resolution;
 DROP TABLE projected_calls;
+DROP TABLE projected_call_provenance;
 
 UPDATE variables_data SET kind='local' WHERE kind='param' AND fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 UPDATE variables_data SET fn_id=(SELECT owner_fn_id FROM lambda_owners WHERE lambda_fn_id=fn_id)
@@ -795,6 +819,80 @@ mod tests {
                 "SELECT count(*) FROM execution_contexts WHERE entry_fn_id=1"
             ),
             1
+        );
+    }
+
+    #[test]
+    fn multiple_entering_edges_to_same_callee_deduplicate_in_public_edges() {
+        let conn = complete_graph();
+        // Add another entering edge from Root (fn 0) to lambda 5 at call site 0,
+        // which also reaches Leaf (fn 3).
+        let indirect: i64 = conn
+            .query_row("SELECT id FROM strings WHERE text = 'indirect'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO call_edges_data VALUES(100, 0, 0, 5, ?1)",
+            [indirect],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        // Root has call site 0: originally edge 0 went to lambda 1 (reaching Leaf 3 and Other 4).
+        // Edge 100 also at call site 0 went to lambda 5 (reaching Leaf 3).
+        // In public call_edges, Root -> Leaf at site 0 must appear only ONCE!
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM call_edges WHERE caller_fn_id=0 AND callee_fn_id=3 AND call_site_id=0"
+            ),
+            1
+        );
+        // But lambda_call_provenance must record both entering edges (0 and 100).
+        let edge_id: i64 = conn
+            .query_row(
+                "SELECT id FROM call_edges WHERE caller_fn_id=0 AND callee_fn_id=3 AND call_site_id=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let prov_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM lambda_call_provenance WHERE edge_id=?1",
+                [edge_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prov_count, 2);
+    }
+
+    #[test]
+    fn hash_collision_error_is_annotated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE projected_calls (
+                entry_edge_id INTEGER,
+                callee_fn_id INTEGER,
+                projected_id INTEGER
+            );
+            CREATE TABLE raw_call_edges_data (
+                id INTEGER PRIMARY KEY,
+                callee_fn_id INTEGER
+            );",
+        )
+        .unwrap();
+        // Insert two rows that will produce the same hash: identical entry_edge_id and callee_fn_id
+        conn.execute_batch(
+            "INSERT INTO raw_call_edges_data VALUES(1, 10);
+             INSERT INTO projected_calls VALUES(1, 20, NULL), (1, 20, NULL);",
+        )
+        .unwrap();
+        let err = project_call_ids(&conn).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "hash collision detected while assigning deterministic projected call edge IDs"
+            ),
+            "{err:#}"
         );
     }
 }
