@@ -4,6 +4,17 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Run default member initializers at construction (#271)
+
+A call written in a C++ default member initializer now has a call site and edge
+wherever the initializer runs. A user-provided constructor owns the defaults of
+the members its list omits; for a class without one, the function building the
+object does. A list entry replaces the default. Re-index to pick up the new
+edges.
+
+See [C++ support](docs/ANALYSIS.md#c-support-first-step);
+measurements in `docs/EVAL_REPORT.md` ("Default member initializers").
+
 ### Resolve immediately invoked lambdas (#268)
 
 A lambda invoked where it is written, every `IN_PROCESS_CALL(...)` expansion

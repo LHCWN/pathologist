@@ -5907,6 +5907,201 @@ fn nested_member_initializer_constructor_metadata_survives_cached_headers() {
     }
 }
 
+analyzed_fixture!(cpp_default_member_initializers);
+
+fn sites_calling(program: &trace_ir::Program, caller: &str, callee: &str) -> usize {
+    program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| fn_name(program, site.caller) == caller && site.callee_name == callee)
+        .count()
+}
+
+fn assert_runs(pairs: &[(&str, &str)]) {
+    let (program, analysis) = cpp_default_member_initializers();
+    for (caller, callee) in pairs {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} runs {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+}
+
+#[test]
+fn user_provided_constructors_run_omitted_default_member_initializers() {
+    assert_runs(&[
+        ("User::User", "Lu"),
+        ("User::User", "K::K"),
+        ("OutOfLine::OutOfLine", "Lp"),
+        ("Copied::Copied", "Lc"),
+        ("NestedOwner::NestedOwner", "Ln"),
+        ("DerivedOwner::DerivedOwner", "Lb"),
+        ("Tmpl::Tmpl", "Lt"),
+    ]);
+}
+
+#[test]
+fn implicit_and_aggregate_initialization_runs_defaults_in_the_constructing_function() {
+    assert_runs(&[
+        ("MakeImplicit", "Li"),
+        ("MakeImplicit", "K::K"),
+        ("MakeOnHeap", "Li"),
+        ("MakeOnHeap", "K::K"),
+        ("MakeAgg", "La"),
+        ("MakePartial", "Ls"),
+        ("MakeHeapPartial", "Ls"),
+        ("MakeDefaulted", "Ld"),
+    ]);
+}
+
+#[test]
+fn a_constructor_list_entry_replaces_the_default_member_initializer() {
+    let (program, analysis) = cpp_default_member_initializers();
+    for caller in ["ListK::ListK", "ListScalar::ListScalar"] {
+        assert!(
+            !has_any_edge(program, analysis, caller, "Named"),
+            "{caller} runs its list entry instead: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+    assert!(has_any_edge(program, analysis, "ListK::ListK", "Leaf"));
+    assert!(!has_any_edge(
+        program,
+        analysis,
+        "NamedInner::NamedInner",
+        "Ln"
+    ));
+}
+
+#[test]
+fn each_constructing_function_keeps_its_own_default_member_initializer_sites() {
+    let (program, _) = cpp_default_member_initializers();
+    assert_eq!(
+        sites_calling(program, "TwoConstructors::TwoConstructors", "Lt2"),
+        2
+    );
+    for caller in ["MakeImplicit", "MakeOnHeap"] {
+        assert_eq!(
+            sites_calling(program, caller, "Li"),
+            2,
+            "{caller} runs both defaults"
+        );
+    }
+}
+
+#[test]
+fn a_callback_stored_by_a_default_member_initializer_reaches_its_member() {
+    let (program, analysis) = cpp_default_member_initializers();
+    for caller in ["CallbackDefault::Run", "RawCallbackDefault::Run"] {
+        assert!(
+            has_edge(
+                program,
+                analysis,
+                caller,
+                "Handler",
+                ResolutionKind::Indirect
+            ),
+            "{caller}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+    assert!(has_edge(
+        program,
+        analysis,
+        "NullCallback::Run",
+        "Unrelated",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn default_member_initializers_run_for_every_implicit_default_construction() {
+    assert_runs(&[
+        ("MakeDefaultedWithOther", "Ldf"),
+        ("MakeOnlyBase", "Lib"),
+        ("MakeFactory", "Lmk"),
+    ]);
+}
+
+#[test]
+fn a_block_scope_extern_declaration_runs_no_default_member_initializer() {
+    let (program, analysis) = cpp_default_member_initializers();
+    assert!(!has_any_edge(program, analysis, "UsesExtern", "Lext"));
+}
+
+#[test]
+fn an_address_default_on_an_unknown_member_type_reaches_the_member() {
+    let (program, analysis) = cpp_default_member_initializers();
+    assert!(has_edge(
+        program,
+        analysis,
+        "UnknownTypeDefault::Run",
+        "HandlerAddress",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn a_default_that_builds_its_own_class_terminates() {
+    assert_runs(&[("MakeSelfBuilding", "Lself"), ("MakeMutual", "Lmutual")]);
+}
+
+#[test]
+fn a_caller_keeps_one_site_per_default_whatever_its_linkage() {
+    let (program, _) = cpp_default_member_initializers();
+    for caller in ["ConstructTwiceInternal", "ConstructTwiceExternal"] {
+        assert_eq!(sites_calling(program, caller, "Ltwice"), 1, "{caller}");
+    }
+}
+
+#[test]
+fn a_repeated_default_in_an_internal_caller_still_stores_its_value() {
+    let (program, analysis) = cpp_default_member_initializers();
+    assert!(has_edge(
+        program,
+        analysis,
+        "CallSecondHolder",
+        "TwiceHandler",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn a_user_provided_constructor_owns_defaults_when_new_passes_arguments() {
+    let (program, analysis) = cpp_default_member_initializers();
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "ArgumentConstructor::ArgumentConstructor",
+        "Larg"
+    ));
+    assert!(!has_any_edge(program, analysis, "MakeWithArgument", "Larg"));
+}
+
+#[test]
+fn a_delegating_constructor_leaves_defaults_to_its_target() {
+    let (program, _) = cpp_default_member_initializers();
+    assert_eq!(
+        sites_calling(program, "Delegating::Delegating", "Delegated"),
+        1,
+        "only the target constructor runs the default"
+    );
+}
+
+#[test]
+fn header_defined_classes_keep_one_site_per_default_member_initializer() {
+    let (program, _) = cpp_default_member_initializers();
+    for caller in ["HeaderOwner::HeaderOwner", "BuildHeaderImplicit"] {
+        assert_eq!(
+            sites_calling(program, caller, "HeaderLeaf"),
+            1,
+            "{caller} is lowered once after merge"
+        );
+    }
+}
+
 analyzed_fixture!(cpp_member_initializer_review);
 
 #[test]

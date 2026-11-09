@@ -2480,6 +2480,27 @@ mod tests {
         assert!(!g.guaranteed(seed, body));
     }
 
+    #[test]
+    fn a_local_objects_default_member_initializer_runs_at_its_declaration() {
+        let unit = lower("local_default.cpp");
+        let g = graph(&unit, "Build");
+        let (before, seed, after) = (g.ev("before"), g.ev("local_seed"), g.ev("after"));
+        assert!(g.may_precede(before, seed), "{}", g.dump());
+        assert!(!g.may_precede(seed, before), "{}", g.dump());
+        assert!(g.may_precede(seed, after), "{}", g.dump());
+    }
+
+    #[test]
+    fn a_default_that_builds_its_own_class_is_lowered_once() {
+        let unit = lower("local_default.cpp");
+        // Counted before merge, which would hide a second walk.
+        let sites = unit
+            .call_sites
+            .iter()
+            .filter(|s| s.callee_name == "self_seed");
+        assert_eq!(sites.count(), 1);
+    }
+
     fn covered_by(g: &Graph, e: EventId, kind: GapKind) -> bool {
         g.cfg
             .gaps

@@ -1,5 +1,36 @@
 # Evaluation Report
 
+## Default member initializers — 2026-11-09
+
+Issue #271, measured with `scripts/eval_check.py` on the pinned corpora, the
+patched binary against its parent. Default exports throughout.
+
+| Corpus | Raw edges | Public edges | Indirect edges | Argument-flow rows | Solver pops |
+|--------|-----------|--------------|----------------|--------------------|-------------|
+| HDF | 78796 → 78892 | 78613 → 78709 | 5139 → 5139 | 72232 → 72400 | 493372 → 492643 |
+| HiView | 39335 → 39337 | 38726 → 38728 | 246 → 246 | 32470 → 32470 | 58981 → 59415 |
+| Camera | 116364 → 116425 | 114648 → 114709 | 443 → 443 | 58694 → 58702 | 165979 → 166910 |
+| Ability runtime | 382418 → 382653 | 373795 → 374030 | 1848 → 1848 | 375642 → 375727 | 727370 → 741896 |
+
+A comparison of distinct raw caller/callee function pairs, by name and
+signature, lost none on any corpus and gained 36 in HDF (`AutoPtr` members of
+the `hc-gen` code emitters), 2 in HiView, 34 in Camera and 170 in Ability
+runtime.
+
+Only HDF's argument-flow centers and its public edge total are re-captured,
+following the new `AutoPtr` constructor sites; the check's `budget_pops` stays at
+800000. Ability runtime now also pins `edges_indirect` (1848) and a probe that
+the solver converged, because a partial fixpoint would otherwise pass every
+check on that corpus. Earlier revisions of this change reached the budget and
+lost up to 1189 caller/callee pairs there, including the #268 probe's edge.
+
+Analysis time on Ability runtime, measured before the rebase over #267, two runs
+each at 8 jobs: 158.0 s and 156.4 s on the parent, 164.2 s and 154.4 s patched, within the variation between runs.
+Solver pops rise by 2%. Only defaults that can have an effect are lowered inside
+bodies: treating every parenthesis as a call took 919325 pops, nearly all of it
+from `static_cast` defaults on request objects, and building every member of an
+implicitly constructed object added 417233 raw edges.
+
 ## Eval checks and the two call graphs — 2026-11-09
 
 Issue #270, measured with `scripts/eval_check.py` on the pinned corpora at

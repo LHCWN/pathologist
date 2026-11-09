@@ -1319,12 +1319,15 @@ fn merge_unit(
             default_owner: cs.source_key().default_owner.map(|_| mapped_caller),
             ..cs.source_key()
         };
-        let source = if remerge || !is_internal_caller {
+        // Internal callers keep every site, except a default evaluated once
+        // per construction: all of a caller's objects share its spelling.
+        let merges_copies = !is_internal_caller || key.default_owner.is_some();
+        let source = if remerge || merges_copies {
             program.dedup.site_keys.get(&key, &program.symbols)
         } else {
             None
         };
-        if !matches!(mode, MergeMode::Variant) && !is_internal_caller {
+        if !matches!(mode, MergeMode::Variant) && merges_copies {
             if let Some(existing) = source {
                 program.symbols.absorb_call_copy(existing.primary, cs);
                 call_map.insert(cs.id, existing.primary);
@@ -1436,7 +1439,7 @@ fn merge_unit(
         if shared_caller {
             program.symbols.share_header_call(new_id, primary_file_id);
         }
-        if !is_internal_caller || shared_caller {
+        if merges_copies || shared_caller {
             let source =
                 program
                     .dedup
