@@ -233,14 +233,26 @@ pub(crate) fn with_raw_relations<T>(
     {
         return read();
     }
-    conn.execute_batch("SAVEPOINT trace_raw_inspection")?;
-    let result = use_raw_relations(conn).and_then(|()| read());
-    let cleanup =
-        conn.execute_batch("ROLLBACK TO trace_raw_inspection; RELEASE trace_raw_inspection");
-    conn.flush_prepared_statement_cache();
-    let value = result?;
-    cleanup?;
-    Ok(value)
+    let query_only: bool = conn
+        .query_row("PRAGMA query_only", [], |r| r.get(0))
+        .unwrap_or(false);
+    if query_only {
+        conn.execute_batch("PRAGMA query_only=OFF;")?;
+    }
+    let res = (|| -> Result<T> {
+        conn.execute_batch("SAVEPOINT trace_raw_inspection")?;
+        let result = use_raw_relations(conn).and_then(|()| read());
+        let cleanup =
+            conn.execute_batch("ROLLBACK TO trace_raw_inspection; RELEASE trace_raw_inspection");
+        conn.flush_prepared_statement_cache();
+        let value = result?;
+        cleanup?;
+        Ok(value)
+    })();
+    if query_only {
+        let _ = conn.execute_batch("PRAGMA query_only=ON;");
+    }
+    res
 }
 
 fn project_call_ids(conn: &Connection) -> Result<()> {
@@ -380,7 +392,7 @@ FROM projected_calls p
 JOIN projected_call_provenance prov
   ON prov.caller_fn_id = p.caller_fn_id
  AND prov.callee_fn_id = p.callee_fn_id
- AND prov.call_site_id = p.call_site_id
+ AND prov.call_site_id IS p.call_site_id
  AND prov.resolution = p.resolution;
 DROP TABLE projected_calls;
 DROP TABLE projected_call_provenance;
@@ -390,15 +402,26 @@ UPDATE variables_data SET fn_id=(SELECT owner_fn_id FROM lambda_owners WHERE lam
 WHERE fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 -- A function location is a callable value, not an ownership fact. Preserve
 -- its node and flow without claiming that it points to the lexical parent.
-INSERT INTO strings
-SELECT coalesce(max(id),0)+1,'anonymous callable' FROM strings
-HAVING EXISTS (SELECT 1 FROM flow_nodes_data WHERE var_id IS NULL
-               AND fn_id IN (SELECT lambda_fn_id FROM lambda_owners));
-UPDATE flow_nodes_data SET label_id=(SELECT max(id) FROM strings) WHERE var_id IS NULL
- AND fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
-UPDATE flow_nodes_data SET fn_id=NULL WHERE var_id IS NULL
- AND fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
-UPDATE flow_nodes_data SET fn_id=(SELECT owner_fn_id FROM lambda_owners WHERE lambda_fn_id=fn_id)
+-- Scope the relabeling and unlinking to actual fn: location nodes; other nodes
+-- in the lambda (variables, call_target nodes) are remapped to the owner.
+INSERT INTO strings(id, text)
+SELECT (SELECT coalesce(max(id), 0) + 1 FROM strings), 'anonymous callable'
+WHERE NOT EXISTS (SELECT 1 FROM strings WHERE text = 'anonymous callable')
+  AND EXISTS (
+    SELECT 1 FROM flow_nodes_data n
+    WHERE n.fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
+      AND n.kind_id = (SELECT id FROM strings WHERE text = 'loc')
+      AND n.label_id IN (SELECT id FROM strings WHERE text LIKE 'fn:%')
+);
+UPDATE flow_nodes_data
+SET label_id = (SELECT max(id) FROM strings WHERE text = 'anonymous callable'),
+    fn_id = NULL
+WHERE fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
+  AND kind_id = (SELECT id FROM strings WHERE text = 'loc')
+  AND label_id IN (SELECT id FROM strings WHERE text LIKE 'fn:%');
+
+UPDATE flow_nodes_data
+SET fn_id = (SELECT owner_fn_id FROM lambda_owners WHERE lambda_fn_id = fn_id)
 WHERE fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 UPDATE call_sites_data SET caller_fn_id=(SELECT owner_fn_id FROM lambda_owners WHERE lambda_fn_id=caller_fn_id)
 WHERE caller_fn_id IN (SELECT lambda_fn_id FROM lambda_owners WHERE owner_fn_id IS NOT NULL);
@@ -894,5 +917,104 @@ mod tests {
             ),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn synthetic_edges_preserve_provenance_when_lambdas_present() {
+        let conn = complete_graph();
+        // Insert a synthetic IPC edge with call_site_id = NULL
+        let ipc: i64 = conn
+            .query_row("SELECT id FROM strings WHERE text = 'ipc'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO call_edges_data VALUES(200, NULL, 0, 3, ?1)",
+            [ipc],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM call_edges WHERE id = 200 AND call_site_id IS NULL"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM lambda_call_provenance WHERE edge_id = 200 AND entry_edge_id = 200"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn lambda_owned_call_targets_preserve_labels_and_remap_owner() {
+        let conn = complete_graph();
+        // Node 4 in complete_graph() is a loc node for Lambda 1.
+        // Add a call_target node inside Lambda 1 (fn_id = 1, call_site_id = 6).
+        let ct_kind: i64 = conn
+            .query_row(
+                "SELECT id FROM strings WHERE text = 'call_target'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let target_label: i64 = conn
+            .query_row("SELECT id FROM strings WHERE text = 'unknown()'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO flow_nodes_data(id, kind_id, label_id, detail_id, var_id, fn_id, call_site_id)
+             VALUES(50, ?1, ?2, 1, NULL, 1, 6)",
+            params![ct_kind, target_label],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+
+        // 1. loc node for lambda is relabeled "anonymous callable" and fn_id becomes NULL
+        let loc_label: String = conn
+            .query_row("SELECT label FROM flow_nodes WHERE id = 4", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(loc_label, "anonymous callable");
+        assert_eq!(
+            count(&conn, "SELECT fn_id IS NULL FROM flow_nodes WHERE id = 4"),
+            1
+        );
+
+        // 2. call_target node keeps its label ("unknown()") and its fn_id is remapped to owner (0)
+        let ct_label: String = conn
+            .query_row("SELECT label FROM flow_nodes WHERE id = 50", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ct_label, "unknown()");
+        let ct_fn: i64 = conn
+            .query_row("SELECT fn_id FROM flow_nodes WHERE id = 50", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ct_fn, 0, "call_target fn_id remapped to owner_fn_id");
+    }
+
+    #[test]
+    fn with_raw_relations_succeeds_under_query_only() {
+        let conn = complete_graph();
+        publish_lambda_free(&conn).unwrap();
+        conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        let count = with_raw_relations(&conn, || {
+            conn.query_row("SELECT count(*) FROM functions", [], |r| r.get::<_, i64>(0))
+                .map_err(Into::into)
+        })
+        .unwrap();
+        assert_eq!(count, 8);
+        assert!(conn
+            .query_row("PRAGMA query_only", [], |r| r.get::<_, bool>(0))
+            .unwrap());
     }
 }
