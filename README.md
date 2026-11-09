@@ -313,8 +313,7 @@ trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction dow
 | `--file <SUBSTR>` | File path substring to disambiguate same-name functions. |
 | `--line <N>` | A line inside the function of interest. |
 | `--depth <N>` | Maximum BFS depth (default 3). |
-| `--hide-lambdas` | Use the lambda-free projection on earlier snapshots with the PR views; redundant on v9. |
-| `--show-lambdas` | Inspect the complete graph, including lambda intermediates. Conflicts with `--hide-lambdas`. |
+| `--show-lambdas` | Inspect the complete graph, including lambda intermediates. |
 | `--direction` | `down` = callees (default), `up` = callers. |
 | `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
 | `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden, nodes left without any surviving edge are pruned. The start function (the root) is always kept even when it does not match, so the query anchor stays visible. |
@@ -360,8 +359,9 @@ existing public tables and views keep their master column layouts and expose
 the lambda-free graph; `raw_*` relations retain the complete analysis.
 Lambda-owned variables and flow ownership move to the enclosing non-lambda
 function. See the [projection contract](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views)
-for provenance, execution contexts, and raw merging. `--hide-lambdas` remains
-available for earlier snapshots with the PR views; legacy defaults are unchanged.
+for provenance, execution contexts, and raw merging. Existing v7/v8 databases
+retain their stored graph; re-export or re-merge to obtain the lambda-free
+public interface.
 
 Find all simple call paths (chains) between two functions no longer than `--depth`.
 

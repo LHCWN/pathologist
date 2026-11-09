@@ -2,23 +2,19 @@
 
 ## Lambda-free view review — 2026-11-06
 
-PR #263: an indirect site can enter several lambdas that share a visible
-callee. Callgraph traversal now sorts and deduplicates projected adjacency
-lists before BFS, using the same comparator as callchain traversal. The
-regression covers nonconsecutive duplicate neighbors, both storage layouts,
-text/JSON output, and distinct source columns. The raw graph's traversal
-order is unchanged. See the authoritative
-[view contract](SQLITE_SCHEMA.md#lambda-free-call-graph-views) for provenance
-row multiplicity and the lifecycle of stored view definitions.
+These are historical measurements of the SQL view prototype developed while
+reviewing PR #263, not benchmarks of the final v9 export implementation.
+The prototype's public view names and query-time projection are not shipped.
+The final implementation contracts paths once during export, publishes the
+existing public relation names, and retains the complete graph under `raw_*`.
+See the authoritative [projection contract](SQLITE_SCHEMA.md#lambda-free-call-graph-views).
 
-The recursive view now computes `(starting lambda, reachable lambda)` pairs
+The measured revision computed `(starting lambda, reachable lambda)` pairs
 before attaching original entering edges. For E entering edges, K mutually
-calling lambdas, and S distinct starting lambdas, this reduces recursive
-states from E×K to S×K. Inspection queries do not materialize that full view:
-they compute an equivalent walk from `call_edges` scoped to the queried root,
-so unrelated lambda components are not expanded. Large strongly connected
-components reachable from the root can still require quadratic closure state,
-and each query recomputes that closure.
+calling lambdas, and S distinct starting lambdas, this reduced recursive
+states from E×K to S×K. That closure strategy is used by the export-only
+temporary views. The timings below do not measure current export time,
+storage growth, or end-to-end inspection latency.
 
 ### Bounded synthetic comparison
 

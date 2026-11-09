@@ -40,6 +40,72 @@ const CHANGED: &[&str] = &[
     "merge_call_site_identities",
 ];
 
+// Export-only views over the complete graph. They are temporary and never
+// become a public schema or a compatibility obligation.
+const PROJECTION_VIEWS: &str = r#"
+CREATE TEMP VIEW _projection_functions AS
+SELECT id, name, file_id, line_start, line_end, linkage, signature,
+       is_defined, is_dep, is_weak, target_id
+FROM raw_functions WHERE instr(name, '::$lambda') = 0;
+
+-- Compute reachability once per distinct entering lambda, independently of
+-- how many visible callers enter it. UNION bounds cycles by lambda pairs.
+CREATE TEMP VIEW _projection_lambda_reachability AS
+WITH RECURSIVE paths(start_fn_id, lambda_fn_id) AS (
+    SELECT ce.callee_fn_id, ce.callee_fn_id
+    FROM raw_call_edges ce
+    JOIN _projection_functions caller ON caller.id = ce.caller_fn_id
+    LEFT JOIN _projection_functions callee ON callee.id = ce.callee_fn_id
+    WHERE callee.id IS NULL
+    UNION
+    SELECT p.start_fn_id, ce.callee_fn_id
+    FROM paths p JOIN raw_call_edges ce ON ce.caller_fn_id = p.lambda_fn_id
+    LEFT JOIN _projection_functions callee ON callee.id = ce.callee_fn_id
+    WHERE callee.id IS NULL
+)
+SELECT start_fn_id, lambda_fn_id FROM paths;
+
+-- Attach original entering-edge provenance only after the shared closure.
+CREATE TEMP VIEW _projection_lambda_callers AS
+SELECT ce.id AS entry_edge_id, ce.call_site_id, ce.caller_fn_id,
+       p.lambda_fn_id, ce.resolution
+FROM raw_call_edges ce
+JOIN _projection_functions caller ON caller.id = ce.caller_fn_id
+JOIN _projection_lambda_reachability p ON p.start_fn_id = ce.callee_fn_id;
+
+CREATE TEMP VIEW _projection_call_edges AS
+SELECT ce.id AS entry_edge_id, ce.call_site_id, ce.caller_fn_id, ce.callee_fn_id, ce.resolution
+FROM raw_call_edges ce
+JOIN _projection_functions caller ON caller.id = ce.caller_fn_id
+JOIN _projection_functions callee ON callee.id = ce.callee_fn_id
+UNION
+SELECT p.entry_edge_id, p.call_site_id, p.caller_fn_id, ce.callee_fn_id, p.resolution
+FROM _projection_lambda_callers p JOIN raw_call_edges ce ON ce.caller_fn_id = p.lambda_fn_id
+JOIN _projection_functions callee ON callee.id = ce.callee_fn_id;
+
+CREATE TEMP VIEW _projection_unresolved AS
+SELECT cs.id AS call_site_id, cs.caller_fn_id, cs.callee_text, cs.file_id, cs.line, cs.col
+FROM raw_call_sites cs JOIN _projection_functions caller ON caller.id = cs.caller_fn_id
+WHERE cs.is_direct = 0
+  AND NOT EXISTS (SELECT 1 FROM raw_call_edges ce WHERE ce.call_site_id = cs.id)
+UNION
+SELECT cs.id, p.caller_fn_id, cs.callee_text, cs.file_id, cs.line, cs.col
+FROM raw_call_sites cs JOIN _projection_lambda_callers p ON p.lambda_fn_id = cs.caller_fn_id
+WHERE cs.is_direct = 0
+  AND NOT EXISTS (SELECT 1 FROM raw_call_edges ce WHERE ce.call_site_id = cs.id);
+"#;
+
+fn drop_projection_views(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP VIEW _projection_unresolved;
+        DROP VIEW _projection_call_edges;
+        DROP VIEW _projection_lambda_callers;
+        DROP VIEW _projection_lambda_reachability;
+        DROP VIEW _projection_functions;",
+    )?;
+    Ok(())
+}
+
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -235,6 +301,7 @@ pub fn publish_lambda_free(conn: &Connection) -> Result<()> {
         |r| r.get(0),
     )?;
     preserve_raw(conn, has_lambdas)?;
+    conn.execute_batch(PROJECTION_VIEWS)?;
     conn.execute_batch(
         r#"
 CREATE TABLE lambda_owners (
@@ -251,13 +318,14 @@ CREATE TABLE lambda_unresolved_calls (
     call_site_id INTEGER, caller_fn_id INTEGER, callee_text TEXT,
     file_id INTEGER, line INTEGER, col INTEGER
 );
-INSERT INTO lambda_unresolved_calls SELECT * FROM unresolved_calls_no_lambdas;
+INSERT INTO lambda_unresolved_calls SELECT * FROM _projection_unresolved;
 "#,
     )?;
     if !has_lambdas {
         // No changed storage needs a second physical copy or a rewrite. This
         // also preserves ordinary edge IDs at the full SQLite integer range.
         conn.execute_batch("INSERT INTO lambda_call_provenance SELECT id,id FROM call_edges_data")?;
+        drop_projection_views(conn)?;
         return Ok(());
     }
     // Ownership is lexical, scoped to file and image, with the containing
@@ -279,7 +347,7 @@ SELECT id,owner FROM (
 -- Materialize before changing either endpoint relation. An entering edge can
 -- reach multiple leaves, so its ID is provenance, not a projected primary key.
 CREATE TEMP TABLE projected_calls AS
-SELECT p.*,CAST(NULL AS INTEGER) AS projected_id FROM call_edges_no_lambdas p;
+SELECT p.*,CAST(NULL AS INTEGER) AS projected_id FROM _projection_call_edges p;
 "#,
     )?;
     project_call_ids(conn)?;
@@ -312,10 +380,10 @@ UPDATE call_sites_data SET caller_fn_id=(SELECT owner_fn_id FROM lambda_owners W
 WHERE caller_fn_id IN (SELECT lambda_fn_id FROM lambda_owners WHERE owner_fn_id IS NOT NULL);
 -- File-scope lambdas have no lexical function. Use a recorded visible caller
 -- when available; otherwise their body sites exist only in the raw interface.
-UPDATE call_sites_data SET caller_fn_id=(SELECT min(caller_fn_id) FROM raw__lambda_callers p
+UPDATE call_sites_data SET caller_fn_id=(SELECT min(caller_fn_id) FROM _projection_lambda_callers p
                                         WHERE p.lambda_fn_id=call_sites_data.caller_fn_id)
 WHERE caller_fn_id IN (SELECT lambda_fn_id FROM lambda_owners WHERE owner_fn_id IS NULL)
-  AND EXISTS (SELECT 1 FROM raw__lambda_callers p WHERE p.lambda_fn_id=call_sites_data.caller_fn_id);
+  AND EXISTS (SELECT 1 FROM _projection_lambda_callers p WHERE p.lambda_fn_id=call_sites_data.caller_fn_id);
 DELETE FROM call_sites_data WHERE caller_fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 UPDATE flow_nodes_data SET call_site_id=NULL WHERE call_site_id IS NOT NULL
   AND call_site_id NOT IN (SELECT id FROM call_sites_data);
@@ -399,14 +467,6 @@ DELETE FROM functions WHERE id IN (SELECT lambda_fn_id FROM lambda_owners);
             ))?;
         }
     }
-    conn.execute_batch(
-        "DROP VIEW unresolved_calls_no_lambdas;
-        CREATE VIEW unresolved_calls_no_lambdas AS SELECT * FROM lambda_unresolved_calls;
-        DROP VIEW call_edges_no_lambdas;
-        CREATE VIEW call_edges_no_lambdas AS
-        SELECT p.entry_edge_id,e.call_site_id,e.caller_fn_id,e.callee_fn_id,e.resolution
-        FROM call_edges e JOIN lambda_call_provenance p ON p.edge_id=e.id;",
-    )?;
     // Text IDs remain stable. Strip only reserved generated name segments;
     // source-level lambda expressions and ordinary strings are retained.
     let segment = Regex::new(r"::\$lambda[0-9]+:[0-9]+")?;
@@ -418,6 +478,7 @@ DELETE FROM functions WHERE id IN (SELECT lambda_fn_id FROM lambda_owners);
     for (id, text) in strings {
         update.execute(params![id, segment.replace_all(&text, "").as_ref()])?;
     }
+    drop_projection_views(conn)?;
     Ok(())
 }
 
@@ -648,6 +709,14 @@ mod tests {
             );
             assert_eq!(rows(&format!("raw_{name}")), raw_rows[i], "complete {name}");
         }
+        assert_eq!(count(&conn,"SELECT count(*) FROM sqlite_schema WHERE name GLOB '*no_lambdas*' OR name GLOB '_projection_*'"),0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM sqlite_temp_schema WHERE name GLOB '_projection_*'"
+            ),
+            0
+        );
         assert_eq!(
             count(
                 &conn,

@@ -261,7 +261,7 @@ into its lexical parent's control flow, so lambda CFGs remain in `raw_cfg_*`.
 Public linking metadata excludes lambda function identities and retains
 visible ownership; full linking always uses the raw facts.
 
-### Complete graph and compatibility views
+### Complete graph and projection provenance
 
 Every original relation has a `raw_` counterpart, for example
 `raw_functions`, `raw_call_edges`, `raw_variables`, `raw_flow_nodes`,
@@ -274,28 +274,22 @@ Minimal/full exports and merged outputs share the same publication step.
 `trace-merge` reads raw relations when present, including when re-merging a
 merged output, so projection never changes linking inputs.
 
-The existing PR views remain compatible aliases:
-
-| Relation | Columns and meaning |
-|---|---|
-| `functions_no_lambdas` | Same columns and IDs as public `functions` |
-| `call_edges_no_lambdas` | `entry_edge_id`, `call_site_id`, `caller_fn_id`, `callee_fn_id`, `resolution`; entering-edge provenance from the complete graph |
-| `unresolved_calls_no_lambdas` | `call_site_id`, `caller_fn_id`, `callee_text`, `file_id`, `line`, `col`; unresolved indirect sites attached to visible callers through recorded paths |
-
 `lambda_unresolved_calls` stores unresolved-path provenance before lexical
-ownership is lifted. Thus an uninvoked lambda's unresolved site does not
-become an unresolved call in its parent. Shared lambdas may expose an
-unresolved site under multiple callers. Direct sites without edges are not
-unresolved leaves. Internal `_lambda_*` helpers have no consumer contract.
+ownership is lifted. Its columns are `call_site_id`, `caller_fn_id`,
+`callee_text`, `file_id`, `line`, and `col`. Thus an uninvoked lambda's
+unresolved site does not become an unresolved call in its parent. Shared
+lambdas may expose an unresolved site under multiple callers. Direct sites
+without edges are not unresolved leaves. Export-only projection views are
+temporary and are removed before publication; they are not public relations.
 
 The CLI uses the public graph by default on v9 snapshots, so
 `ScheduleAbilityTransaction → HandleAbilityTransaction` takes one visible hop
 without an option. Both callgraph and callchain accept `--show-lambdas` to
 inspect the complete graph in either direction and every output format.
-`--hide-lambdas` remains available for earlier snapshots with the PR views
-and is redundant on v9; the two options conflict. Legacy v7/v8 defaults are
-unchanged. The Rust helper `use_raw_relations` selects the complete relations
-on a read connection using temporary aliases; it does not modify the stored
+Existing v7/v8 databases retain their stored graph; re-export or re-merge
+to obtain the lambda-free public interface. The Rust helper `use_raw_relations`
+selects the complete relations on a read connection using temporary aliases;
+it does not modify the stored
 snapshot.
 
 Detailed value slicing reads the complete graph within a temporary scope, so

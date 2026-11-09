@@ -63,20 +63,12 @@ fn analyze_repo(repo: &std::path::Path, db: &std::path::Path) {
 }
 
 #[test]
-fn merged_database_exposes_lambda_free_views() {
+fn merged_database_exposes_lambda_free_public_relations() {
     let tmp = tempdir().unwrap();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/lambda_call_view");
     let input = tmp.path().join("input.db");
     analyze_repo(&fixture, &input);
-    // Also exercise merging an older input that lacks the additive views.
-    Connection::open(&input)
-        .unwrap()
-        .execute_batch(
-            "DROP VIEW unresolved_calls_no_lambdas; DROP VIEW call_edges_no_lambdas; \
-         DROP VIEW _lambda_callers; DROP VIEW _lambda_reachability; DROP VIEW functions_no_lambdas;",
-        )
-        .unwrap();
     let output = tmp.path().join("merged.db");
     merge_databases(
         &[input],
@@ -89,9 +81,9 @@ fn merged_database_exposes_lambda_free_views() {
     let conn = Connection::open(&output).unwrap();
     let count: i64 = conn
         .query_row(
-            "SELECT count(*) FROM call_edges_no_lambdas e \
-         JOIN functions_no_lambdas caller ON caller.id=e.caller_fn_id \
-         JOIN functions_no_lambdas callee ON callee.id=e.callee_fn_id \
+            "SELECT count(*) FROM call_edges e \
+         JOIN functions caller ON caller.id=e.caller_fn_id \
+         JOIN functions callee ON callee.id=e.callee_fn_id \
          WHERE caller.name='OHOS::UIAbilityThread::ScheduleAbilityTransaction' \
            AND callee.name='OHOS::UIAbilityThread::HandleAbilityTransaction'",
             [],
@@ -99,7 +91,7 @@ fn merged_database_exposes_lambda_free_views() {
         )
         .unwrap();
     assert_eq!(count, 1);
-    assert!(trace_db::table_exists(&conn, "unresolved_calls_no_lambdas").unwrap());
+    assert!(trace_db::table_exists(&conn, "lambda_unresolved_calls").unwrap());
     let lambdas: i64 = conn
         .query_row(
             "SELECT count(*) FROM raw_functions WHERE instr(name,'::$lambda')>0",
