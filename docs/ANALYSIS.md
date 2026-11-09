@@ -4339,7 +4339,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   the same either way. `auto *p` and `auto **p` need an
   initializer with at least as many pointer layers, and deduce nothing from
   one with fewer. Both `if (auto p = f())` and `if (auto p = f(); p)` are
-  covered.
+  covered. A parenthesized single-expression initializer (`auto self(shared_from_this());`,
+  `auto p(factory());`, `auto p(obj.get());`) uses the same deduction and
+  value flow as a copy initializer. For ambiguous function-declarator parses,
+  see [C++ parse-input normalization](#c-parse-input-normalization).
   `lock()` on a `weak_ptr<T>` and `promote()` on a `wptr<T>` whose body is
   not in the tree produce `shared_ptr<T>` / `sptr<T>` in the weak pointer's
   own scope (`OHOS::CameraStandard::wptr` promotes to
@@ -5189,6 +5192,33 @@ other presumed generated member is synthesized. Results describe only the
 explicit declarations; restoring the real dependency is necessary to index
 the missing semantics. Recovery reads only the unit's text, tree and LineMap,
 and uses source order, independently of job count and expansion-cache replay.
+
+**Parenthesized `auto` local initializers.** The grammar reads
+`auto self(shared_from_this());` as a function declaration, whose parameter
+type is `shared_from_this` and whose declarator is an abstract function.
+Lowering checks the apparent parameter type in the original scope using the
+type/value lookup described below, including type template parameters and
+names brought in by `using` declarations or directives. An unqualified
+template-id is classified by its template name, as a qualified one is. A
+single bare value name, or an apparent function call whose name is a known
+value, is reparsed with the initializer's outer parentheses changed to `=`
+and a space. A bare name that resolves to neither a value nor a type keeps
+the block-scope value assumption direct initialization already makes for
+`T w(E::kind);`; a call-shaped name that resolves to nothing keeps its
+function interpretation. Empty parameter lists, known parameter types and
+named parameter declarators keep their function interpretation. Recovery
+requires a complete, error-free declaration and retains the original byte
+offsets, LineMap and enclosing scope, using the same scratch-tree lifetime
+and relocation rules as callback recovery below. Recovery targets
+function-local declarations; namespace-scope spellings are left unchanged.
+Ordinary declaration lowering then deduces and copies the initializer value;
+the body walk visits its evaluated expressions once. Already parsed
+argument-list initializers (`auto self(this->shared_from_this());`, extra
+parentheses included) expose their one expression directly to the same
+deduction and flow path. The deduced class's constructor is not called with
+that expression as an argument. The type-template-parameter check applies to
+non-`auto` direct initialization too: `Gadget make(T);` inside
+`template<class T>` remains a declaration rather than defining an object.
 
 **Empty-parameter callback declarations (#219).** The C++ grammar can silently
 read `void post(void (*cb)());` as an initialized variable, and `void (*cb)();`

@@ -3,7 +3,7 @@
 // const twins, whose results disagree, as libstdc++ and libc++ do.
 namespace std {
 template <class T> class shared_ptr { public: T *operator->() const; };
-template <class T> class weak_ptr { public: shared_ptr<T> lock(); };
+template <class T> class weak_ptr { public: shared_ptr<T> lock() const; };
 template <class T> class enable_shared_from_this {
 public:
     shared_ptr<T> shared_from_this();
@@ -17,6 +17,38 @@ class Manager : public std::enable_shared_from_this<Manager> {
 public:
     void Handle();
     void ViaShared() { auto self = shared_from_this(); self->Handle(); }
+    void DirectInit() {
+        auto self(shared_from_this());
+        auto task = [self]() { self->Handle(); };
+        task();
+    }
+    void DirectInitExplicit() {
+        auto self(this->shared_from_this());
+        auto task = [self]() { self->Handle(); };
+        task();
+    }
+    void DirectInitGrouped() {
+        auto self((shared_from_this()));
+        auto task = [self]() { self->Handle(); };
+        task();
+    }
+    void DirectInitCopy() {
+        auto seed = shared_from_this();
+        auto self(seed);
+        auto task = [self]() { self->Handle(); };
+        task();
+    }
+    void DirectInitWeak() {
+        auto w(weak_from_this());
+        auto self(w.lock());
+        auto task = [self]() { self->Handle(); };
+        task();
+    }
+    void DirectInitReturn() {
+        auto self(Self());
+        auto task = [self]() { self->Handle(); };
+        task();
+    }
     void ViaWeak() { auto w = weak_from_this(); auto self = w.lock(); self->Handle(); }
     void InitCapture() {
         auto task = [self = shared_from_this()]() { self->Handle(); };
@@ -31,6 +63,12 @@ public:
         task();
     }
     std::shared_ptr<Manager> Self() { return shared_from_this(); }
+    void Prototypes() {
+        using Object = Manager;
+        auto make(Manager());
+        auto take(Object);
+        auto empty();
+    }
 };
 void Manager::Handle() {}
 
@@ -66,6 +104,12 @@ void Impostor::Handle() {}
 
 void drive(Manager *m, Derived *d, Impostor *i) {
     m->ViaShared();
+    m->DirectInit();
+    m->DirectInitExplicit();
+    m->DirectInitGrouped();
+    m->DirectInitCopy();
+    m->DirectInitWeak();
+    m->DirectInitReturn();
     m->ViaWeak();
     m->InitCapture();
     m->InitCaptureWeak();

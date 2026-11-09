@@ -16,6 +16,29 @@ collapse into the first. Re-index to pick up the new edges.
 See [Callables](docs/ANALYSIS.md#c-support-first-step);
 measurements in `docs/EVAL_REPORT.md` ("Immediately invoked lambdas").
 
+### Parenthesized `auto` local initializers
+
+`auto self(shared_from_this());` now deduces and copies the initializer's value
+like `auto self = shared_from_this();`, so the value flows into later uses such
+as lambda captures. The deduced class's constructor is not called with the
+expression as an argument. A declaration the grammar misreads as a function
+taking a function pointer is reparsed when its call-shaped apparent parameter
+type names a known value; type template parameters and imported names count
+as types, and a call-shaped name that resolves to neither stays a function.
+Real prototypes, known parameter types and named parameter declarators keep
+their function interpretation. A bare unresolved name keeps the block-scope
+value assumption direct initialization already makes for `T w(E::kind);`.
+Unqualified template-ids are recovered too (`auto w(Lookup<Tag>());`), and
+the type-template-parameter check also keeps non-`auto` direct initializers
+such as `Gadget make(T);` inside `template<class T>` declarations instead of
+object definitions. Explicit member and grouped spellings
+(`auto self(this->shared_from_this());`, `auto self((...));`) use the same
+path, and recovery retains the original byte offsets, LineMap and enclosing
+scope.
+
+See [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization)
+and [production evaluation](docs/EVAL_REPORT.md#parenthesized-auto-initializers--2026-11-09).
+
 ### Bridge IPC operations through `SendTransactCmd`
 
 OpenHarmony proxy methods that call `SendTransactCmd` now connect to the
