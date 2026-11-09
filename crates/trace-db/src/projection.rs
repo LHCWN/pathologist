@@ -46,7 +46,7 @@ const PROJECTION_VIEWS: &str = r#"
 CREATE TEMP VIEW _projection_functions AS
 SELECT id, name, file_id, line_start, line_end, linkage, signature,
        is_defined, is_dep, is_weak, target_id
-FROM raw_functions WHERE instr(name, '::$lambda') = 0;
+FROM raw_functions WHERE name NOT GLOB '*::$lambda[0-9]*:[0-9]*';
 
 -- Compute reachability once per distinct entering lambda, independently of
 -- how many visible callers enter it. UNION bounds cycles by lambda pairs.
@@ -309,7 +309,7 @@ pub fn publish_lambda_free(conn: &Connection) -> Result<()> {
         bail!("lambda-free projection has already been published");
     }
     let has_lambdas: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM functions WHERE instr(name,'::$lambda')>0)",
+        "SELECT EXISTS(SELECT 1 FROM functions WHERE name GLOB '*::$lambda[0-9]*:[0-9]*')",
         [],
         |r| r.get(0),
     )?;
@@ -355,7 +355,7 @@ SELECT id,owner FROM (
  FROM raw_functions l LEFT JOIN raw_functions f
    ON f.name=substr(l.name,1,instr(l.name,'::$lambda')-1)
   AND f.file_id=l.file_id AND f.target_id IS l.target_id
- WHERE instr(l.name,'::$lambda')>0
+ WHERE l.name GLOB '*::$lambda[0-9]*:[0-9]*'
 ) WHERE rank=1;
 
 -- Materialize before changing either endpoint relation. An entering edge can
@@ -518,7 +518,7 @@ DELETE FROM functions WHERE id IN (SELECT lambda_fn_id FROM lambda_owners);
     // source-level lambda expressions and ordinary strings are retained.
     let segment = Regex::new(r"::\$lambda[0-9]+:[0-9]+")?;
     let strings = conn
-        .prepare("SELECT id,text FROM strings WHERE instr(text,'::$lambda')>0")?
+        .prepare("SELECT id,text FROM strings WHERE text GLOB '*::$lambda[0-9]*:[0-9]*'")?
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut update = conn.prepare("UPDATE strings SET text=?2 WHERE id=?1")?;
@@ -767,14 +767,14 @@ mod tests {
         assert_eq!(
             count(
                 &conn,
-                "SELECT count(*) FROM functions WHERE instr(name,'::$lambda')>0"
+                "SELECT count(*) FROM functions WHERE name GLOB '*::$lambda[0-9]*:[0-9]*'"
             ),
             0
         );
         assert_eq!(
             count(
                 &conn,
-                "SELECT count(*) FROM strings WHERE instr(text,'::$lambda')>0"
+                "SELECT count(*) FROM strings WHERE text GLOB '*::$lambda[0-9]*:[0-9]*'"
             ),
             0
         );
@@ -1016,5 +1016,34 @@ mod tests {
         assert!(conn
             .query_row("PRAGMA query_only", [], |r| r.get::<_, bool>(0))
             .unwrap());
+    }
+
+    #[test]
+    fn functions_named_lambda_without_numeric_suffix_are_not_classified_as_lambdas() {
+        let conn = complete_graph();
+        // Add a function whose name contains ::$lambda but without digits:digits suffix.
+        conn.execute(
+            "INSERT INTO functions VALUES(20, 'MyClass::$lambda_helper', 0, 100, 110, 'external', 'void()', 1, 0, 0, NULL)",
+            [],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+
+        // 1. Function must remain in public functions table
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM functions WHERE name = 'MyClass::$lambda_helper'"
+            ),
+            1
+        );
+        // 2. Must not be in lambda_owners
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM lambda_owners WHERE lambda_fn_id = 20"
+            ),
+            0
+        );
     }
 }
