@@ -2422,7 +2422,31 @@ fn execution_context_survives_an_absent_callback_edge() {
     // This fixture deliberately removes a referenced edge while retaining
     // the independent context and provenance evidence.
     conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
-    assert!(conn.execute("DELETE FROM call_edges_data WHERE callee_fn_id IN (SELECT entry_fn_id FROM execution_contexts)", []).unwrap() > 0);
+    assert!(
+        conn.execute(
+            "DELETE FROM call_edges_data WHERE callee_fn_id IN (SELECT entry_fn_id FROM execution_contexts)",
+            [],
+        )
+        .unwrap()
+            > 0
+    );
+    let raw_is_table: bool = conn
+        .query_row(
+            "SELECT type = 'table' FROM sqlite_schema WHERE name = 'raw_call_edges_data'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if raw_is_table {
+        assert!(
+            conn.execute(
+                "DELETE FROM raw_call_edges_data WHERE callee_fn_id IN (SELECT entry_fn_id FROM execution_contexts)",
+                [],
+            )
+            .unwrap()
+                > 0
+        );
+    }
     trace_db::record_database_identity(&conn).unwrap();
     drop(conn);
 
