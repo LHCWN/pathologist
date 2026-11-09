@@ -245,6 +245,9 @@ struct LowerContext {
     handled_new_exprs: RefCell<HashSet<usize>>,
     /// Elided class expressions already constructed into an initializer subobject.
     handled_constructor_exprs: RefCell<HashSet<usize>>,
+    /// Source text of each lambda a macro expansion wrote, which is what tells
+    /// lambdas sharing that expansion's position apart.
+    macro_lambda_text: HashMap<FnId, Box<str>>,
     /// Cache for `resolve_callee_with_loads`: maps the `func` node id of a
     /// field-expression callee to the whole answer it gave.
     /// `emit_field_value_store` (via `resolve_callee_var`) and the later
@@ -4028,6 +4031,7 @@ fn lower_prepared_source(
         cpp_standard: pre.cpp_standard,
         handled_new_exprs: RefCell::new(HashSet::default()),
         handled_constructor_exprs: RefCell::new(HashSet::default()),
+        macro_lambda_text: HashMap::default(),
         callee_load_cache: RefCell::new(HashMap::default()),
         call_receiver_cache: RefCell::new(HashMap::default()),
         call_return_dst: RefCell::new(HashMap::default()),
@@ -4091,6 +4095,7 @@ fn lower_prepared_source(
     // Expression recovery finished with the AST walk; deferred references
     // already carry their complete spelling in pending_flow_origins.
     ctx.original_sources = HashMap::default();
+    ctx.macro_lambda_text = HashMap::default();
     ctx.handled_new_exprs.borrow_mut().clear();
     ctx.handled_constructor_exprs.borrow_mut().clear();
     ctx.callee_load_cache.borrow_mut().clear();
@@ -14880,10 +14885,13 @@ fn collect_call_at_node(
             }
         })
         .filter(|token| node_has_expansion_location(ctx, *token));
+    // Lowered ahead of the windows below: the body's sites and flows are the
+    // lambda's own operations, not this call's.
+    let invoked_lambda = lower_invoked_lambda(program, ctx, source, node);
     let first_site = program.symbols.call_sites.len();
     let first_flow = program.flow.len();
     let first_pending = ctx.pending.borrow().len();
-    collect_call_at_node_inner(program, ctx, source, node, caller);
+    collect_call_at_node_inner(program, ctx, source, node, caller, invoked_lambda);
     if program.symbols.call_sites[first_site..]
         .iter()
         .any(|site| site.receiver_class.is_some() && site.callee_fn_id.is_none())
@@ -15040,6 +15048,7 @@ fn collect_call_at_node_inner(
     source: &str,
     node: Node,
     caller: FnId,
+    invoked_lambda: Option<FnId>,
 ) {
     let return_dst = ctx
         .call_return_dst
@@ -15431,14 +15440,19 @@ fn collect_call_at_node_inner(
         }
     }
 
-    let (mut callee_name, mut is_direct, callee_var) =
-        resolve_callee_with_loads(program, ctx, source, func);
+    // Named as well as bound: a header's preamble unit drops its lambdas, so
+    // the site of a header body binds again by this name after merge.
+    let (mut callee_name, mut is_direct, callee_var) = match invoked_lambda {
+        Some(lambda) => (program.symbols.function(lambda).name.clone(), true, None),
+        None => resolve_callee_with_loads(program, ctx, source, func),
+    };
     // Macro-expansion artifacts (stringified log fragments and similar
     // token soup) surface as call sites whose "callee" text embeds string
     // literals; real callees are plain identifiers or field paths. Note
     // that whitespace is legitimate here — preprocessed text keeps token
-    // spacing (`tbl [ i ]->fn`) — so only quotes are rejected.
-    if callee_name.contains('"') {
+    // spacing (`tbl [ i ]->fn`) — so only quotes are rejected. A lambda's
+    // generated name is no spelling (`operator""_x::$lambda3:4`).
+    if invoked_lambda.is_none() && callee_name.contains('"') {
         return;
     }
     // Only bare identifiers and qualified names can fall back to direct calls.
@@ -15493,7 +15507,9 @@ fn collect_call_at_node_inner(
     // candidate so varargs declarations keep their targets. When several
     // same-arity overloads survive, rank them by argument/parameter types so
     // `f(1)` picks `f(int)` rather than emitting every overload.
-    let chosen: Vec<FnId> = if !ctx.is_cpp {
+    let chosen: Vec<FnId> = if let Some(lambda) = invoked_lambda {
+        vec![lambda]
+    } else if !ctx.is_cpp {
         if !is_direct || is_field_or_element_call {
             Vec::new()
         } else {
@@ -19644,6 +19660,25 @@ fn filter_targets_by_argc(
     }
 }
 
+/// The function of the lambda `call` invokes where it is written:
+/// `[&] { ... }()`, the expansion of an `IN_PROCESS_CALL`-style wrapper.
+fn lower_invoked_lambda(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    call: Node,
+) -> Option<FnId> {
+    if !ctx.is_cpp {
+        return None;
+    }
+    let lambda = call
+        .cached_field("function")
+        .map(peel_expression)
+        .filter(|callee| callee.cached_kind() == "lambda_expression")
+        .filter(|&lambda| !node_is_from_ignored_macro(ctx, lambda))?;
+    lower_lambda_expression(program, ctx, source, lambda)
+}
+
 fn lambda_is_mutable(source: &str, node: Node) -> bool {
     let body = node.cached_field("body");
     let end_byte = body.map_or(node.end_byte(), |b| b.start_byte());
@@ -19656,7 +19691,9 @@ fn lambda_is_mutable(source: &str, node: Node) -> bool {
 /// nested function so inner calls participate in the call graph. Repeated
 /// lowering of the same node reuses the first FnId; an entry merged from a
 /// header's own unit is not this unit's lowering of the node, and this unit
-/// reads the body with more declared than that unit did.
+/// reads the body with more declared than that unit did. Lambdas a macro
+/// expansion writes all sit at its invocation: each distinct body takes the
+/// next free column there, and equal bodies share one function.
 fn lower_lambda_expression(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -19668,14 +19705,22 @@ fn lower_lambda_expression(
         .current_fn
         .map(|f| program.symbols.function(f).name.clone())
         .unwrap_or_else(|| "<tu>".to_string());
-    let name = format!("{owner}::$lambda{}:{}", span.line, span.col);
-    if let Some(existing) = program
-        .symbols
-        .resolve_function_in_scope(&name, Some(ctx.current_file))
-        .filter(|&id| program.symbols.function(id).tu == Some(ctx.current_file))
-    {
-        return Some(existing);
-    }
+    let macro_text = node_has_expansion_location(ctx, node).then(|| node_text(source, &node));
+    let mut col = span.col;
+    let name = loop {
+        let name = format!("{owner}::$lambda{}:{col}", span.line);
+        let existing = program
+            .symbols
+            .resolve_function_in_scope(&name, Some(ctx.current_file))
+            .filter(|&id| program.symbols.function(id).tu == Some(ctx.current_file));
+        match existing {
+            None => break name,
+            Some(id) if ctx.macro_lambda_text.get(&id).map(|t| &**t) == macro_text => {
+                return Some(id);
+            }
+            Some(_) => col += 1,
+        }
+    };
     let provisional_id = program.symbols.alloc_fn_id();
     let provisional_start = (
         program.symbols.variables.len(),
@@ -19760,6 +19805,9 @@ fn lower_lambda_expression(
             .dedup
             .internal_definitions
             .insert(fn_id, Arc::from(&source[node.byte_range()]));
+    }
+    if let Some(text) = macro_text {
+        ctx.macro_lambda_text.insert(fn_id, text.into());
     }
     let saved_fn = ctx.current_fn;
     let saved_locals = ctx.locals.clone();
@@ -25508,6 +25556,11 @@ fn resolve_call_for_return(
     if is_member_call(program, ctx, source, call_node) {
         return Some(ResolvedCallReturn::Member);
     }
+    if let Some(lambda) = lower_invoked_lambda(program, ctx, source, call_node) {
+        return Some(ResolvedCallReturn::Direct(
+            program.symbols.function(lambda).name.clone(),
+        ));
+    }
     if let Some(callee_name) = resolve_direct_call(program, ctx, source, call_node) {
         return Some(ResolvedCallReturn::Direct(callee_name));
     }
@@ -31027,6 +31080,7 @@ mod qualified_variable_lookup_tests {
             cpp_standard: 201703,
             handled_new_exprs: RefCell::new(HashSet::default()),
             handled_constructor_exprs: RefCell::new(HashSet::default()),
+            macro_lambda_text: HashMap::default(),
             callee_load_cache: RefCell::new(HashMap::default()),
             call_receiver_cache: RefCell::new(HashMap::default()),
             call_return_dst: RefCell::new(HashMap::default()),

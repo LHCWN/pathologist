@@ -425,6 +425,17 @@ SET fn_id = (SELECT owner_fn_id FROM lambda_owners WHERE lambda_fn_id = fn_id)
 WHERE fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 UPDATE call_sites_data SET caller_fn_id=(SELECT owner_fn_id FROM lambda_owners WHERE lambda_fn_id=caller_fn_id)
 WHERE caller_fn_id IN (SELECT lambda_fn_id FROM lambda_owners WHERE owner_fn_id IS NOT NULL);
+-- A site that names a generated lambda invokes it where it is written. Stripping
+-- that name below would leave the owner's, reading as a call of the owner.
+INSERT INTO strings(id, text)
+SELECT (SELECT coalesce(max(id), 0) + 1 FROM strings), '<lambda>'
+WHERE NOT EXISTS (SELECT 1 FROM strings WHERE text = '<lambda>')
+  AND EXISTS (
+    SELECT 1 FROM call_sites_data cs JOIN strings t ON t.id = cs.callee_text_id
+    WHERE t.text GLOB '*::$lambda[0-9]*:[0-9]*'
+);
+UPDATE call_sites_data SET callee_text_id = (SELECT max(id) FROM strings WHERE text = '<lambda>')
+WHERE callee_text_id IN (SELECT id FROM strings WHERE text GLOB '*::$lambda[0-9]*:[0-9]*');
 -- File-scope lambdas have no lexical function. Use a recorded visible caller
 -- when available; otherwise their body sites exist only in the raw interface.
 UPDATE call_sites_data SET caller_fn_id=(SELECT min(caller_fn_id) FROM _projection_lambda_callers p

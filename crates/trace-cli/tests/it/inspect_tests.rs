@@ -25,9 +25,23 @@ fn build_and_export(name: &str) -> TempDb {
     export_tree(&fixture(name), name)
 }
 
+/// Stdout of a successful `trace inspect` on `db`.
+fn inspect_output(db: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_trace"))
+        .args(["inspect", db.to_str().unwrap()])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
 #[test]
 fn lambda_free_public_graph_and_cli_count_scheduled_callbacks_as_one_hop() {
-    let bin = env!("CARGO_BIN_EXE_trace");
     for full in [false, true] {
         let db = export_tree_with(&fixture("lambda_call_view"), "lambda_view", full);
         let conn = open_db(&db).unwrap();
@@ -43,19 +57,7 @@ fn lambda_free_public_graph_and_cli_count_scheduled_callbacks_as_one_hop() {
             )
             .unwrap();
         assert_eq!(count, 1, "one projected hop in full={full}");
-        let run = |args: &[&str]| {
-            let out = Command::new(bin)
-                .args(["inspect", db.to_str().unwrap()])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8(out.stdout).unwrap()
-        };
+        let run = |args: &[&str]| inspect_output(&db, args);
         let raw = run(&[
             "callchain",
             "--from",
@@ -130,6 +132,123 @@ fn lambda_free_public_graph_and_cli_count_scheduled_callbacks_as_one_hop() {
                 assert!(!graph.contains("$lambda"), "{graph}");
             }
         }
+    }
+}
+
+#[test]
+fn immediately_invoked_lambdas_contract_to_their_body_calls() {
+    for full in [false, true] {
+        let db = export_tree_with(&fixture("immediate_lambda"), "immediate_lambda", full);
+        let conn = open_db(&db).unwrap();
+        let edges = |prefix: &str, caller: &str| -> Vec<String> {
+            let sql = format!(
+                "SELECT DISTINCT callee.name FROM {prefix}call_edges e \
+                 JOIN {prefix}functions c ON c.id=e.caller_fn_id \
+                 JOIN {prefix}functions callee ON callee.id=e.callee_fn_id \
+                 WHERE c.name=?1 ORDER BY 1"
+            );
+            conn.prepare(&sql)
+                .unwrap()
+                .query_map([caller], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        for (caller, callees) in [
+            ("Start", &["CallStartAbilityInner"][..]),
+            ("WithLiteral", &["Leaf"]),
+            ("Parenthesized", &["First"]),
+            ("operator\"\"_kb", &["Leaf"]),
+            ("Both", &["First", "Second"]),
+            ("Nested", &["First", "Third"]),
+            ("Holder::Run", &["Holder::Keep"]),
+            ("PassesArgument", &["Sink"]),
+            ("UsesResult", &["Target"]),
+            ("PassesCallback", &["Target"]),
+            ("EmptyBody", &[]),
+            ("InHeader", &["HeaderLeaf"]),
+            ("InHeaderMacro", &["HeaderLeaf"]),
+            ("HeaderHolder::Run", &["HeaderLeaf"]),
+            ("NeverInvoked", &[]),
+            ("Unevaluated", &[]),
+        ] {
+            assert_eq!(edges("", caller), callees, "{caller} in full={full}");
+        }
+        // The complete graph keeps the entering edge.
+        assert_eq!(
+            edges("raw_", "Start"),
+            ["Start::$lambda22:12"],
+            "full={full}"
+        );
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT count(*) FROM raw_functions WHERE name GLOB 'InHeaderMacro::$lambda*'"),
+            1,
+            "a macro-written header lambda is one function, full={full}"
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM call_sites s JOIN functions f ON f.id=s.caller_fn_id \
+                 WHERE f.name='EmptyBody' AND s.callee_text='<lambda>' \
+                 AND NOT EXISTS (SELECT 1 FROM call_edges e WHERE e.call_site_id=s.id)"
+            ),
+            1,
+            "full={full}"
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM raw_call_edges e \
+                 JOIN raw_functions c ON c.id=e.caller_fn_id \
+                 JOIN raw_functions t ON t.id=e.callee_fn_id \
+                 WHERE c.name GLOB '<tu>::$lambda*' AND t.name='FileScopeLeaf'"
+            ),
+            1,
+            "full={full}"
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM raw_call_sites WHERE callee_text LIKE '[%'"),
+            0,
+            "no site keeps a lambda's source as its callee, full={full}"
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM lambda_unresolved_calls l \
+                 JOIN functions f ON f.id=l.caller_fn_id WHERE f.name='WithLiteral'"
+            ),
+            0,
+            "full={full}"
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM functions WHERE name LIKE '%$lambda%'"),
+            0,
+            "full={full}"
+        );
+        // An owner's name would read as the function calling itself.
+        let start_sites = common::text_rows(
+            &conn,
+            "SELECT DISTINCT s.callee_text FROM call_edges e \
+             JOIN call_sites s ON s.id=e.call_site_id \
+             JOIN functions c ON c.id=e.caller_fn_id WHERE c.name='Start'",
+        );
+        assert_eq!(start_sites, [["Text(\"<lambda>\")"]], "full={full}");
+
+        let out = inspect_output(
+            &db,
+            &[
+                "callchain",
+                "--from",
+                "Start",
+                "--to",
+                "CallStartAbilityInner",
+                "--depth",
+                "1",
+            ],
+        );
+        assert!(
+            !out.contains("no call chain found") && !out.contains("$lambda"),
+            "{out}"
+        );
     }
 }
 

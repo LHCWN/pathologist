@@ -1,5 +1,31 @@
 # Evaluation Report
 
+## Immediately invoked lambdas — 2026-11-09
+
+Issue #268, measured with `scripts/eval_check.py` on the pinned corpora, the
+patched binary against its parent `d1679a2`. Default exports throughout.
+
+| Corpus | Raw edges | Public edges | Unresolved lambda-path rows | `<lambda>` sites | Lambda-source sites |
+|--------|-----------|--------------|-----------------------------|------------------|---------------------|
+| HDF | 78796 → 78796 | 78613 → 78613 | 1418 → 1418 | 0 | 0 → 0 |
+| HiView | 39334 → 39335 | 38723 → 38726 | 1386 → 1385 | 1 | 1 → 0 |
+| Camera | 116344 → 116364 | 114618 → 114648 | 8352 → 8348 | 20 | 4 → 0 |
+| Ability runtime | 382108 → 382403 | 372677 → 373780 | 13214 → 12956 | 293 | 291 → 0 |
+
+Every immediately invoked lambda's site has an edge in `raw_call_edges`. In the
+public graph 4 Ability runtime sites have none, because those lambdas reach no
+visible callee. A comparison of public caller/callee pairs
+gained 791 in Ability runtime, 23 in Camera and 3 in HiView, and lost none.
+`ImplicitStartAbility -> CallStartAbilityInner` is present, and the six
+`IN_PROCESS_CALL` sites of `implicit_start_processor.cpp` the issue lists each
+have one edge. The `<lambda>` sites beyond the old lambda-source count (2 in Ability runtime, 16
+in Camera) had no call site at all on the parent.
+
+The same run on `d1679a2` already fails 20 expectations in
+`scripts/eval_expected.json`, none of them moved into failure by this change;
+those counts are not re-captured here. The template-syntax probe now excludes
+the `<lambda>` callee text, which is not a template spelling.
+
 ## Lambda-free view review — 2026-11-06
 
 These are historical measurements of the SQL view prototype developed while

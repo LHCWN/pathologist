@@ -4,6 +4,18 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Resolve immediately invoked lambdas (#268)
+
+A lambda invoked where it is written, every `IN_PROCESS_CALL(...)` expansion
+included, now has a direct edge to its body, so the calls in that body reach
+the public call graph through the enclosing function. Previously the site
+stayed unresolved with the lambda's source as its callee, or disappeared when
+that source held a string literal. Lambdas from one macro expansion no longer
+collapse into the first. Re-index to pick up the new edges.
+
+See [Callables](docs/ANALYSIS.md#c-support-first-step);
+measurements in `docs/EVAL_REPORT.md` ("Immediately invoked lambdas").
+
 ### Bridge IPC operations through `SendTransactCmd`
 
 OpenHarmony proxy methods that call `SendTransactCmd` now connect to the
