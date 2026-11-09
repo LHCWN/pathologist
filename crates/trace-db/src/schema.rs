@@ -4,9 +4,11 @@
 // table presence alone does not imply populated data (notably merge outputs).
 // Incompatible layouts or meanings require a version bump. See
 // docs/SQLITE_SCHEMA.md, "Version and capability contract".
-pub const SCHEMA_VERSION: i64 = 8;
+// V9 keeps the compact v8 storage DDL and master column layouts; the final
+// publication step changes the public graph's meaning and retains raw_*.
+pub const SCHEMA_VERSION: i64 = 9;
 /// Versions whose call-graph columns current consumers understand.
-pub const SUPPORTED_SCHEMA_VERSIONS: &[i64] = &[7, SCHEMA_VERSION];
+pub const SUPPORTED_SCHEMA_VERSIONS: &[i64] = &[7, 8, SCHEMA_VERSION];
 
 /// Optional identity of an immutable analysis snapshot; stored by current
 /// exporters and computed read-only for earlier databases.

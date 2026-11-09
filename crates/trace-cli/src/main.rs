@@ -183,6 +183,9 @@ enum InspectCommands {
     ///
     /// `--direction down` follows callees, `up` follows callers.
     Callgraph {
+        /// Inspect the complete graph, including synthetic lambda functions.
+        #[arg(long)]
+        show_lambdas: bool,
         /// File path substring (e.g. basename) locating the start function.
         #[arg(long)]
         file: String,
@@ -263,6 +266,9 @@ enum InspectCommands {
     /// Call chains (paths) between two functions no longer than depth.
     #[command(alias = "chains")]
     Callchain {
+        /// Inspect the complete graph, including synthetic lambda functions.
+        #[arg(long)]
+        show_lambdas: bool,
         /// Start function name, C++ qualified suffix, or FILE:LINE (e.g. `main` or `main.c:10`).
         #[arg(long)]
         from: Option<String>,
@@ -954,6 +960,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             }
         }
         InspectCommands::Callgraph {
+            show_lambdas,
             file,
             line,
             depth,
@@ -961,6 +968,9 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             format,
             callgraph_filter,
         } => {
+            if show_lambdas {
+                trace_db::use_raw_relations(&conn)?;
+            }
             let dir = trace_db::Direction::parse(&direction)?;
             if depth == 0 {
                 anyhow::bail!("depth must be >= 1");
@@ -1120,6 +1130,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             print!("{}", trace_db::render_slice(&slice, format.to_render())?);
         }
         InspectCommands::Callchain {
+            show_lambdas,
             from,
             to,
             from_file,
@@ -1132,6 +1143,9 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             format,
             callgraph_filter,
         } => {
+            if show_lambdas {
+                trace_db::use_raw_relations(&conn)?;
+            }
             let dir = trace_db::Direction::parse(&direction)?;
             let start = trace_db::resolve_function_target(
                 &conn,

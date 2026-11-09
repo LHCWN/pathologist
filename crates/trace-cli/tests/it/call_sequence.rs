@@ -357,6 +357,21 @@ fn export_writes_every_graph_and_marks_the_capability() {
     assert_eq!(sequencing_marker(&db), serde_json::json!(true));
     let conn = rusqlite::Connection::open(db.path()).unwrap();
     let graphs: Vec<_> = program.cfgs.values().flatten().collect();
+    let public_graphs = graphs
+        .iter()
+        .filter(|g| {
+            !program
+                .symbols
+                .function(g.function)
+                .name
+                .contains("::$lambda")
+        })
+        .count();
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_functions"),
+        public_graphs as i64
+    );
+    trace_db::use_raw_relations(&conn).unwrap();
     let sum = |f: fn(&FunctionCfg) -> usize| graphs.iter().map(|g| f(g)).sum::<usize>() as i64;
     assert_eq!(
         count(&conn, "SELECT COUNT(*) FROM cfg_functions"),

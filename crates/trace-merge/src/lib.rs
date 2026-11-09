@@ -547,12 +547,15 @@ pub fn merge_databases<P: AsRef<Path>>(
             })?;
         if !trace_db::SUPPORTED_SCHEMA_VERSIONS.contains(&ver) {
             bail!(
-                "incompatible schema version in {}: database has version {}, expected 7 or {}; re-analyze the input with the current trace version",
+                "incompatible schema version in {}: database has version {}, expected 7, 8 or {}; re-analyze the input with the current trace version",
                 path.display(),
                 ver,
                 SCHEMA_VERSION
             );
         }
+        // Linking must consume the complete graph, never a previously
+        // contracted public projection (including on a merge of merges).
+        trace_db::use_raw_relations(&conn)?;
         // Preparing every ingestion query checks required tables and columns,
         // including empty inputs, before any output is created or replaced.
         require_reads(
@@ -1800,8 +1803,9 @@ pub fn merge_databases<P: AsRef<Path>>(
         verify_foreign_keys(&out_conn)?;
 
         // Build secondary indexes
-        trace_db::record_database_identity(&out_conn)?;
         out_conn.execute_batch(INDEXES_V8)?;
+        trace_db::publish_lambda_free(&out_conn)?;
+        trace_db::record_database_identity(&out_conn)?;
         out_conn.execute_batch("COMMIT;")?;
     }
 

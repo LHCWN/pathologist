@@ -1,6 +1,6 @@
 # SQLite schema
 
-Schema version: **v8** (readers also support v7)
+Schema version: **v9** (readers also support v7 and v8)
 
 Export creates secondary indexes after bulk insertion, within the same
 transaction and before publishing the database. Primary keys and uniqueness
@@ -23,6 +23,11 @@ The query columns and values are unchanged. Current readers support v7 tables
 and v8 views; consumers must accept either relation type. Older readers that
 require table objects for these relations must be updated for v8 exports. Re-analysis
 produces the smaller format; existing databases are not rewritten automatically.
+
+Version 9 preserves these column layouts but makes the public graph lambda-free
+and retains the complete graph in `raw_*` relations. See the authoritative
+[projection contract](#lambda-free-call-graph-views) for ownership, provenance,
+and merge semantics. Readers accept v7, v8 and v9.
 
 Consumers must check the tables or views and columns needed by their query, and account
 for database origin and export mode. A version number or an empty table alone
@@ -99,7 +104,7 @@ re-analysis supplies exact source-view and parameter-uncertainty metadata. Core 
 Merge metadata records `ipc_bridges_added` and `member_calls_added` counts.
 No variable bindings, points-to sets, or parcel/value flow are reconstructed.
 
-`trace-merge` accepts v7 and v8 and structurally validates the exact columns it reads
+`trace-merge` accepts v7, v8 and v9 and structurally validates the exact columns it reads
 in `files`, `link_targets`, `target_sources`, `target_dependencies`, `functions`,
 `call_sites`, `call_edges`, `diagnostics`, and `execution_contexts` and the
 `cfg_*` tables when present before creating or replacing output.
@@ -198,6 +203,115 @@ function IDs or new rows in `call_edges`.
 Copies with the same caller, callee text and full spelling path/line/column
 share one leaf, including shared-header sites copied from multiple merge
 inputs. The lowest call-site ID supplies that leaf's query-local ID.
+
+## Lambda-free call graph views
+
+Version 9 makes the existing public relations the lambda-free consumer
+interface. It preserves the master column names, order, types, nullability,
+keys, and table/view kinds for `analysis_run`, `files`, `functions`, `strings`,
+`linking_facts`, `flow_field_access`, `execution_contexts`, `link_*`, `call_*`,
+`flow_*`, and `variables`. Function IDs, variable IDs, flow-node IDs, source
+positions, and string IDs are retained. The meanings change as described
+below, so this requires a schema version bump rather than an additive v8
+capability. Existing databases are immutable; re-analyze or re-merge to obtain
+this interface.
+
+### Public graph and ownership
+
+`functions` excludes generated lambda functions. `call_edges` contracts each
+recorded path from a visible caller through one or more lambdas to the next
+visible callee. It stops at visible functions and does not infer invocation
+from lexical ownership: an uninvoked lambda creates no call edge. Nested and
+shared lambdas and cycles are supported. A contracted edge retains the first
+edge's call site and resolution, expressing reachability without implying
+synchronous execution.
+
+Ordinary edges retain their IDs. Contracted edge IDs are deterministic
+hashes of the original entering-edge ID and visible target identity; merged
+targets use their inherited stable function identities, so adding unrelated
+inputs does not renumber unchanged contracted edges. A hash collision rejects
+publication instead of assigning an order-dependent ID. Public edges are
+deduplicated on `(caller_fn_id, callee_fn_id, call_site_id, resolution)`;
+`lambda_call_provenance(edge_id, entry_edge_id)` maps every public edge to its
+original `raw_call_edges.id` entering edges. One entering edge can have
+multiple projected leaves, and a public edge reached via multiple entering
+edges links to each one. SQL row order is unspecified; use `ORDER BY`.
+
+`lambda_owners(lambda_fn_id, owner_fn_id)` records the enclosing non-lambda
+function in the same file and link image. File-scope lambdas have a NULL owner.
+Variables and flow nodes retain their IDs and edges; lambda-owned variables
+and variable-node ownership are attributed to that enclosing function (or
+file scope). Lambda parameters become locals, since they are not parameters
+of the enclosing function. Lambda signature bindings in `flow_parameters`
+and lambda-callee return provenance in `flow_return_calls` remain only in
+the raw interface; the underlying value-flow edges are retained. Callable
+locations and callback actuals retain their value-flow nodes, but their
+lambda function references become NULL rather than falsely referring to the
+lexical parent. `flow_field_access` retains its original nodes and fields.
+
+Body sites in `call_sites` use the lexical owner while keeping their source
+positions. A file-scope lambda's sites use a recorded visible caller when one
+exists; otherwise those sites and site-only provenance remain raw-only.
+This ownership is descriptive and does not establish call reachability.
+Generated `::$lambda<line>:<col>` name segments are removed from public
+dictionary text; raw strings retain the original text under the same IDs.
+Source-level lambda expressions are not removed from source expressions.
+
+`execution_contexts` projects a lambda entry to each next visible callee,
+retaining the scheduling model, entry site, receiver and concurrency evidence.
+An entry with no visible leaf remains raw-only. A lambda CFG cannot be spliced
+into its lexical parent's control flow, so lambda CFGs remain in `raw_cfg_*`.
+Public linking metadata excludes lambda function identities and retains
+visible ownership; full linking always uses the raw facts.
+
+### Complete graph and projection provenance
+
+Every original relation has a `raw_` counterpart, for example
+`raw_functions`, `raw_call_edges`, `raw_variables`, `raw_flow_nodes`,
+`raw_execution_contexts`, and `raw_link_method_facts`. These expose the complete
+analysis, including original lambda ownership, text, and provenance. Changed
+storage is copied before projection; unaffected raw relations alias shared
+storage. This adds disk and export work for affected relations, without
+copying the large unchanged flow-edge and operation-provenance tables.
+Minimal/full exports and merged outputs share the same publication step.
+`trace-merge` reads raw relations when present, including when re-merging a
+merged output, so projection never changes linking inputs.
+
+`lambda_unresolved_calls` stores unresolved-path provenance before lexical
+ownership is lifted. Its columns are `call_site_id`, `caller_fn_id`,
+`callee_text`, `file_id`, `line`, and `col`. Thus an uninvoked lambda's
+unresolved site does not become an unresolved call in its parent. Shared
+lambdas may expose an unresolved site under multiple callers. Direct sites
+without edges are not unresolved leaves. Export-only projection views are
+temporary and are removed before publication; they are not public relations.
+
+The CLI uses the public graph by default on v9 snapshots, so
+`ScheduleAbilityTransaction → HandleAbilityTransaction` takes one visible hop
+without an option. Both callgraph and callchain accept `--show-lambdas` to
+inspect the complete graph in either direction and every output format.
+Existing v7/v8 databases retain their stored graph; re-export or re-merge
+to obtain the lambda-free public interface. The Rust helper `use_raw_relations`
+selects the complete relations on a read connection using temporary aliases;
+it does not modify the stored
+snapshot.
+
+Detailed value slicing reads the complete graph within a temporary scope, so
+lambda return bindings and asynchronous execution boundaries remain accurate.
+Its result can name lambda functions; subsequent SQL queries still see the
+public projection. This does not change the stored public tables or views.
+
+Projection closure is computed at export time and public call edges are
+indexed before publication. A large reachable lambda component can still
+increase export work; the earlier [synthetic query measurements](EVAL_REPORT.md#lambda-free-view-review--2026-11-06)
+measure the old v8 view implementation, not production v9 export scalability.
+
+```sql
+SELECT caller.name, callee.name, e.resolution, e.call_site_id
+FROM call_edges e
+JOIN functions caller ON caller.id = e.caller_fn_id
+JOIN functions callee ON callee.id = e.callee_fn_id
+ORDER BY e.caller_fn_id, e.callee_fn_id, e.id;
+```
 
 ## Entity relationships
 
@@ -420,9 +534,10 @@ cost once, after writing its rows and before building secondary indexes;
 each merge pays it for every legacy input without a stored identity.
 Reading a valid stored identity only reads the singleton metadata row.
 
-Exports record the identity after writing every analysis row and before
-publication. Published databases are immutable: a tool deliberately changing
-their analysis rows must call `trace_db::record_database_identity` afterward.
+Exports record the identity after writing and publishing every analysis
+and projection row, before persisting the output file. Published databases
+are immutable: a tool deliberately changing their analysis rows must call
+`trace_db::record_database_identity` afterward.
 The merger trusts a valid stored identity, rejects unsupported algorithms or
 malformed digests, and computes the same digest read-only for older databases
 without the table or row. Its input duplicate detection uses this identity,

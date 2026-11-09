@@ -403,12 +403,21 @@ pub fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNod
 
 type Adjacency = FxHashMap<i64, Vec<(i64, &'static str, EdgeSite)>>;
 
+fn sort_call_adjacency(adj: &mut Adjacency) {
+    for list in adj.values_mut() {
+        list.sort_by(|a, b| {
+            (a.0, a.1, &a.2.path, a.2.line, a.2.col).cmp(&(b.0, b.1, &b.2.path, b.2.line, b.2.col))
+        });
+        list.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    }
+}
+
 fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
     let mut stmt = conn.prepare(
         "SELECT ce.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line, cs.col \
          FROM call_edges ce \
          LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
-         LEFT JOIN files p ON p.id = cs.file_id",
+         LEFT JOIN files p ON p.id = cs.file_id ORDER BY ce.id",
     )?;
     let mut adj: Adjacency = FxHashMap::default();
     let rows = stmt.query_map([], |row| {
@@ -448,6 +457,36 @@ fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
         }
     }
     Ok(adj)
+}
+
+/// Add one unresolved leaf to the callgraph adjacency, deduplicating shared
+/// merge inputs before assigning the synthetic negative node id.
+fn insert_unresolved(
+    labels: &mut FxHashMap<i64, GraphNode>,
+    adj: &mut Adjacency,
+    seen: &mut FxHashSet<(i64, String, String, i64, i64)>,
+    site_id: i64,
+    caller: i64,
+    name: String,
+    site: EdgeSite,
+) {
+    if !seen.insert((caller, name.clone(), site.path.clone(), site.line, site.col)) {
+        return;
+    }
+    let id = -site_id - 1;
+    labels.insert(
+        id,
+        GraphNode {
+            id,
+            label: name,
+            detail: "[unresolved]".into(),
+            kind: None,
+            loc_kind: None,
+        },
+    );
+    adj.entry(caller)
+        .or_default()
+        .push((id, "unresolved", site));
 }
 
 fn leak_resolution(resolution: &str) -> &'static str {
@@ -764,14 +803,22 @@ pub fn call_graph(
         bail!("function id {root_fn_id} not found in database");
     }
     let mut adj = load_call_adjacency(conn, dir)?;
+    let projected = crate::projection::public_projection_active(conn)?;
     if dir == Direction::Down {
-        let mut stmt = conn.prepare(
-            "SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
-             FROM call_sites cs JOIN files p ON p.id = cs.file_id \
-             WHERE cs.is_direct = 0 \
-               AND cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
-             ORDER BY cs.id",
-        )?;
+        // Stored callers preserve invocation reachability before lexical
+        // ownership was lifted. Legacy and raw graphs read their own sites.
+        let sql = if projected {
+            "SELECT cs.call_site_id,cs.caller_fn_id,cs.callee_text,p.path,cs.line,cs.col
+             FROM lambda_unresolved_calls cs JOIN files p ON p.id=cs.file_id
+             ORDER BY cs.call_site_id,cs.caller_fn_id"
+        } else {
+            "SELECT cs.id,cs.caller_fn_id,cs.callee_text,p.path,cs.line,cs.col
+             FROM call_sites cs JOIN files p ON p.id=cs.file_id
+             WHERE cs.is_direct=0
+               AND cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL)
+             ORDER BY cs.id"
+        };
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -787,26 +834,20 @@ pub fn call_graph(
         let mut seen = FxHashSet::default();
         for row in rows {
             let (site_id, caller, name, site) = row?;
-            // Merge inputs can each retain the same shared-header call.
-            // Match resolved-edge display deduplication before assigning IDs.
-            if !seen.insert((caller, name.clone(), site.path.clone(), site.line, site.col)) {
-                continue;
-            }
-            let id = -site_id - 1;
-            labels.insert(
-                id,
-                GraphNode {
-                    id,
-                    label: name,
-                    detail: "[unresolved]".into(),
-                    kind: None,
-                    loc_kind: None,
-                },
+            insert_unresolved(
+                &mut labels,
+                &mut adj,
+                &mut seen,
+                site_id,
+                caller,
+                name,
+                site,
             );
-            adj.entry(caller)
-                .or_default()
-                .push((id, "unresolved", site));
         }
+    }
+    // Different entering edges can project to the same visible edge.
+    if projected {
+        sort_call_adjacency(&mut adj);
     }
 
     let mut graph = QueryGraph::default();
@@ -985,12 +1026,7 @@ pub fn call_chains(
     }
 
     let mut adj = load_call_adjacency(conn, dir)?;
-    for list in adj.values_mut() {
-        list.sort_by(|a, b| {
-            (a.0, a.1, &a.2.path, a.2.line, a.2.col).cmp(&(b.0, b.1, &b.2.path, b.2.line, b.2.col))
-        });
-        list.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
-    }
+    sort_call_adjacency(&mut adj);
 
     let max_chains = match limit {
         Some(0) | None => usize::MAX,

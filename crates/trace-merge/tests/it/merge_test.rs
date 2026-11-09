@@ -63,6 +63,129 @@ fn analyze_repo(repo: &std::path::Path, db: &std::path::Path) {
 }
 
 #[test]
+fn merged_database_exposes_lambda_free_public_relations() {
+    let tmp = tempdir().unwrap();
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/lambda_call_view");
+    let input = tmp.path().join("input.db");
+    analyze_repo(&fixture, &input);
+    let output = tmp.path().join("merged.db");
+    merge_databases(
+        &[input],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let conn = Connection::open(&output).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM call_edges e \
+         JOIN functions caller ON caller.id=e.caller_fn_id \
+         JOIN functions callee ON callee.id=e.callee_fn_id \
+         WHERE caller.name='OHOS::UIAbilityThread::ScheduleAbilityTransaction' \
+           AND callee.name='OHOS::UIAbilityThread::HandleAbilityTransaction'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(trace_db::table_exists(&conn, "lambda_unresolved_calls").unwrap());
+    let lambdas: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM raw_functions WHERE instr(name,'::$lambda')>0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(lambdas > 0);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM functions WHERE instr(name,'::$lambda')>0",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    let projected_ids = |conn: &Connection| -> Vec<i64> {
+        conn.prepare("SELECT id FROM call_edges ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let ids = projected_ids(&conn);
+    let output_again = tmp.path().join("merged-again.db");
+    merge_databases(
+        &[output],
+        &MergeOptions {
+            output: output_again.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let again = Connection::open(&output_again).unwrap();
+    assert_eq!(
+        again
+            .query_row(
+                "SELECT count(*) FROM raw_functions WHERE instr(name,'::$lambda')>0",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        lambdas
+    );
+    assert_eq!(
+        projected_ids(&again),
+        ids,
+        "re-merging consumes the complete graph and preserves projected identities"
+    );
+    let extra = tmp.path().join("aaa-unrelated.db");
+    empty_merge_input(&extra);
+    Connection::open(&extra)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO files VALUES(1,'/unrelated.c','',0);
+         INSERT INTO functions VALUES(1,'unrelated',1,1,2,'external','void()',1,0,0,NULL);",
+        )
+        .unwrap();
+    let extended = tmp.path().join("extended.db");
+    merge_databases(
+        &[extra, output_again],
+        &MergeOptions {
+            output: extended.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        projected_ids(&Connection::open(extended).unwrap()),
+        ids,
+        "adding unrelated functions must preserve contracted edge IDs"
+    );
+    assert_eq!(
+        again
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn merge_keeps_unresolved_internal_calls_file_local() {
     let tmp = tempdir().unwrap();
     let mut inputs = Vec::new();
@@ -2296,7 +2419,34 @@ fn execution_context_survives_an_absent_callback_edge() {
     let input = tmp.path().join("input.db");
     analyze_repo(&repo, &input);
     let conn = Connection::open(&input).unwrap();
-    assert!(conn.execute("DELETE FROM call_edges_data WHERE callee_fn_id IN (SELECT entry_fn_id FROM execution_contexts)", []).unwrap() > 0);
+    // This fixture deliberately removes a referenced edge while retaining
+    // the independent context and provenance evidence.
+    conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    assert!(
+        conn.execute(
+            "DELETE FROM call_edges_data WHERE callee_fn_id IN (SELECT entry_fn_id FROM execution_contexts)",
+            [],
+        )
+        .unwrap()
+            > 0
+    );
+    let raw_is_table: bool = conn
+        .query_row(
+            "SELECT type = 'table' FROM sqlite_schema WHERE name = 'raw_call_edges_data'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if raw_is_table {
+        assert!(
+            conn.execute(
+                "DELETE FROM raw_call_edges_data WHERE callee_fn_id IN (SELECT entry_fn_id FROM execution_contexts)",
+                [],
+            )
+            .unwrap()
+                > 0
+        );
+    }
     trace_db::record_database_identity(&conn).unwrap();
     drop(conn);
 

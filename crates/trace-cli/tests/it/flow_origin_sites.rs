@@ -327,27 +327,19 @@ fn inspect_scopes_operations_by_the_enclosing_function() {
     );
 }
 
-/// A lambda is a definition of its own written inside another. A site on a
-/// line inside the lambda (not its first or last) is the lambda's, the
-/// innermost definition holding it; a site on a line both the lambda and its
-/// enclosing function hold at a boundary (a one-line lambda) has none.
+/// Public provenance retains body positions under the visible lexical owner.
 #[test]
-fn a_lambda_body_site_is_the_lambdas() {
+fn a_lambda_body_site_uses_the_visible_lexical_owner() {
     let src = "int g;\nint *gp;\nvoid Reset() {\n    int *local = &g;\n    \
                auto body = [&local]() {\n        gp = local;\n    };\n    body();\n    \
                auto once = [&local]() { gp = local; };\n    once();\n}\n";
     let dir = scratch(&[("main.cpp", src)]);
     let db = cli_analyze(dir.path(), &[]);
     let copies = sites(&db, "copy", "local", Some("gp"));
-    let [once, body] = <[Site; 2]>::try_from(copies).unwrap();
+    let [body, once] = <[Site; 2]>::try_from(copies).unwrap();
     assert_eq!((body.1.as_str(), body.2, body.3), ("main.cpp", 6, 9));
-    assert!(
-        body.0
-            .as_deref()
-            .is_some_and(|f| f.starts_with("Reset::$lambda")),
-        "{body:?}"
-    );
-    assert_eq!(once, (None, "main.cpp".into(), 9, 30));
+    assert_eq!(body.0.as_deref(), Some("Reset"));
+    assert_eq!(once, (Some("Reset".into()), "main.cpp".into(), 9, 30));
     assert_eq!(
         lines(sites(&db, "addr_of", "g", Some("local"))),
         vec![at(Some("Reset"), "main.cpp", 4)]
@@ -359,7 +351,7 @@ fn a_lambda_body_site_is_the_lambdas() {
     );
     assert_eq!(
         inspect_scope(&db, ("main.cpp", 4, 10), "down", (9, 30)),
-        None
+        once.0
     );
 }
 

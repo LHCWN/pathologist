@@ -81,7 +81,7 @@ target/release/trace-lsp --db analysis.db
 ```
 
 `trace-lsp` serves standard LSP incoming/outgoing call hierarchy over stdio.
-Default minimal exports work; no points-to export is needed. It opens schema v7 and v8
+Default minimal exports work; no points-to export is needed. It opens schema v7, v8 and v9
 read-only and leaves the analyzer and database format unchanged. See
 [LSP configuration and editor example](docs/LSP.md) for path mapping, range
 precision, snapshot behavior, and limitations.
@@ -313,6 +313,7 @@ trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction dow
 | `--file <SUBSTR>` | File path substring to disambiguate same-name functions. |
 | `--line <N>` | A line inside the function of interest. |
 | `--depth <N>` | Maximum BFS depth (default 3). |
+| `--show-lambdas` | Inspect the complete graph, including lambda intermediates. |
 | `--direction` | `down` = callees (default), `up` = callers. |
 | `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
 | `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden, nodes left without any surviving edge are pruned. The start function (the root) is always kept even when it does not match, so the query anchor stays visible. |
@@ -343,6 +344,24 @@ trace inspect /tmp/hdf.db callgraph --file allocator.c --line 44 --callgraph-fil
 ```
 
 ### `trace inspect callchain`
+
+New v9 databases count a path such as
+`ScheduleAbilityTransaction → lambda → HandleAbilityTransaction` as one
+visible hop by default:
+
+```bash
+trace inspect graph.db callchain --from ScheduleAbilityTransaction --to HandleAbilityTransaction --depth 1
+```
+
+Use `--show-lambdas` to inspect the complete graph. Both callchain and
+callgraph support it in either direction and every output format. The
+existing public tables and views keep their master column layouts and expose
+the lambda-free graph; `raw_*` relations retain the complete analysis.
+Lambda-owned variables and flow ownership move to the enclosing non-lambda
+function. See the [projection contract](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views)
+for provenance, execution contexts, and raw merging. Existing v7/v8 databases
+retain their stored graph; re-export or re-merge to obtain the lambda-free
+public interface.
 
 Find all simple call paths (chains) between two functions no longer than `--depth`.
 
@@ -824,7 +843,7 @@ indexes before that export phase. See the
 SQLite export also builds a function-range index for operation ownership lookup
 during source-level dataflow inspection; see the [inspection index rules](docs/SQLITE_SCHEMA.md#source-level-presentation-metadata-v7).
 
-Schema version: **v8**; readers also support v7. Repeated names, call and operation expressions, and graph text are stored once in a shared dictionary; the existing query columns and values are exposed through read-only views (see [compact text storage](docs/SQLITE_SCHEMA.md#compact-text-storage)). Each version is an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 and v8 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `flow_memory_access` records which memory cells each load and store reaches (its sites are that load's or store's `flow_origins` rows), or that none are recorded ([Memory access edges](docs/ANALYSIS.md#memory-access-edges)); an earlier v7 export has no such table and `trace-merge` output leaves it empty. `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table. The `cfg_*` tables hold the per-function call-order graphs `trace analyze --sequencing` records (empty otherwise; `analysis_run.options_json.call_sequencing` says which), read by `trace inspect sequence`; see [call sequencing tables](docs/SQLITE_SCHEMA.md#call-sequencing-tables).
+Schema version: **v9**; readers also support v7 and v8. Public relations are lambda-free, with complete analysis retained in `raw_*`; see the [projection contract](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views). Repeated names, call and operation expressions, and graph text are stored once in a shared dictionary; the existing query columns are exposed through read-only views (see [compact text storage](docs/SQLITE_SCHEMA.md#compact-text-storage)). Each version is an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7, v8 and v9 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `flow_memory_access` records which memory cells each load and store reaches (its sites are that load's or store's `flow_origins` rows), or that none are recorded ([Memory access edges](docs/ANALYSIS.md#memory-access-edges)); an earlier v7 export has no such table and `trace-merge` output leaves it empty. `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table. The `cfg_*` tables hold the per-function call-order graphs `trace analyze --sequencing` records (empty otherwise; `analysis_run.options_json.call_sequencing` says which), read by `trace inspect sequence`; see [call sequencing tables](docs/SQLITE_SCHEMA.md#call-sequencing-tables).
 
 ### Entity relationship (overview)
 
