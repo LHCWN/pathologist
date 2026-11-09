@@ -115,7 +115,7 @@ Register external function summaries and function models (`FnModelSet`, loaded v
 - Run: `cargo test --workspace`
 - Tests that need a scratch tree or a scratch SQLite file use `tempfile` (`tempfile::tempdir()`, or `common::TempDb` in `trace-cli` integration tests): the directory is removed when the value drops, on a failed assertion too, so no PID-suffixed paths and no manual `remove_dir_all`
 - C++ member-call result typing (receiver cv, ref-qualifiers, value categories, casts, lambdas, fields, smart pointers) is checked against a real compiler by `python3 scripts/cpp_overload_diff.py` (needs `clang++` and `target/release/trace`; exits 1 when the exported call edge is a different overload than the compiler picks, `--strict` also when the receiver is left untyped; `--volatile` adds the overload sets that differ in `volatile`, which the analyzer does not model)
-- Eval corpora (OpenHarmony trees pinned by revision in `scripts/eval_expected.json`): `python3 scripts/fetch_corpora.py` once, then `python3 scripts/eval_check.py`; re-capture the expectations when a change legitimately moves the counts
+- Eval corpora (OpenHarmony trees pinned by revision in `scripts/eval_expected.json`): `python3 scripts/fetch_corpora.py` once, then `python3 scripts/eval_check.py`; re-capture the expectations when a change legitimately moves the counts. Checks read the complete `raw_*` graph by default; `public_*` globals and sites or probes marked `"relations": "public"` read the [lambda-free projection](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views)
 
 ## Do not
 
