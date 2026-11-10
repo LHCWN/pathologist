@@ -2667,22 +2667,30 @@ recording, merging and text rules are in
   ([Value slice](#value-slice-inspect-slice)). Other arguments are the
   call's: its site and text.
 - **Enclosing function.** It follows from the site by the edge-scope rule
-  of the source-level view: the innermost defined function whose
-  `[line_start, line_end]` in the site's file holds the line. When several
-  definitions hold the line, the innermost one (every other one holding it
-  encloses its range) owns it if the line is strictly inside it, not its
-  first or last line: a statement on its own line in a lambda body or a
-  local class's method is that definition's. A line held by a single
-  definition is that definition's, its first and last lines included.
-  Otherwise the site has none: outside every function (a file-scope
-  initializer), and with no single innermost definition: a one-line lambda,
-  the line a lambda opens or closes on (the enclosing function's statement
-  may share it), or two definitions written on one line (a macro that
-  defines two functions). Lines are all the
-  export records of a definition's extent, so these stay unresolved rather
-  than guessed. The export adds no function column; the lookup uses
-  `idx_functions_file_range`. Query:
+  of the source-level view: the innermost defined function in the queried
+  relation whose `[line_start, line_end]` in the site's file holds the line.
+  When several definitions hold the line, the innermost one (every other one
+  holding it encloses its range) owns it if the line is strictly inside it,
+  not its first or last line: a statement on its own line in a local class's
+  method is that definition's. A line held by a single definition is that
+  definition's, its first and last lines included. Otherwise the site has
+  none: outside every function (a file-scope initializer), and with no single
+  innermost definition: a one-line method of a local class, the line such a
+  method opens or closes on (the enclosing function's statement may share
+  it), or two definitions written on one line (a macro that defines two
+  functions). Lines are all the export records of a definition's extent, so
+  these stay unresolved rather than guessed. The export adds no function
+  column; the lookup uses `idx_functions_file_range`. Query:
   [Source sites of a value move](SQLITE_SCHEMA.md#source-sites-of-a-value-move).
+
+  The public `functions` relation holds no lambda, so a lambda is not a
+  definition there. A statement on its own line in a lambda body belongs to
+  the visible function the lambda is written in, and so does a statement in a
+  one-line lambda. A statement in a file-scope lambda has no enclosing
+  function. `raw_functions` also holds the lambdas, so in the
+  complete graph they count as definitions: a statement on its own line in a
+  lambda body is that lambda's, and a one-line lambda or the line a lambda
+  opens or closes on has none.
 - **Lowered operations only.** Edges with no statement of their own have no
   rows: `points_to`, `call_arg`, `terminates`, `dlsym`, and parameter copies
   the solver wires at a resolved call. Calls are located by `call_sites`

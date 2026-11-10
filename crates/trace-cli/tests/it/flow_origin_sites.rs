@@ -271,7 +271,7 @@ fn shared_header_statements_moving_the_same_value_keep_their_own_sites() {
 /// The function `trace inspect dataflow` scopes the edge at `at` (line,
 /// column) to, from a slice at `file:line:col` in `direction`; `None` when
 /// the edge's scope is no function.
-fn inspect_scope(
+pub(crate) fn inspect_scope(
     db: &TempDb,
     (file, line, col): (&str, i64, i64),
     direction: &str,

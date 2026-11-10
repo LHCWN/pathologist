@@ -1800,11 +1800,11 @@ pub fn merge_databases<P: AsRef<Path>>(
         }
 
         trace_db::write_linking_facts(&out_conn, &linking_facts, &mut strings)?;
-        verify_foreign_keys(&out_conn)?;
+        trace_db::verify_foreign_keys(&out_conn)?;
 
         // Build secondary indexes
         out_conn.execute_batch(INDEXES_V8)?;
-        trace_db::publish_lambda_free(&out_conn)?;
+        trace_db::publish_verified(&out_conn)?;
         trace_db::record_database_identity(&out_conn)?;
         out_conn.execute_batch("COMMIT;")?;
     }
@@ -1819,32 +1819,6 @@ pub fn merge_databases<P: AsRef<Path>>(
         })?;
 
     Ok(report)
-}
-
-fn verify_foreign_keys(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
-    let violations: Vec<String> = stmt
-        .query_map([], |row| {
-            // SQLite reports NULL instead of a rowid for WITHOUT ROWID tables.
-            let rowid = row
-                .get::<_, Option<i64>>(1)?
-                .map_or_else(|| "NULL".to_owned(), |id| id.to_string());
-            Ok(format!(
-                "table: {}, rowid: {}, parent: {}, fkid: {}",
-                row.get::<_, String>(0)?,
-                rowid,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    if !violations.is_empty() {
-        bail!(
-            "foreign key violation in merged database:\n  {}",
-            violations.join("\n  ")
-        );
-    }
-    Ok(())
 }
 
 fn chrono_lite_now() -> String {
@@ -1863,17 +1837,16 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         conn.execute_batch(TABLES_V8).unwrap();
-        verify_foreign_keys(&conn).unwrap();
+        trace_db::verify_foreign_keys(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO functions(id,name,file_id,line_start,line_end,linkage,signature,is_defined)
              VALUES(4,'f',999,1,1,'external','f()',1);
              INSERT INTO target_sources VALUES(2,7);",
         ).unwrap();
-        let error = verify_foreign_keys(&conn).unwrap_err().to_string();
-        assert!(
-            error.starts_with("foreign key violation in merged database:"),
-            "{error}"
-        );
+        let error = trace_db::verify_foreign_keys(&conn)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("foreign key violation:"), "{error}");
         assert!(
             error.contains("table: functions, rowid: 4, parent: files"),
             "{error}"

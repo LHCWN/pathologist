@@ -85,7 +85,7 @@ enum Commands {
         /// Abort the whole analyze process after N seconds (watchdog).
         #[arg(long)]
         timeout_secs: Option<u64>,
-        /// Include points-to debug table in output (also retains points-to in memory during analysis).
+        /// Include points-to debug table and its locations in output (also retains points-to in memory during analysis).
         #[arg(long)]
         debug_points_to: bool,
         /// Disable IPC proxy/stub bridge edge detection (enabled by default).

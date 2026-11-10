@@ -15,6 +15,7 @@ const CHANGED: &[&str] = &[
     "variables_data",
     "call_sites_data",
     "call_edges_data",
+    "locations",
     "flow_nodes_data",
     "flow_parameters_data",
     "flow_return_calls",
@@ -42,6 +43,7 @@ const CHANGED: &[&str] = &[
 ];
 
 const LAMBDA_NAME: &str = "*::$lambda[0-9]*:[0-9]*";
+const ANONYMOUS_CALLABLE: &str = "anonymous callable";
 
 /// Tables publication rewrites in place and never removes a row from, with the
 /// columns it changes. Their `raw_*` view reads one table and overlays those
@@ -51,6 +53,7 @@ const LAMBDA_NAME: &str = "*::$lambda[0-9]*:[0-9]*";
 /// a join inside the view would also stop SQLite flattening it.
 const IN_PLACE: &[(&str, &[&str])] = &[
     ("strings", &["text"]),
+    ("locations", &["desc"]),
     ("variables_data", &["kind", "fn_id"]),
     ("flow_nodes_data", &["label_id", "fn_id", "call_site_id"]),
     ("link_dispatch_queries", &["callee_fn_id"]),
@@ -334,6 +337,52 @@ fn drop_unchanged_preimages(conn: &Connection, table: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fail on any reference to a missing row, except to `exempt_parent`.
+fn verify_references(conn: &Connection, exempt_parent: &str) -> Result<()> {
+    let violations: Vec<String> = conn
+        .prepare(
+            "SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check WHERE parent <> ?1",
+        )?
+        .query_map([exempt_parent], |row| {
+            // SQLite reports NULL instead of a rowid for WITHOUT ROWID tables.
+            let rowid = row
+                .get::<_, Option<i64>>(1)?
+                .map_or_else(|| "NULL".to_owned(), |id| id.to_string());
+            Ok(format!(
+                "table: {}, rowid: {rowid}, parent: {}, fkid: {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if !violations.is_empty() {
+        bail!("foreign key violation:\n  {}", violations.join("\n  "));
+    }
+    Ok(())
+}
+
+pub fn verify_foreign_keys(conn: &Connection) -> Result<()> {
+    verify_references(conn, "")
+}
+
+/// Publish, then verify what publication left: it runs with foreign keys off
+/// and rewrites or removes referenced rows. Pre-images declare no foreign keys,
+/// so verifying the complete graph takes a check before this one. Rules:
+/// docs/SQLITE_SCHEMA.md, "Complete graph and projection provenance".
+pub fn publish_verified(conn: &Connection) -> Result<()> {
+    publish_lambda_free(conn)?;
+    let rewrote: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM lambda_owners)", [], |r| {
+        r.get(0)
+    })?;
+    if !rewrote {
+        return Ok(());
+    }
+    let no_types: bool =
+        conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM types)", [], |r| r.get(0))?;
+    verify_references(conn, if no_types { "types" } else { "" })
+}
+
 /// Select the complete stored graph on a read connection, including linking
 /// metadata. Temporary aliases leave the immutable snapshot unchanged. Legacy
 /// snapshots already expose their complete graph under the public names.
@@ -465,7 +514,8 @@ WHERE cs.is_direct = 0
 /// Must run once, inside the export transaction, after all graph/link facts
 /// and indexes have been written and before recording the database identity.
 /// Requires current compact storage and the producer's bulk-load setting
-/// `PRAGMA foreign_keys=OFF`; publication can replace referenced rows.
+/// `PRAGMA foreign_keys=OFF`; publication can replace referenced rows, so
+/// producers call it through [`publish_verified`].
 pub fn publish_lambda_free(conn: &Connection) -> Result<()> {
     if crate::table_exists(conn, "raw_functions")? {
         bail!("lambda-free projection has already been published");
@@ -657,8 +707,8 @@ WHERE fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 -- Scope the relabeling and unlinking to actual fn: location nodes; other nodes
 -- in the lambda (variables, call_target nodes) are remapped to the owner.
 INSERT INTO strings(id, text)
-SELECT (SELECT coalesce(max(id), 0) + 1 FROM strings), 'anonymous callable'
-WHERE NOT EXISTS (SELECT 1 FROM strings WHERE text = 'anonymous callable')
+SELECT (SELECT coalesce(max(id), 0) + 1 FROM strings), '{ANONYMOUS_CALLABLE}'
+WHERE NOT EXISTS (SELECT 1 FROM strings WHERE text = '{ANONYMOUS_CALLABLE}')
   AND EXISTS (
     SELECT 1 FROM flow_nodes_data n
     WHERE n.fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
@@ -666,11 +716,15 @@ WHERE NOT EXISTS (SELECT 1 FROM strings WHERE text = 'anonymous callable')
       AND n.label_id IN (SELECT id FROM strings WHERE text LIKE 'fn:%')
 );
 UPDATE flow_nodes_data
-SET label_id = (SELECT max(id) FROM strings WHERE text = 'anonymous callable'),
+SET label_id = (SELECT max(id) FROM strings WHERE text = '{ANONYMOUS_CALLABLE}'),
     fn_id = NULL
 WHERE fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
   AND kind_id = (SELECT id FROM strings WHERE text = 'loc')
   AND label_id IN (SELECT id FROM strings WHERE text LIKE 'fn:%');
+-- Only a name ending at the generated segment is the lambda itself.
+UPDATE locations SET desc = '{ANONYMOUS_CALLABLE}'
+WHERE kind = 'Function' AND desc GLOB '{LAMBDA_NAME}'
+  AND rtrim(desc, '0123456789:') GLOB '*::$lambda';
 
 UPDATE flow_nodes_data
 SET fn_id = (SELECT owner_fn_id FROM lambda_owners WHERE lambda_fn_id = fn_id)
@@ -760,20 +814,27 @@ DELETE FROM functions WHERE id IN (SELECT lambda_fn_id FROM lambda_owners);
             ))?;
         }
     }
-    // Text IDs remain stable. Strip only reserved generated name segments;
+    // IDs remain stable. Strip only reserved generated name segments;
     // source-level lambda expressions and ordinary strings are retained.
     let segment = Regex::new(r"::\$lambda[0-9]+:[0-9]+")?;
-    let strings = conn
-        .prepare(&format!(
-            "SELECT id,text FROM strings WHERE text GLOB '{LAMBDA_NAME}'"
-        ))?
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut update = conn.prepare("UPDATE strings SET text=?2 WHERE id=?1")?;
-    for (id, text) in strings {
-        update.execute(params![id, segment.replace_all(&text, "").as_ref()])?;
+    for (table, column, spelled_in_source) in [
+        // A string literal's location label is the program's own text too.
+        ("strings", "text", "AND text NOT GLOB 'string:*'"),
+        // A string literal's description is the program's own text.
+        ("locations", "desc", "AND kind <> 'StringLit'"),
+    ] {
+        let rows = conn
+            .prepare(&format!(
+                "SELECT id,{column} FROM {table}
+                 WHERE {column} GLOB '{LAMBDA_NAME}' {spelled_in_source}"
+            ))?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut update = conn.prepare(&format!("UPDATE {table} SET {column}=?2 WHERE id=?1"))?;
+        for (id, text) in rows {
+            update.execute(params![id, segment.replace_all(&text, "").as_ref()])?;
+        }
     }
-    drop(update);
     for table in CHANGED {
         for event in ["update", "delete", "insert"] {
             let trigger = quote(&capture_trigger(event, table));
@@ -787,6 +848,62 @@ DELETE FROM functions WHERE id IN (SELECT lambda_fn_id FROM lambda_owners);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_lambda(extra: &str) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        conn.execute_batch(crate::SCHEMA_V8).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO files VALUES(0,'/src/a.cpp','',0);
+             INSERT INTO strings(id,text) VALUES(50,'x');
+             INSERT INTO functions(id,name,file_id,line_start,line_end,linkage,signature,is_defined)
+             VALUES(1,'f',0,1,3,'external','f()',1),
+                   (2,'f::$lambda2:1',0,2,2,'internal','()',1);
+             {extra}"
+        ))
+        .unwrap();
+        conn
+    }
+
+    const DANGLING_TYPE: &str =
+        "INSERT INTO variables_data(id,name_id,kind,fn_id,type_id,file_id,line)
+        VALUES(0,50,'local',1,7,0,1);";
+
+    #[test]
+    fn a_dangling_reference_left_by_publication_fails_verification() {
+        // Publication removes the lambda and does not know this table.
+        let conn = one_lambda(
+            "CREATE TABLE unmanaged(fn_id INTEGER REFERENCES functions(id));
+             INSERT INTO unmanaged VALUES(2);",
+        );
+        verify_foreign_keys(&conn).unwrap();
+        let error = publish_verified(&conn).unwrap_err().to_string();
+        assert!(error.contains("table: unmanaged"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_types_table_is_exempt_from_verification() {
+        publish_verified(&one_lambda(DANGLING_TYPE)).unwrap();
+    }
+
+    #[test]
+    fn a_populated_types_table_is_verified() {
+        let conn = one_lambda(&format!(
+            "INSERT INTO types VALUES(0,'int','int',4,'{{}}');{DANGLING_TYPE}"
+        ));
+        let error = publish_verified(&conn).unwrap_err().to_string();
+        assert!(error.contains("parent: types"), "{error}");
+    }
+
+    #[test]
+    fn a_tree_without_lambdas_is_not_verified_after_publication() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        conn.execute_batch(crate::SCHEMA_V8).unwrap();
+        conn.execute_batch("INSERT INTO target_sources VALUES(2,7);")
+            .unwrap();
+        publish_verified(&conn).unwrap();
+    }
 
     fn complete_graph() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -889,6 +1006,56 @@ mod tests {
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn locations_lose_generated_names_and_keep_them_in_the_raw_relation() {
+        let conn = complete_graph();
+        conn.execute_batch(
+            "INSERT INTO locations(id,kind,desc) VALUES
+             (0,'Function','Root::$lambda3:1'),
+             (1,'Local','Root::$lambda3:1::x'),
+             (2,'Function','Leaf'),
+             (3,'StringLit','Root::$lambda3:1'),
+             (4,'Function','Root::$lambda3:1::Local::m'),
+             (5,'Function','Root::$lambda3:1::$lambda4:1');",
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        let descs = |relation: &str| -> Vec<String> {
+            conn.prepare(&format!("SELECT desc FROM {relation} ORDER BY id"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        // The callable is not its parent, so it cannot keep the parent's name.
+        assert_eq!(
+            descs("locations"),
+            [
+                "anonymous callable",
+                "Root::x",
+                "Leaf",
+                "Root::$lambda3:1",
+                "Root::Local::m",
+                "anonymous callable"
+            ]
+        );
+        assert_eq!(
+            descs("raw_locations"),
+            [
+                "Root::$lambda3:1",
+                "Root::$lambda3:1::x",
+                "Leaf",
+                "Root::$lambda3:1",
+                "Root::$lambda3:1::Local::m",
+                "Root::$lambda3:1::$lambda4:1"
+            ]
+        );
+        // Complete-graph readers get the originals under the public name.
+        let complete = with_raw_relations(&conn, || Ok(descs("locations"))).unwrap();
+        assert_eq!(complete, descs("raw_locations"));
     }
 
     #[test]

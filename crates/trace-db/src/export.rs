@@ -21,7 +21,8 @@ pub struct ExportOptions {
     /// `minimal` falls back to this crate's package version for library
     /// callers that have no build identity of their own.
     pub trace_version: String,
-    /// Export points-to debug table (requires analysis with `retain_points_to`).
+    /// Export the points-to debug table and the locations it references
+    /// (requires analysis with `retain_points_to`).
     pub include_points_to: bool,
     /// Export types, all variables, and PAG locations (slower, larger DB).
     pub full_detail: bool,
@@ -116,9 +117,12 @@ pub fn export_to_sqlite(
         if opts.full_detail {
             export_types(&conn, program)?;
             export_variables(&conn, program, &mut strings)?;
-            export_locations(&conn, pag)?;
         } else {
             export_flow_and_arg_flow_vars(&conn, program, pag, analysis, &mut strings)?;
+        }
+        // `points_to` references these rows.
+        if opts.full_detail || opts.include_points_to {
+            export_locations(&conn, pag)?;
         }
         export_arg_flow(&conn, analysis)?;
         export_execution_contexts(&conn, analysis)?;
@@ -128,7 +132,7 @@ pub fn export_to_sqlite(
         }
         export_diagnostics(&conn, program, analysis)?;
         conn.execute_batch(INDEXES_V8)?;
-        crate::publish_lambda_free(&conn)?;
+        crate::publish_verified(&conn)?;
         crate::record_database_identity(&conn)?;
         conn.execute_batch("COMMIT;")?;
     }

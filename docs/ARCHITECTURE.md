@@ -138,7 +138,7 @@ Lowering (`trace-parse/src/lower.rs`) walks tree-sitter ASTs and emits **flow co
 |----------|--------|
 | *(default)* | Minimal export: functions, filtered call sites, call edges, arg-flow, execution contexts, required variables, and the PAG flow graph |
 | `--full-export` | All types, all variables, PAG `locations` |
-| `--debug-points-to` | Retain points-to in memory; export `points_to` table |
+| `--debug-points-to` | Retain points-to in memory; export `points_to` and the `locations` it references |
 
 Indirect call sites **without** resolved edges are still exported in `call_sites` when `is_direct = 0`.
 

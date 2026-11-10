@@ -1,5 +1,22 @@
 # Evaluation Report
 
+## Foreign-key verification after publication — 2026-11-10
+
+Issue #272, `PRAGMA foreign_key_check` timed alone on exported databases at
+`294218b`, one run with a warm cache. Every export of a tree with a lambda pays
+it once, and every merge pays it twice.
+
+| Corpus | Default export | Full export |
+|--------|----------------|-------------|
+| HDF | | 0.53 s |
+| HiView | | 0.28 s |
+| Camera | | 0.81 s |
+| Ability runtime | 3.35 s | 3.28 s |
+
+On Ability runtime that is about 2% of the 158 s full-export run. No corpus
+reports a violation, apart from the references to an empty `types` table that a
+default export leaves and the check exempts.
+
 ## Compact lambda-free publication — 2026-11-10
 
 Schema v9 (`d1679a2`) published the lambda-free relations by copying every

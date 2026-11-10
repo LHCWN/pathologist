@@ -27,6 +27,7 @@ mod ignore_macro_tests;
 mod inspect_tests;
 mod integration;
 mod ipc_tests;
+mod lambda_publication;
 mod macro_paste_cases;
 mod macro_source_mapping;
 mod malloc_mode_tests;

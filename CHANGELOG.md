@@ -4,6 +4,21 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Lambda-free publication follow-ups (#272)
+
+`locations` in a full export no longer publishes generated lambda names: a
+lambda's location reads `anonymous callable`, and `raw_locations` keeps the
+original. A string literal that looks like a generated name now keeps its text
+in `locations` and in its flow-node label. `trace analyze` and `trace-merge` now
+check foreign keys after lambda-free publication, so a dangling reference left
+by that step fails the run instead of being published. `--debug-points-to` now
+exports the `locations` its `points_to` rows reference. Re-export to pick up the
+new `locations` text. The docs now state how the public and complete graphs
+assign an enclosing function, and what a lifted `call_sites` row means to each
+reader.
+
+See [Lambda-free call graph views](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views).
+
 ### Store only the rows lambda-free publication changes (#279)
 
 A snapshot with lambdas no longer copies every table the projection rewrites
