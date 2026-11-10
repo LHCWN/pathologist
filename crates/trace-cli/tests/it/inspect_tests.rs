@@ -26,7 +26,7 @@ fn build_and_export(name: &str) -> TempDb {
 }
 
 /// Stdout of a successful `trace inspect` on `db`.
-fn inspect_output(db: &std::path::Path, args: &[&str]) -> String {
+pub(crate) fn inspect_output(db: &std::path::Path, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_trace"))
         .args(["inspect", db.to_str().unwrap()])
         .args(args)

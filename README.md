@@ -126,7 +126,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--jobs <N>` | Parallel jobs for indexing (parse + lower). Default: logical CPU count. |
 | `--timeout-secs <N>` | Watchdog: abort the process after N seconds (exit 124). Useful when probing hang-prone trees. |
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
-| `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table (requires PAG in memory). Implies keeping location data needed for export. |
+| `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table and the `locations` it references (requires PAG in memory). |
 | `--models <FILE>` | Load TOML function-behavior summaries and noise macro lists. Repeatable; later files override earlier entries and built-ins. Project IPC shortcuts such as DataShare `OpenFile` are opt-in; see [missing-framework fallbacks](#missing-framework-fallbacks) and the [model format](docs/ANALYSIS.md#configuration-format). |
 | `--ignore-macro <NAME>` | Ignore expansions of the named macro during AST lowering (repeatable). Glob wildcards (`*`) are supported (e.g. `--ignore-macro 'LOG*'`). Suppresses boilerplate call sites, temporary variables, and flow constraints. |
 | `--ignore-logging` | Preset flag to ignore common OpenHarmony and standard logging macros (`HILOG_*`, `TAG_LOG*`, `HIVIEW_LOG*`, `MEDIA_*_LOG`, `LOGD`, `LOGI`, `LOGW`, `LOGE`, `LOGF`). |
@@ -705,7 +705,7 @@ Measured changes are recorded in the [evaluation report](docs/EVAL_REPORT.md).
 |------|-------|-------------------|
 | **Minimal** (default) | *(none)* | `analysis_run`, `files`, `functions`, filtered `call_sites`, `call_edges`, `arg_flow_edges`, `execution_contexts`, PAG-referenced variables, flow graph (`flow_nodes` / `flow_edges` / `flow_memory_access`), `diagnostics`. |
 | **Full IR** | `--full-export` | Minimal plus all `types`, all `variables`, PAG `locations`. |
-| **Points-to debug** | `--debug-points-to` | Adds `points_to` table (and retains PAG during analysis). Use with `--full-export` for complete debug dumps. |
+| **Points-to debug** | `--debug-points-to` | Adds `points_to` and `locations` tables (and retains PAG during analysis). Use with `--full-export` for complete debug dumps. |
 | **Call sequencing** | `--sequencing` | Adds the call-order graphs (`cfg_*` tables) to either mode above; without the flag those tables are empty. See [call sequencing tables](docs/SQLITE_SCHEMA.md#call-sequencing-tables). |
 
 The flow-graph tables are always exported because `trace inspect dataflow`

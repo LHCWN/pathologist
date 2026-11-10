@@ -169,11 +169,11 @@ omitted flow data from merger output.
 | `call_edges` | ✓ | ✓ | ✓ |
 | `arg_flow_edges` | ✓ | ✓ | ✓ |
 | `execution_contexts` | ✓ | ✓ | ✓ |
-| `variables` | PAG-referenced | all | all (+ arg-flow) |
+| `variables` | PAG-referenced | all | PAG-referenced |
 | `flow_nodes` | ✓ | ✓ | ✓ |
 | `flow_edges` | ✓ | ✓ | ✓ |
 | `flow_memory_access` | ✓ | ✓ | ✓ |
-| `types` | | ✓ | ✓ |
+| `types` | | ✓ | |
 | `locations` | | ✓ | ✓ |
 | `points_to` | | | ✓ |
 | `diagnostics` | ✓ | ✓ | ✓ |
@@ -256,9 +256,25 @@ lexical parent. `flow_field_access` retains its original nodes and fields.
 Body sites in `call_sites` use the lexical owner while keeping their source
 positions. A file-scope lambda's sites use a recorded visible caller when one
 exists; otherwise those sites and site-only provenance remain raw-only.
-This ownership is descriptive and does not establish call reachability.
+This ownership is descriptive and does not establish call reachability: a site
+in a lambda nothing invokes has a row under the enclosing function and no edge.
+Whether a function makes a call is a question for `call_edges`. Each reader of
+these rows treats them as follows:
+
+| Reader | What a lifted site means there |
+|--------|--------------------------------|
+| `inspect dataflow` (text and JSON) | Lexical: a step's scope is the function the call is written in. Value flow does not imply reachability, as for a function nothing calls. |
+| `inspect calls`, `callgraph`, `callchain`; the LSP call hierarchy | Edges only, so an uninvoked lambda adds no call. `callgraph`'s unresolved leaves come from `lambda_unresolved_calls`. |
+| `inspect sequence` | Absent: lambda graphs and their event sites stay in `raw_cfg_*`. |
+| `inspect slice`, `trace-merge`, `--show-lambdas` | The complete graph: the site keeps its lambda caller, through temporary aliases for every `raw_*` relation (`raw_locations` included). |
+
 Generated `::$lambda<line>:<col>` name segments are removed from public
-dictionary text; raw strings retain the original text under the same IDs.
+dictionary text and from `locations.desc`; raw strings retain the original text
+under the same IDs, and `raw_locations` keeps the original descriptions. A
+lambda's `Function` location reads `anonymous callable`, as its `flow_nodes`
+label does, because the name left after stripping would be its parent's. A
+`StringLit` location and its `string:` flow-node label keep their text, which is
+the program's own.
 Source-level lambda expressions are not removed from source expressions.
 
 `execution_contexts` projects a lambda entry to each next visible callee,
@@ -284,14 +300,19 @@ pre-images; other raw relations alias the public table directly. Query `raw_*`
 rather than `raw_preimage_*`, which holds only part of a relation. Like every
 `raw_` name, these hold the original lambda names.
 
-Tables publication rewrites without removing rows (`strings`, `variables_data`,
-`flow_nodes_data`, `link_dispatch_queries`) use a single-table `raw_` view that
+Tables publication rewrites without removing rows (`strings`, `locations`,
+`variables_data`, `flow_nodes_data`, `link_dispatch_queries`) use a single-table `raw_` view that
 overlays the rewritten columns. The other changed relations are `UNION ALL`
 views. SQLite copies such a view whole when it is on the right of a `LEFT JOIN`,
 when the outer query is aggregate or `DISTINCT`, or when an `ORDER BY` term is
 not selected, so a complete-graph read should select its ordering columns and
 reach those relations by key rather than `LEFT JOIN` them.
 Minimal/full exports and merged outputs share the same publication step.
+Foreign keys are verified after publication, and `trace-merge` also verifies
+them before it. References to `types` are exempt when that table is empty, as
+in a default export. A tree with no lambda is not verified, because publication
+rewrites nothing there. The check's cost is
+[measured](EVAL_REPORT.md#foreign-key-verification-after-publication--2026-11-10).
 `trace-merge` reads raw relations when present, including when re-merging a
 merged output, so projection never changes linking inputs.
 
@@ -350,7 +371,7 @@ files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
        └─ variables (type_id → types when exported,
                      target_id → link_targets)
 types
-locations (full export)
+locations (full export or debug)
 points_to (debug)
 diagnostics
 ```
@@ -863,12 +884,12 @@ Exported with `--full-export` only.
 
 ### locations
 
-PAG abstract locations (`--full-export`).
+PAG abstract locations (`--full-export` or `--debug-points-to`).
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Location id |
-| `kind` | TEXT | `global`, `file_static`, `fn_static`, `local`, `heap`, `field`, `field_summary`, `array_summary`, `function`, `string_lit`, … |
+| `kind` | TEXT | `Global`, `FileStatic`, `FnStatic`, `Local`, `Heap`, `Field`, `FieldSummary`, `ArraySummary`, `Function`, `StringLit` |
 | `desc` | TEXT | Description |
 | `type_id` | INTEGER FK → `types` | Optional |
 

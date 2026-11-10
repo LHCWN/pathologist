@@ -92,7 +92,7 @@ Return-value flow (`ReturnFlow` in `program.fn_returns`):
 
 - Default export is **minimal** (call graph + arg-flow + PAG flow graph; see `trace-db/src/export.rs`).
 - `--full-export`: types, all variables, `locations`
-- `--debug-points-to`: retain/export points-to
+- `--debug-points-to`: retain/export points-to and the `locations` it references
 - Document schema changes in `docs/SQLITE_SCHEMA.md` and `README.md`
 
 ## Adding preprocessor features

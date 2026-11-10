@@ -48,7 +48,9 @@ pub use filter::CallGraphFilter;
 pub use identity::{database_identity, record_database_identity, DatabaseIdentity};
 pub use inspect::*;
 pub use linking::{read_linking_facts, write_linking_facts};
-pub use projection::{publish_lambda_free, use_raw_relations};
+pub use projection::{
+    publish_lambda_free, publish_verified, use_raw_relations, verify_foreign_keys,
+};
 pub use render::*;
 pub use schema::*;
 pub use text::{TextId, TextPool};
