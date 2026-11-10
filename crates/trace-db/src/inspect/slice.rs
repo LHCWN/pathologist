@@ -22,6 +22,28 @@ pub struct SliceOptions {
     pub down_depth: u32,
 }
 
+/// One flow node with its variable. Runs once per node, on the complete graph.
+pub(crate) const NODE_ROW_SQL: &str =
+    "SELECT n.kind, n.label, n.detail, n.fn_id, v.name, v.kind, v.fn_id, \
+            vp.path, v.line, v.col, v.id, COALESCE(v.is_synthetic, 0) \
+     FROM flow_nodes n \
+     LEFT JOIN variables v ON v.id = n.var_id \
+     LEFT JOIN files vp ON vp.id = v.file_id \
+     WHERE n.id = ?1";
+
+/// Execution contexts with their start position, on the complete graph.
+/// `call_sites` loses rows there, so its columns are read by key, not joined.
+pub(crate) const CONTEXT_ROWS_SQL: &str =
+    "SELECT c.id, c.kind, c.entry_fn_id, c.call_site_id, c.api_fn_id, \
+            c.multi_instance, c.self_concurrent, \
+            (SELECT caller_fn_id FROM call_sites WHERE id = c.call_site_id), \
+            (SELECT path FROM files WHERE id = \
+                (SELECT file_id FROM call_sites WHERE id = c.call_site_id)), \
+            (SELECT line FROM call_sites WHERE id = c.call_site_id), \
+            (SELECT col FROM call_sites WHERE id = c.call_site_id) \
+     FROM execution_contexts c \
+     ORDER BY c.id";
+
 impl Default for SliceOptions {
     fn default() -> Self {
         Self {
@@ -463,14 +485,7 @@ impl<'c> FlowDb<'c> {
         }
         let row = self
             .conn
-            .prepare_cached(
-                "SELECT n.kind, n.label, n.detail, n.fn_id, v.name, v.kind, v.fn_id, \
-                        vp.path, v.line, v.col, v.id, COALESCE(v.is_synthetic, 0) \
-                 FROM flow_nodes n \
-                 LEFT JOIN variables v ON v.id = n.var_id \
-                 LEFT JOIN files vp ON vp.id = v.file_id \
-                 WHERE n.id = ?1",
-            )?
+            .prepare_cached(NODE_ROW_SQL)?
             .query_row([id], |r| {
                 let kind_name: String = r.get(0)?;
                 let label: String = r.get(1)?;
@@ -829,14 +844,7 @@ impl<'c> ContextIndex<'c> {
         let mut starts: FxHashSet<(i64, i64)> = FxHashSet::default();
         let mut dispatched: FxHashSet<i64> = FxHashSet::default();
         {
-            let mut stmt = conn.prepare(
-                "SELECT c.id, c.kind, c.entry_fn_id, c.call_site_id, c.api_fn_id, \
-                        c.multi_instance, c.self_concurrent, cs.caller_fn_id, p.path, cs.line, cs.col \
-                 FROM execution_contexts c \
-                 LEFT JOIN call_sites cs ON cs.id = c.call_site_id \
-                 LEFT JOIN files p ON p.id = cs.file_id \
-                 ORDER BY c.id",
-            )?;
+            let mut stmt = conn.prepare(CONTEXT_ROWS_SQL)?;
             let mut q = stmt.query([])?;
             while let Some(r) = q.next()? {
                 let id: i64 = r.get(0)?;

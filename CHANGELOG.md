@@ -4,6 +4,29 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Store only the rows lambda-free publication changes (#279)
+
+A snapshot with lambdas no longer copies every table the projection rewrites
+into `raw_*`. Each `raw_*` relation now reads the public rows plus a
+`raw_preimage_*` table holding the original of each row the projection changed
+or removed, so `raw_*` and the public relations return the same rows as before.
+Publication works on indexed temporary tables and leaves edges with no lambda
+endpoint in place, except that duplicates of one `(caller, callee, call site,
+resolution)` group still collapse to the lowest ID, as before. On the Ability-runtime corpus a default export falls from 435 to
+254 MB and its export phase from 49 to 38 s. Merging it with Camera falls from
+81 to 29 s and from 271 to 150 MB, where it took 25 s and 132 MB before
+lambda-free publication. `inspect callgraph --show-lambdas` takes about 1.3 s
+longer on that corpus. Peak memory is unchanged.
+
+An edge with both a direct and a lambda-entered path keeps its own
+`lambda_call_provenance` row, and exports stay readable through `ATTACH`.
+Re-analyse to pick up the smaller layout. Merging re-analysed inputs renumbers
+merged edge IDs once, because an input's identity covers what it stores; the
+call graph itself is unchanged.
+
+See [Lambda-free call graph views](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views);
+measurements in `docs/EVAL_REPORT.md` ("Compact lambda-free publication").
+
 ### Run default member initializers at construction (#271)
 
 A call written in a C++ default member initializer now has a call site and edge
