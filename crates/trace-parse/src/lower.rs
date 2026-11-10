@@ -9767,6 +9767,27 @@ struct FromThis<'t> {
     result: TypeDesc,
 }
 
+/// The qualifier, method and wrapper of a `shared_from_this()` /
+/// `weak_from_this()` spelling. `None` for another name, or for
+/// `::shared_from_this()`, which names a free function rather than the member.
+fn from_this_spelling(spelled: &str) -> Option<(String, &'static str, &'static str)> {
+    if !FROM_THIS_WRAPPERS
+        .iter()
+        .any(|(method, _)| spelled.ends_with(method))
+    {
+        return None;
+    }
+    // The qualifier keeps its arguments (`Shared<M>::shared_from_this()`).
+    let spelled = normalize_spacing(spelled);
+    let (qualifier, method) = spelled.rsplit_once("::").unwrap_or(("", &spelled));
+    // `::shared_from_this()` names a free function, never the member.
+    if qualifier.is_empty() && spelled.starts_with("::") {
+        return None;
+    }
+    let &(method, wrapper) = FROM_THIS_WRAPPERS.iter().find(|(m, _)| *m == method)?;
+    Some((qualifier.to_owned(), method, wrapper))
+}
+
 /// The one place `from_this` calls are recognized, for result typing
 /// ([`call_result_shape`]) and for value flow ([`from_this_value`]). The
 /// declared overloads are not consulted: the standard's const twins disagree
@@ -9797,23 +9818,7 @@ fn from_this_call<'t>(
         }
         _ => return None,
     };
-    // The method name settles almost every call before anything allocates
-    // or the receiver is typed.
-    let spelled = node_text(source, &name);
-    if !FROM_THIS_WRAPPERS
-        .iter()
-        .any(|(method, _)| spelled.ends_with(method))
-    {
-        return None;
-    }
-    // The qualifier keeps its arguments (`Shared<M>::shared_from_this()`).
-    let spelled = normalize_spacing(spelled);
-    let (qualifier, method) = spelled.rsplit_once("::").unwrap_or(("", &spelled));
-    // `::shared_from_this()` names a free function, never the member.
-    if qualifier.is_empty() && spelled.starts_with("::") {
-        return None;
-    }
-    let &(method, wrapper) = FROM_THIS_WRAPPERS.iter().find(|(m, _)| *m == method)?;
+    let (qualifier, method, wrapper) = from_this_spelling(node_text(source, &name))?;
     if !call_arg_nodes(call).is_empty() {
         return None;
     }
@@ -9824,7 +9829,7 @@ fn from_this_call<'t>(
         Some(result) => result,
         None => {
             let result =
-                from_this_result(program, ctx, source, receiver, qualifier, method, wrapper)?;
+                from_this_result(program, ctx, source, receiver, &qualifier, method, wrapper)?;
             ctx.from_this_results
                 .borrow_mut()
                 .insert(call.id(), result.clone());

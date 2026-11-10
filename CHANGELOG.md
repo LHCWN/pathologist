@@ -15,6 +15,17 @@ edges.
 See [C++ support](docs/ANALYSIS.md#c-support-first-step);
 measurements in `docs/EVAL_REPORT.md` ("Default member initializers").
 
+### Parenthesized `shared_from_this()` without `<memory>`
+
+`auto self(shared_from_this());` now recovers even when the standard library
+headers declaring `enable_shared_from_this` are not visible. The intrinsic is
+recognized from the class's base clause, so `self` receives the wrapper type
+and a lambda capturing it receives the object without `--system-includes` or
+parsing the whole STL. A class without an `enable_shared_from_this` base keeps
+the declaration interpretation.
+
+See [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization).
+
 ### Resolve immediately invoked lambdas (#268)
 
 A lambda invoked where it is written, every `IN_PROCESS_CALL(...)` expansion

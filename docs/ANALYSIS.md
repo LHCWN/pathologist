@@ -5221,7 +5221,10 @@ value, is reparsed with the initializer's outer parentheses changed to `=`
 and a space. A bare name that resolves to neither a value nor a type keeps
 the block-scope value assumption direct initialization already makes for
 `T w(E::kind);`; a call-shaped name that resolves to nothing keeps its
-function interpretation. Empty parameter lists, known parameter types and
+function interpretation. The standard `shared_from_this()` /
+`weak_from_this()` intrinsic is recognized from the class's base clause even
+when `<memory>` is not in the tree, so its parenthesized initializer recovers
+without system headers. Empty parameter lists, known parameter types and
 named parameter declarators keep their function interpretation. Recovery
 requires a complete, error-free declaration and retains the original byte
 offsets, LineMap and enclosing scope, using the same scratch-tree lifetime
