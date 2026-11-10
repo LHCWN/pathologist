@@ -10205,6 +10205,7 @@ fn smart_pointer_promotion_ignores_non_promotions() {
 }
 
 analyzed_fixture!(cpp_shared_from_this);
+analyzed_fixture!(cpp_shared_from_this_unseen);
 analyzed_fixture!(cpp_parenthesized_auto);
 
 /// The one variable `name` of the lambda inside `outer`.
@@ -10510,6 +10511,41 @@ fn template_parameter_keeps_non_auto_direct_init_a_declaration() {
         "NonAutoHolder::Value",
         "Gadget::Gadget"
     ));
+}
+
+#[test]
+fn parenthesized_shared_from_this_recovers_without_memory() {
+    let (program, analysis) = cpp_shared_from_this_unseen();
+    for (owner, name, wrapper) in [
+        ("Manager::Run", "self", "std::shared_ptr<Manager>"),
+        ("Manager::Weak", "w", "std::weak_ptr<Manager>"),
+        ("Qualified::Run", "self", "std::shared_ptr<Qualified>"),
+    ] {
+        let var = common::local_variable(program, owner, name);
+        assert_eq!(type_name(program, var), wrapper, "{owner}");
+    }
+    let lambda = common::lambda_in(program, "Manager::Run");
+    assert!(has_any_edge(
+        program,
+        analysis,
+        &lambda.name,
+        "Manager::Handle"
+    ));
+    for (owner, name) in [
+        ("Plain::Run", "self"),
+        ("GlobalScope::Run", "self"),
+        ("Nested::Run", "x"),
+    ] {
+        let caller = common::only_function(program, owner);
+        assert!(
+            !program
+                .symbols
+                .variables
+                .iter()
+                .any(|v| v.fn_id == Some(caller) && v.name == name),
+            "{owner}: not an implicit-this intrinsic"
+        );
+    }
 }
 
 #[test]

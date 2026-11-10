@@ -50,8 +50,10 @@ pub(super) fn try_lower(
 /// `auto self(get());` parses as a function taking a function pointer.
 /// When the parameter's apparent type names no type in the original scope,
 /// reparse the initializer as `auto self=get() ;`, at identical offsets. A
-/// call-shaped apparent type must name a known value; a bare unresolved name
-/// keeps the block-scope value assumption direct initialization already uses
+/// call-shaped apparent type must name a known value, or the standard
+/// `shared_from_this()` / `weak_from_this()` intrinsic on the enclosing
+/// `enable_shared_from_this`-derived object; a bare unresolved name keeps the
+/// block-scope value assumption direct initialization already uses
 /// (`T w(E::kind);`).
 pub(super) fn try_lower_auto_initializer(
     program: &mut Program,
@@ -111,7 +113,14 @@ pub(super) fn try_lower_auto_initializer(
             ty,
             &normalize_qualified(node_text(source, &ty)),
         );
-        if kind == NameKind::Type || (declarator.is_some() && kind != NameKind::Value) {
+        // `shared_from_this()` / `weak_from_this()` is the standard intrinsic
+        // even when `<memory>` is not in the tree: the base clause and the
+        // class ancestry decide it.
+        let from_this = kind == NameKind::Unknown
+            && declarator.is_some_and(abstract_declarator_takes_no_arguments)
+            && implicit_from_this_initializer(program, ctx, source, ty);
+        if kind == NameKind::Type || (declarator.is_some() && kind != NameKind::Value && !from_this)
+        {
             continue;
         }
         let bytes = rewritten.get_or_insert_with(|| node_text(source, &node).as_bytes().to_vec());
@@ -148,6 +157,41 @@ pub(super) fn try_lower_auto_initializer(
     let declaration = tree.root_node().named_child(0).unwrap();
     lower_recovered(program, ctx, source, node, Arc::clone(&tree), declaration);
     true
+}
+
+/// Whether an apparent function-pointer parameter declares a zero-argument
+/// call: the intrinsic `shared_from_this()` / `weak_from_this()` takes none.
+fn abstract_declarator_takes_no_arguments(declarator: Node) -> bool {
+    declarator.cached_field("declarator").is_none()
+        && declarator.cached_field("parameters").is_some_and(|params| {
+            params
+                .named_children(&mut params.walk())
+                .all(|n| n.cached_kind() == "comment")
+        })
+}
+
+/// Whether the apparent parameter spells the standard `shared_from_this()` /
+/// `weak_from_this()` on the enclosing object, recognized from the base
+/// clause so `<memory>` need not be visible ([`from_this_result`]).
+fn implicit_from_this_initializer(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    ty: Node,
+) -> bool {
+    let Some((qualifier, method, wrapper)) = from_this_spelling(node_text(source, &ty)) else {
+        return false;
+    };
+    from_this_result(
+        program,
+        ctx,
+        source,
+        FromThisReceiver::This,
+        &qualifier,
+        method,
+        wrapper,
+    )
+    .is_some()
 }
 
 fn lower_recovered(
