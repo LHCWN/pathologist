@@ -20,7 +20,9 @@
         "edges_ipc": {"cmp": "exact", "value": 58},
         "arg_flow_edges": {"cmp": "band", "value": 72232, "tol": 150},
         "diagnostics": {"cmp": "exact", "value": 1910},
-        "dlsym_edges": {"cmp": "exact", "value": 6}
+        "dlsym_edges": {"cmp": "exact", "value": 6},
+        "public_functions_total": {"cmp": "band", "value": 12145, "tol": 20},
+        "public_edges_total": {"cmp": "band", "value": 78613, "tol": 80}
       },
       "sites": [
       {"case": "HdfRemoteServiceCheckInterfaceToken -> the C++ adapter body (#83: the `extern \"C\"` prototype in hdf_remote_adapter_if.h and the definition in hdf_remote_adapter.cpp interned `struct HdfRemoteService *` under two ids, so the overload check split them and this call stopped at the undefined prototype)", "caller": "%HdfRemoteServiceCheckInterfaceToken", "line": 68, "resolution": "direct", "expected": 1},
@@ -89,7 +91,9 @@
         "edges_ipc": {"cmp": "exact", "value": 44},
         "arg_flow_edges": {"cmp": "band", "value": 32470, "tol": 120},
         "diagnostics": {"cmp": "exact", "value": 3576},
-        "dlsym_edges": {"cmp": "exact", "value": 3}
+        "dlsym_edges": {"cmp": "exact", "value": 3},
+        "public_functions_total": {"cmp": "band", "value": 9551, "tol": 120},
+        "public_edges_total": {"cmp": "band", "value": 38726, "tol": 160}
       },
       "sites": [
         {"case": "Plugin::OnEventProxy dispatch", "caller": "%Plugin::OnEventProxy", "line": 68, "resolution": "all", "expected": 13},
@@ -143,7 +147,9 @@
         "edges_ipc": {"cmp": "exact", "value": 808},
         "arg_flow_edges": {"cmp": "band", "value": 58694, "tol": 250},
         "diagnostics": {"cmp": "exact", "value": 5251},
-        "dlsym_edges": {"cmp": "exact", "value": 6}
+        "dlsym_edges": {"cmp": "exact", "value": 6},
+        "public_functions_total": {"cmp": "band", "value": 22874, "tol": 120},
+        "public_edges_total": {"cmp": "band", "value": 114648, "tol": 420}
       },
       "sites": [
         {"case": "Command::Do GetCommandName", "caller": "%DeferredProcessing::Command::Do", "line": 35, "resolution": "all", "expected": 31},
@@ -189,11 +195,13 @@
       "dir": "ability_ability_runtime",
       "analyze_args": ["--ignore-logging", "--timeout-secs", "600"],
       "globals": {
-        "edges_ipc": {"cmp": "exact", "value": 1762}
+        "edges_ipc": {"cmp": "exact", "value": 1762},
+        "public_functions_total": {"cmp": "band", "value": 78881, "tol": 400},
+        "public_edges_total": {"cmp": "band", "value": 373780, "tol": 1300}
       },
       "probes": [
-        {"name": "an IN_PROCESS_CALL of a local lambda reaches the lambda's callee (#268: implicit_start_processor.cpp:260 had no entering edge, 0 on the baseline)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id WHERE c.name='OHOS::AAFwk::ImplicitStartProcessor::ImplicitStartAbility' AND t.name='OHOS::AAFwk::ImplicitStartProcessor::CallStartAbilityInner'", "cmp": "exact", "value": 1},
-        {"name": "no immediately invoked lambda is left without an edge (#268: every site with the lambda's source as callee had 0 edges on the baseline)", "sql": "SELECT COUNT(*) FROM raw_call_sites s WHERE (s.callee_text GLOB '*::$lambda[0-9]*:[0-9]*' OR s.callee_text LIKE '[%') AND NOT EXISTS (SELECT 1 FROM raw_call_edges e WHERE e.call_site_id=s.id)", "cmp": "exact", "value": 0},
+        {"name": "an IN_PROCESS_CALL of a local lambda reaches the lambda's callee (#268: implicit_start_processor.cpp:260 had no entering edge, 0 on the baseline)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id WHERE c.name='OHOS::AAFwk::ImplicitStartProcessor::ImplicitStartAbility' AND t.name='OHOS::AAFwk::ImplicitStartProcessor::CallStartAbilityInner'", "relations": "public", "cmp": "exact", "value": 1},
+        {"name": "no immediately invoked lambda is left without an edge (#268: every site with the lambda's source as callee had 0 edges on the baseline)", "sql": "SELECT COUNT(*) FROM call_sites s WHERE (s.callee_text GLOB '*::$lambda[0-9]*:[0-9]*' OR s.callee_text LIKE '[%') AND NOT EXISTS (SELECT 1 FROM call_edges e WHERE e.call_site_id=s.id)", "cmp": "exact", "value": 0},
         {"name": "parenthesized auto self at mission_list_manager.cpp:2195 reaches both captured receiver calls", "sql": "SELECT COUNT(DISTINCT t.name) FROM raw_call_edges e JOIN raw_call_sites s ON s.id=e.call_site_id JOIN files p ON p.id=s.file_id JOIN raw_functions t ON t.id=e.callee_fn_id WHERE p.path LIKE '%/services/abilitymgr/src/mission/mission_list_manager.cpp' AND e.resolution='direct' AND ((s.line=2198 AND t.name='OHOS::AAFwk::MissionListManager::PrintTimeOutLog') OR (s.line=2199 AND t.name='OHOS::AAFwk::MissionListManager::CompleteBackground'))", "cmp": "exact", "value": 2},
         {"name": "IPC edges from SendTransactCmd-only senders", "sql": "WITH senders AS (SELECT caller_fn_id FROM call_sites GROUP BY caller_fn_id HAVING MAX(callee_text LIKE '%SendTransactCmd')=1 AND MAX(callee_text LIKE '%SendRequest')=0) SELECT COUNT(*) FROM call_edges e JOIN senders s ON s.caller_fn_id=e.caller_fn_id WHERE e.resolution='ipc'", "cmp": "exact", "value": 605},
         {"name": "integer StartAbility arguments exclude six remote-token overload edges (#244)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id WHERE ((c.name='OHOS::AAFwk::AbilityManagerShellCommand::RunAsStartAbility' AND s.line=486) OR (c.name='OHOS::AAFwk::AbilityManagerShellCommand::StartAbilityWithWait' AND s.line=2753) OR (c.name='OHOS::AAFwk::ClawAaShellCommand::StartAbilityWithWait' AND s.line=1086) OR (c.name='OHOS::AAFwk::AbilityUtil::StartAppgallery' AND s.line=387)) AND t.name='OHOS::AAFwk::AbilityManagerClient::StartAbility' AND t.signature LIKE '%IRemoteObject%'", "cmp": "exact", "value": 0},

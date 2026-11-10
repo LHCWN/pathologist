@@ -1,5 +1,46 @@
 # Evaluation Report
 
+## Eval checks and the two call graphs — 2026-11-09
+
+Issue #270, measured with `scripts/eval_check.py` on the pinned corpora at
+`528b13b`. Default exports throughout. Since `d1679a2` the public relations
+hold the lambda-free projection, while the expectations were captured on the
+complete graph, so 20 of them failed without any analysis change.
+
+The check now reads the complete graph through temporary `raw_*` aliases by
+default. No expectation was re-captured or loosened, and every check passed at
+that revision. Replaying the same databases on the public relations reproduces
+the 20 failures: HDF 4, HiView 8, Camera 7, Ability runtime 1.
+
+Rebased over #267 (`8183021`), the run is 173 checks with one failure, which this
+change does not cause: the probe "parenthesized auto self at
+mission_list_manager.cpp:2195" reads 0 where 2 is expected. Its recovery needs
+`shared_from_this` to be a known name, and the probe's analysis options leave
+`<memory>` unresolved on a host whose standard headers are not on the default
+search path. Adding only a stub `<memory>` declaring
+`std::enable_shared_from_this` with `--include` makes the probe read 2.
+
+| Corpus | Raw functions | Public functions | Raw edges | Public edges |
+|--------|---------------|------------------|-----------|--------------|
+| HDF | 12186 | 12145 | 78796 | 78613 |
+| HiView | 9969 | 9551 | 39335 | 38726 |
+| Camera | 23720 | 22874 | 116364 | 114648 |
+| Ability runtime | 82284 | 78881 | 382403 | 373780 |
+
+The public columns are the new `public_functions_total` and
+`public_edges_total` globals. Their bands are narrower than the projection's
+own effect on each corpus, so losing the projection fails them. Among the
+probes, only
+`ImplicitStartAbility -> CallStartAbilityInner` (#268) asserts the public
+contract: it reads 0 on the complete graph and 1 on the public one, and it is
+marked `"relations": "public"`. Five other probes read different values on the
+two graphs and pass on the complete graph they were captured on.
+
+```bash
+python3 scripts/fetch_corpora.py --base ~/trace-corpora
+python3 scripts/eval_check.py --corpus-base ~/trace-corpora --outdir ~/trace-corpora/out
+```
+
 ## Immediately invoked lambdas — 2026-11-09
 
 Issue #268, measured with `scripts/eval_check.py` on the pinned corpora, the

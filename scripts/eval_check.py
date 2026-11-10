@@ -18,6 +18,13 @@ then asserts:
    member calls) plus calibration probes (external-class sites that must stay
    unresolved rather than degrading into noise edges).
 
+A snapshot holds two call graphs: the complete graph in its `raw_*` relations
+and the lambda-free projection under the public names. Globals, sites and
+probes measure the complete graph, which their expectations were captured on,
+through the same temporary aliases as `trace_db::use_raw_relations`. The
+`public_*` globals and any site or probe marked `"relations": "public"` read the
+public relations instead, so the projection stays measured.
+
 Exit 0 when every check passes; non-zero otherwise. Uses only the stdlib.
 
 Usage:
@@ -36,6 +43,8 @@ import traceback
 import sys
 from pathlib import Path
 
+from analysis_sqlite import quote_identifier, relation_types
+
 FAILS = 0
 CHECKS = 0
 # Expectation mismatches (FAILS) and setup/execution errors are different
@@ -45,6 +54,12 @@ CHECKS = 0
 # to miss the current expectations, so tooling that compares two binaries
 # tolerates 1 on that side but must still abort on 2.
 SETUP_ERRORS = 0
+# What the globals, sites and probes read; a projected snapshot must hold all
+# of them, or a check would silently measure a public relation instead.
+REQUIRED_RAW_RELATIONS = frozenset({
+    "raw_files", "raw_functions", "raw_call_sites", "raw_call_edges",
+    "raw_arg_flow_edges", "raw_diagnostics", "raw_flow_edges",
+    "raw_flow_nodes", "raw_flow_origins", "raw_variables"})
 
 
 def log(level, text):
@@ -124,8 +139,28 @@ def analyze(trace_bin, corpus, expected, root, outdir, env):
     return db
 
 
-def globals_from_db(db):
+def connect(db, relations="raw"):
+    """Open `db` on one of its call graphs. A snapshot without `raw_*`
+    relations stores its complete graph under the public names, so both
+    graphs read the same rows there."""
+    if relations not in ("raw", "public"):
+        raise ValueError(f"unknown relations {relations!r} (want 'raw' or 'public')")
     con = sqlite3.connect(str(db))
+    if relations == "raw":
+        names = relation_types(con)
+        missing = REQUIRED_RAW_RELATIONS - names.keys()
+        if "lambda_owners" in names and missing:
+            con.close()
+            raise ValueError(f"{db}: incomplete raw graph, missing {sorted(missing)}")
+        for name in names:
+            if name.startswith("raw_"):
+                alias = quote_identifier(name.removeprefix("raw_"))
+                con.execute(f"CREATE TEMP VIEW {alias} AS SELECT * FROM main.{quote_identifier(name)}")
+    return con
+
+
+def globals_from_db(db):
+    con = connect(db)
     cur = con.cursor()
     out = {}
     out["files"] = cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
@@ -144,6 +179,10 @@ def globals_from_db(db):
     out["diagnostics"] = cur.execute("SELECT COUNT(*) FROM diagnostics").fetchone()[0]
     out["dlsym_edges"] = cur.execute(
         "SELECT COUNT(*) FROM flow_edges WHERE kind LIKE '%dlsym%'").fetchone()[0]
+    con.close()
+    con = connect(db, "public")
+    out["public_functions_total"] = con.execute("SELECT COUNT(*) FROM functions").fetchone()[0]
+    out["public_edges_total"] = con.execute("SELECT COUNT(*) FROM call_edges").fetchone()[0]
     con.close()
     return out
 
@@ -192,7 +231,7 @@ def check_site(db, site):
         JOIN files f ON f.id = cf.file_id
         JOIN functions tf ON tf.id = e.callee_fn_id
         WHERE cf.name LIKE :caller {line_filter} {res_filter} {file_filter}"""
-    con = sqlite3.connect(str(db))
+    con = connect(db, site.get("relations", "raw"))
     got = con.execute(sql, args).fetchone()[0]
     con.close()
     ok = got == site["expected"]
@@ -206,7 +245,7 @@ def check_site(db, site):
 def check_probe(db, probe):
     global FAILS, CHECKS
     CHECKS += 1
-    con = sqlite3.connect(str(db))
+    con = connect(db, probe.get("relations", "raw"))
     got = con.execute(probe["sql"]).fetchone()[0]
     con.close()
     want = probe["value"]
