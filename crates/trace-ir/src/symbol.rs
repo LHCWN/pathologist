@@ -351,7 +351,8 @@ pub struct CallSiteDetails {
     /// lowering, consumed before the per-TU index is published. Scalar
     /// expressions need not appear in `var_args` or `fn_args`.
     pub pending_defaults: Option<(FnId, u32)>,
-    /// Evaluation ownership for a call spelled inside a default argument.
+    /// Evaluation ownership for a call spelled inside a default argument or
+    /// default member initializer.
     /// Its request position remains the declaration's original source span.
     pub default_origin: Option<Span>,
     /// Additional destination for the address of a reference result.

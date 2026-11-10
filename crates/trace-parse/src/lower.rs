@@ -233,6 +233,10 @@ struct LowerContext {
     default_scopes: Vec<DefaultScope>,
     call_default_bindings: HashMap<trace_ir::CallSiteId, Arc<DefaultArgumentList>>,
     initializer_default_scopes: RefCell<HashMap<usize, InitializerDefaultScopes>>,
+    /// Classes whose default member initializers are being lowered. A default
+    /// that builds such a class again runs under the walk already in progress,
+    /// directly or through another class's default.
+    defaults_in_progress: Vec<String>,
     declared_default_nodes: RefCell<HashSet<usize>>,
     declaration_syntax: RefCell<DeclarationSyntaxCache>,
     /// Gates C++-specific lowering (qualified members, CHA, namespaces).
@@ -4025,6 +4029,7 @@ fn lower_prepared_source(
         default_scopes: Vec::new(),
         call_default_bindings: HashMap::default(),
         initializer_default_scopes: RefCell::default(),
+        defaults_in_progress: Vec::new(),
         declared_default_nodes: RefCell::default(),
         declaration_syntax: RefCell::default(),
         is_cpp,
@@ -7882,6 +7887,13 @@ fn lower_function_body(
         }
         None => &init_lists,
     };
+    if let Some(cls) = eff_class.as_deref().filter(|cls| {
+        ctx.is_cpp
+            && user_provided(program, fn_id)
+            && program.symbols.function(fn_id).name == trace_ir::MethodKind::Ctor.name_on(cls)
+    }) {
+        lower_omitted_member_defaults(program, ctx, source, node, cls, prologue);
+    }
     cfg_build::build_function_cfg(
         program,
         ctx,
@@ -11457,7 +11469,7 @@ fn static_factory_class(
 #[allow(clippy::too_many_arguments)]
 fn emit_factory_construction(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     call: Node,
     caller: FnId,
@@ -11475,6 +11487,15 @@ fn emit_factory_construction(
     if ctor_set_known(program, &cls, &args, &targets) && !any_user_provided(program, &targets)
         || copies_implicitly(program, &cls, &args, &targets)
     {
+        let desc = Arc::new(TypeDesc::Struct {
+            name: cls.clone(),
+            fields: Vec::new(),
+        });
+        if args.argc == 0 && empty_construction_runs_defaults(program, ctx, &desc) {
+            let heap = factory_object(program, ctx, call, caller, cls);
+            let object = InitializedObject::whole(desc, Some(heap));
+            lower_defaults_in_place(program, ctx, &object, span);
+        }
         return;
     }
     let heap = factory_object(program, ctx, call, caller, cls.clone());
@@ -11541,8 +11562,8 @@ fn lower_new_object(
     // as for a braced local, and otherwise initialize an aggregate member by
     // member, with no constructor site.
     let list = node.cached_field("arguments");
-    let aggregate = list.is_some_and(|c| c.cached_kind() == "initializer_list")
-        && !any_user_provided(program, &targets);
+    let braced = list.is_some_and(|c| c.cached_kind() == "initializer_list");
+    let aggregate = braced && !any_user_provided(program, &targets);
     let args = list.filter(|c| match c.cached_kind() {
         "argument_list" => true,
         "initializer_list" => !aggregate,
@@ -11564,6 +11585,41 @@ fn lower_new_object(
     );
     let expression = operation_expression(ctx, source, node);
     record_call_expressions(program, first_site, &expression);
+    let desc = Arc::new(TypeDesc::Struct {
+        name: cls,
+        fields: Vec::new(),
+    });
+    let values: Vec<_> = list
+        .map(|list| list.named_children(&mut list.walk()).collect())
+        .unwrap_or_default();
+    let runs = if values.is_empty() {
+        empty_construction_runs_defaults(program, ctx, &desc)
+    } else {
+        aggregate_defaults_are_evaluated(program, ctx, &desc)
+    };
+    if ctx.current_fn.is_some() && runs {
+        let object = InitializedObject::whole(desc, Some(alloc_tmp));
+        lower_operation(program, ctx, source, node, |program, ctx| {
+            if values.is_empty() {
+                lower_defaults_in_place(program, ctx, &object, span);
+            } else {
+                let mark = ctx.cfg_mark();
+                lower_initializer_object(
+                    program,
+                    ctx,
+                    source,
+                    &object,
+                    &values,
+                    braced,
+                    braced,
+                    span,
+                    expansion_span,
+                    &mut Vec::new(),
+                );
+                ctx.cfg_truncate(mark);
+            }
+        });
+    }
     Some(alloc_tmp)
 }
 
@@ -13135,39 +13191,8 @@ fn emit_automatic_lifecycle(
     span_node: Node,
     construct: bool,
 ) {
-    if construct && ctx.is_cpp && ctx.current_fn.is_none() {
-        let variable = program.symbols.variable(var);
-        let type_id = variable.type_id;
-        if !variable.is_defined || variable.is_pointer || program.is_dep_file(variable.span.file) {
-            return;
-        }
-        let desc = Arc::clone(&program.types.get(type_id).desc);
-        if aggregate_defaults_are_evaluated(program, ctx, &desc) {
-            lower_operation(program, ctx, source, span_node, |program, ctx| {
-                let address = addr_of_temp(program, ctx, span_node, var);
-                let object = InitializedObject {
-                    desc,
-                    address: Some(address),
-                    parent: None,
-                    member: None,
-                    infer_array_extent: false,
-                };
-                let span = node_call_span(program, ctx, span_node);
-                let expansion = node_expansion_span(program, ctx, span_node);
-                lower_initializer_object(
-                    program,
-                    ctx,
-                    source,
-                    &object,
-                    &[],
-                    true,
-                    false,
-                    span,
-                    expansion,
-                    &mut Vec::new(),
-                );
-            });
-        }
+    if construct && ctx.is_cpp {
+        lower_declared_object_defaults(program, ctx, source, var, span_node);
     }
     let Some(caller) = ctx.current_fn.filter(|_| ctx.is_cpp) else {
         return;
@@ -13246,6 +13271,61 @@ fn emit_automatic_lifecycle(
     }
 }
 
+/// Run the default member initializers of a declared object no user-provided
+/// constructor owns (docs/ANALYSIS.md, "C++ support (first step)"). A file-scope
+/// object has no body to hold its member-wise construction, so it is built here.
+fn lower_declared_object_defaults(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    var: VarId,
+    span_node: Node,
+) {
+    let variable = program.symbols.variable(var);
+    let type_id = variable.type_id;
+    // A local's own record says nothing about definitions; `is_defined` is for
+    // file-scope objects, which an `extern` declaration only names.
+    if ctx.current_fn.is_none() && !variable.is_defined
+        || variable.is_pointer
+        || program.is_dep_file(variable.span.file)
+    {
+        return;
+    }
+    let desc = Arc::clone(&program.types.get(type_id).desc);
+    let in_body = ctx.current_fn.is_some();
+    let runs = if in_body {
+        empty_construction_runs_defaults(program, ctx, &desc)
+            && !object_declaration(span_node).is_some_and(|d| declares_extern(source, d))
+    } else {
+        aggregate_defaults_are_evaluated(program, ctx, &desc)
+    };
+    if !runs {
+        return;
+    }
+    lower_operation(program, ctx, source, span_node, |program, ctx| {
+        let address = addr_of_temp(program, ctx, span_node, var);
+        let object = InitializedObject::whole(desc, Some(address));
+        let span = node_call_span(program, ctx, span_node);
+        if in_body {
+            lower_defaults_in_place(program, ctx, &object, span);
+            return;
+        }
+        let expansion = node_expansion_span(program, ctx, span_node);
+        lower_initializer_object(
+            program,
+            ctx,
+            source,
+            &object,
+            &[],
+            true,
+            false,
+            span,
+            expansion,
+            &mut Vec::new(),
+        );
+    });
+}
+
 fn aggregate_defaults_are_evaluated(
     program: &Program,
     ctx: &LowerContext,
@@ -13262,14 +13342,151 @@ fn aggregate_defaults_are_evaluated(
         }
         _ => false,
     };
-    aggregate && aggregate_has_default_initializer(program, desc, &mut Vec::new())
+    aggregate
+        && aggregate_has_default_initializer(
+            program,
+            desc,
+            ctx.current_fn.is_some(),
+            &mut Vec::new(),
+        )
 }
 
-/// Only instantiate global aggregate members when an evaluated default
-/// expression exists. Plain zero-initialized objects need no address temporary.
+/// Whether argument-free construction of `desc` inside a body runs default
+/// member initializers no user-provided default constructor owns.
+fn empty_construction_runs_defaults(
+    program: &Program,
+    ctx: &LowerContext,
+    desc: &TypeDesc,
+) -> bool {
+    let (TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. }) = peel_arrays(desc).0 else {
+        return false;
+    };
+    let cls = receiver_lookup_name(name);
+    class_is_indexed(program, &cls)
+        && !lifecycle_members(program, ctx, &cls, &trace_ir::MethodKind::Ctor)
+            .iter()
+            .any(|(owner, _)| *owner == *cls)
+        && aggregate_has_default_initializer(program, desc, true, &mut Vec::new())
+}
+
+fn class_is_indexed(program: &Program, class: &str) -> bool {
+    program
+        .types
+        .is_struct_defined(&receiver_lookup_name(class))
+}
+
+/// Whether a member's default needs lowering. Outside a body any default does.
+/// Inside one, only a default that can have an effect worth its projection:
+/// a call or `new` it evaluates ([`expression_may_call`]), a constructor of a
+/// class the tree defines, an address stored into a pointer member, or a
+/// function named for a member whose type is not known. Names and literals copied into anything else run nothing.
+fn default_needs_lowering(
+    program: &Program,
+    cls: &str,
+    field: &trace_ir::FieldLayout,
+    in_body: bool,
+) -> bool {
+    let initializers = program.types.member_initializers(cls, &field.name);
+    if initializers.is_empty() || !in_body {
+        return !initializers.is_empty();
+    }
+    let desc = peel_arrays(program.types.get(field.type_id).desc.as_ref()).0;
+    let expressions = || initializers.iter().map(|init| &*init.expression);
+    expressions().any(expression_may_call)
+        || initialized_class(program, desc).is_some_and(|class| class_is_indexed(program, &class))
+        || matches!(desc, TypeDesc::Ptr(_) | TypeDesc::FnPtr { .. })
+            && expressions().any(|text| !matches!(text, "nullptr" | "NULL" | "0"))
+        || (matches!(desc, TypeDesc::Unknown) || program.types.is_guessed_class(desc))
+            && expressions().any(|text| {
+                let name = text.trim_matches(|c: char| matches!(c, '&' | '(' | ')' | ' '));
+                program.symbols.has_function_named(name)
+            })
+}
+
+/// Whether evaluating the expression text can run a call or `new`. A keyword
+/// cast's own parentheses are no call, though its operand may hold one; an
+/// unevaluated operand runs nothing. Other parentheses count, so a grouping or
+/// C-style cast errs toward lowering.
+fn expression_may_call(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_word = |at: usize| {
+        bytes
+            .get(at)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    };
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'(' {
+            return true;
+        }
+        if !is_word(at) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while is_word(at) {
+            at += 1;
+        }
+        match &text[start..at] {
+            "new" => return true,
+            "static_cast" | "dynamic_cast" | "const_cast" | "reinterpret_cast" => {
+                at = after_group(bytes, skip_spaces(bytes, at), b'<', b'>');
+                at = skip_spaces(bytes, at);
+                at += usize::from(bytes.get(at) == Some(&b'('));
+            }
+            "sizeof" | "alignof" | "_Alignof" | "__alignof" | "__alignof__" | "decltype"
+            | "noexcept" | "typeof" | "__typeof" | "__typeof__" => {
+                at = skip_spaces(bytes, at);
+                if bytes.get(at) != Some(&b'(') {
+                    // `sizeof f()` has no parentheses of its own.
+                    while bytes
+                        .get(at)
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || b"_:.*&".contains(b))
+                    {
+                        at += 1;
+                    }
+                }
+                at = after_group(bytes, at, b'(', b')');
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn skip_spaces(bytes: &[u8], mut at: usize) -> usize {
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    at
+}
+
+/// The position after the balanced `open`..`close` group starting at `at`, or
+/// `at` when no group starts there.
+fn after_group(bytes: &[u8], at: usize, open: u8, close: u8) -> usize {
+    if bytes.get(at) != Some(&open) {
+        return at;
+    }
+    let mut depth = 0usize;
+    for (offset, &byte) in bytes[at..].iter().enumerate() {
+        if byte == open {
+            depth += 1;
+        } else if byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return at + offset + 1;
+            }
+        }
+    }
+    bytes.len()
+}
+
+/// Only instantiate aggregate members whose defaults need lowering. Other
+/// objects need no address temporary.
 fn aggregate_has_default_initializer(
     program: &Program,
     desc: &TypeDesc,
+    in_body: bool,
     seen: &mut Vec<String>,
 ) -> bool {
     let desc = peel_arrays(desc).0;
@@ -13285,13 +13502,11 @@ fn aggregate_has_default_initializer(
     };
     seen.push(name.clone());
     let found = program.types.get(tid).layout.fields.values().any(|field| {
-        !program
-            .types
-            .member_initializers(name, &field.name)
-            .is_empty()
+        default_needs_lowering(program, name, field, in_body)
             || aggregate_has_default_initializer(
                 program,
                 program.types.get(field.type_id).desc.as_ref(),
+                in_body,
                 seen,
             )
     }) || program.bases_of(name).iter().any(|base| {
@@ -13301,6 +13516,7 @@ fn aggregate_has_default_initializer(
                 name: base.clone(),
                 fields: Vec::new(),
             },
+            in_body,
             seen,
         )
     });
@@ -13527,8 +13743,7 @@ fn lower_one_declarator(
     if let Some(init) = init_expr {
         if !braced_ctor
             && (init.cached_kind() != "argument_list"
-                || ctx.current_fn.is_none()
-                    && ctx.is_cpp
+                || ctx.is_cpp
                     && ctx.cpp_standard >= 202002
                     && aggregate_defaults_are_evaluated(
                         program,
@@ -14014,8 +14229,7 @@ fn lower_var_initializer(
     // This is the common boundary for file-scope value, address, array and
     // aggregate initializers. No function body walk follows these operands.
     lower_file_expression_effects(program, ctx, source, init);
-    if ctx.current_fn.is_none()
-        && ctx.is_cpp
+    if ctx.is_cpp
         && (init.cached_kind() == "initializer_list"
             || ctx.cpp_standard >= 202002 && init.cached_kind() == "argument_list")
         && init.named_child_count() > 0
@@ -14040,6 +14254,7 @@ fn lower_var_initializer(
             let values: Vec<_> = init.named_children(&mut init.walk()).collect();
             let span = node_call_span(program, ctx, init);
             let expansion = node_expansion_span(program, ctx, init);
+            let mark = ctx.cfg_mark();
             lower_initializer_object(
                 program,
                 ctx,
@@ -14052,6 +14267,7 @@ fn lower_var_initializer(
                 expansion,
                 &mut Vec::new(),
             );
+            ctx.cfg_truncate(mark);
         });
         return;
     }
@@ -17359,6 +17575,19 @@ struct InitializedObject {
     infer_array_extent: bool,
 }
 
+impl InitializedObject {
+    /// A complete object, not a member of a containing one.
+    fn whole(desc: Arc<TypeDesc>, address: Option<VarId>) -> Self {
+        Self {
+            desc,
+            address,
+            parent: None,
+            member: None,
+            infer_array_extent: false,
+        }
+    }
+}
+
 fn initializer_field(
     program: &mut Program,
     ctx: &LowerContext,
@@ -17991,7 +18220,7 @@ fn lower_initializer_clause(
 ) -> usize {
     let Some(value) = values.first().copied() else {
         // Default member initializers are handled before empty initialization.
-        if lower_default_member_initializer(program, ctx, object, seen) {
+        if lower_default_member_initializer(program, ctx, object, span, seen) {
             return 0;
         }
         return lower_initializer_object(
@@ -19050,16 +19279,28 @@ fn lower_default_member_initializer(
     program: &mut Program,
     ctx: &mut LowerContext,
     object: &InitializedObject,
+    origin: Span,
     seen: &mut Vec<String>,
 ) -> bool {
     let Some((class, field)) = object.member.as_ref() else {
         return false;
     };
     let initializers = program.types.member_initializers(class, field).to_vec();
+    if !initializers.is_empty() && ctx.defaults_in_progress.contains(class) {
+        return true;
+    }
+    let first_site = program.symbols.call_sites.len();
+    ctx.defaults_in_progress.push(class.clone());
     let mut lowered = false;
     for initializer in initializers {
         lowered |=
             lower_member_initializer_expression(program, ctx, object, class, &initializer, seen);
+    }
+    ctx.defaults_in_progress.pop();
+    // Spelled once in the class but run by each constructing function, as a
+    // default argument is; the outermost initializer names the evaluation.
+    for site in &mut program.symbols.call_sites[first_site..] {
+        site.details_mut().default_origin = Some(origin);
     }
     lowered
 }
@@ -19079,6 +19320,13 @@ fn lower_member_initializer_expression(
         object.parent,
         Some(class),
         |program, ctx, source, value| {
+            let built = initialized_class(program, object.desc.as_ref());
+            if holds_no_address(value) && built.is_none() {
+                return;
+            }
+            // A class outside the tree has no constructor body to model and
+            // stores nothing, so only the calls in its expression run here.
+            let unindexed = built.is_some_and(|built| !class_is_indexed(program, &built));
             let values: Vec<_> = if value.cached_kind() == "initializer_list" {
                 value.named_children(&mut value.walk()).collect()
             } else {
@@ -19089,9 +19337,11 @@ fn lower_member_initializer_expression(
             let span = node_call_span(program, ctx, value);
             let expansion = node_expansion_span(program, ctx, value);
             lower_file_expression_effects(program, ctx, source, value);
-            lower_initializer_object(
-                program, ctx, source, object, &values, braced, braced, span, expansion, seen,
-            );
+            if !unindexed {
+                lower_initializer_object(
+                    program, ctx, source, object, &values, braced, braced, span, expansion, seen,
+                );
+            }
             // Nested calls in a default expression belong to the constructing caller.
             if let Some(caller) = ctx.current_fn {
                 walk_function_body(program, ctx, source, value, caller);
@@ -19267,6 +19517,138 @@ fn find_initializer_value(node: Node) -> Option<Node> {
     None
 }
 
+/// The default member initializers a user-provided constructor runs: those of
+/// the bases and members its list leaves out. A delegating constructor leaves
+/// them to its target, and naming one union variant rules out the others.
+fn lower_omitted_member_defaults(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    definition: Node,
+    cls: &str,
+    lists: &[Node],
+) {
+    let Some(class) = program.types.class_type_id(cls) else {
+        return;
+    };
+    let named: Vec<String> = lists
+        .iter()
+        .flat_map(|list| list.children(&mut list.walk()).collect::<Vec<_>>())
+        .filter(|entry| entry.cached_kind() == "field_initializer")
+        .filter_map(|entry| field_initializer_name(source, entry))
+        .collect();
+    let desc = Arc::clone(&program.types.get(class).desc);
+    if named
+        .iter()
+        .any(|name| names_class_or_base(&receiver_lookup_name(name), cls))
+        || matches!(desc.as_ref(), TypeDesc::Union { .. }) && !named.is_empty()
+    {
+        return;
+    }
+    let object = InitializedObject::whole(desc, ctx.locals.get("this").copied());
+    let span = node_call_span(program, ctx, definition);
+    lower_subobject_defaults(program, ctx, &object, &named, span, &mut Vec::new());
+}
+
+fn names_class_or_base(name: &str, class: &str) -> bool {
+    receiver_lookup_name(class) == name || !name.contains("::") && last_segment_of(class) == name
+}
+
+/// Defaults of an object a body builds run at the construction. Their reparsed
+/// nodes are not in the body's graph, so their sites stay with the enclosing
+/// statement rather than the constructor prologue.
+fn lower_defaults_in_place(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    object: &InitializedObject,
+    span: Span,
+) {
+    let mark = ctx.cfg_mark();
+    lower_subobject_defaults(program, ctx, object, &[], span, &mut Vec::new());
+    ctx.cfg_truncate(mark);
+}
+
+/// Run only the default member initializers `object`'s construction evaluates,
+/// skipping `named` bases and members and descending through subobjects no
+/// user-provided constructor owns. A subobject's own constructor is the
+/// caller's lifecycle concern, not this walk's.
+fn lower_subobject_defaults(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    object: &InitializedObject,
+    named: &[String],
+    origin: Span,
+    seen: &mut Vec<String>,
+) {
+    let (TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. }) =
+        peel_arrays(object.desc.as_ref()).0
+    else {
+        return;
+    };
+    let cls = receiver_lookup_name(name).into_owned();
+    if seen.contains(&cls) {
+        return;
+    }
+    let Some(class) = program.types.class_type_id(&cls) else {
+        return;
+    };
+    seen.push(cls.clone());
+    let mut elements = Vec::new();
+    for base in program.bases_of(&cls) {
+        let desc = Arc::new(TypeDesc::Struct {
+            name: base.clone(),
+            fields: Vec::new(),
+        });
+        if !named.iter().any(|name| names_class_or_base(name, &base))
+            && empty_construction_runs_defaults(program, ctx, &desc)
+        {
+            elements.push(InitializedObject::whole(desc, object.address));
+        }
+    }
+    let fields: Vec<_> = program
+        .types
+        .get(class)
+        .layout
+        .fields
+        .iter()
+        .filter(|(_, field)| {
+            !named.contains(&field.name)
+                && (default_needs_lowering(program, &cls, field, true)
+                    || empty_construction_runs_defaults(
+                        program,
+                        ctx,
+                        program.types.get(field.type_id).desc.as_ref(),
+                    ))
+        })
+        .map(|(&id, field)| (id, field.clone()))
+        .collect();
+    for (id, field) in &fields {
+        elements.push(initializer_field(
+            program, ctx, object, &cls, *id, field, origin,
+        ));
+    }
+    for element in &elements {
+        if !lower_default_member_initializer(program, ctx, element, origin, seen) {
+            lower_subobject_defaults(program, ctx, element, &[], origin, seen);
+        }
+    }
+    seen.pop();
+}
+
+fn field_initializer_name(source: &str, entry: Node) -> Option<String> {
+    let name = entry.children(&mut entry.walk()).find(|c| {
+        matches!(
+            c.cached_kind(),
+            "field_identifier"
+                | "identifier"
+                | "qualified_identifier"
+                | "type_identifier"
+                | "template_type"
+        )
+    })?;
+    Some(normalize_qualified(node_text(source, &name)))
+}
+
 /// Constructor member-initializer lists: `Derived() : Base(1, 2), sub_(3) {}`.
 /// Default construction follows automatic-object lifecycle lookup; explicit
 /// construction finds own or explicitly imported constructors. References bind
@@ -19287,19 +19669,9 @@ fn lower_field_initializer_list(
         if fi.cached_kind() != "field_initializer" {
             continue;
         }
-        let Some(name_node) = fi.children(&mut fi.walk()).find(|c| {
-            matches!(
-                c.cached_kind(),
-                "field_identifier"
-                    | "identifier"
-                    | "qualified_identifier"
-                    | "type_identifier"
-                    | "template_type"
-            )
-        }) else {
+        let Some(fname) = field_initializer_name(source, fi) else {
             continue;
         };
-        let fname = normalize_qualified(node_text(source, &name_node));
         // Bind a reference before considering the referent's constructors.
         // Non-class references still take the value-store path below.
         let reference = program.types.field_is_reference(&cls, &fname);
@@ -19307,10 +19679,7 @@ fn lower_field_initializer_list(
         let expansion_span = node_expansion_span(program, ctx, fi);
         let target = bases
             .iter()
-            .find(|b| {
-                receiver_lookup_name(b) == fname
-                    || !fname.contains("::") && last_segment_of(b) == fname
-            })
+            .find(|b| names_class_or_base(&fname, b))
             .map(|base| InitializedObject {
                 desc: Arc::new(TypeDesc::Struct {
                     name: base.clone(),
@@ -19399,10 +19768,7 @@ fn store_member_initializer(
         return;
     };
     // A literal holds no address, and neither does a `bool` or floating member.
-    if matches!(
-        value.cached_kind(),
-        "number_literal" | "true" | "false" | "char_literal" | "null" | "nullptr"
-    ) {
+    if holds_no_address(value) {
         return;
     }
     let Some(this) = ctx.locals.get("this").copied() else {
@@ -19432,6 +19798,13 @@ fn store_member_initializer(
     let span = node_span(program, ctx, fi);
     let expression = operation_expression(ctx, source, fi);
     record_operation_origins(program, ctx, first_flow, first_pending, span, &expression);
+}
+
+fn holds_no_address(value: Node) -> bool {
+    matches!(
+        value.cached_kind(),
+        "number_literal" | "true" | "false" | "char_literal" | "null" | "nullptr"
+    )
 }
 
 fn last_segment_of(name: &str) -> &str {
@@ -29160,6 +29533,53 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
 }
 
 #[cfg(test)]
+mod default_call_tests {
+    use super::expression_may_call;
+
+    #[test]
+    fn an_evaluated_call_or_new_may_call() {
+        for text in [
+            "f()",
+            "ns::f(1)",
+            "new T",
+            "::new (p) T",
+            "static_cast<int>(f())",
+            "sizeof(int) + f()",
+            "sizeof g + f()",
+            "my_sizeof(x)",
+            "my_cast<int>(x)",
+            "decltype(x)(f())",
+            "typeid(f())",
+        ] {
+            assert!(expression_may_call(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_name_cast_or_unevaluated_operand_does_not_call() {
+        for text in [
+            "1",
+            "name",
+            "renew",
+            "a + b",
+            "&handler",
+            "sizeof(f())",
+            "sizeof f()",
+            "sizeof (g(h()))",
+            "alignof(T)",
+            "decltype(f())",
+            "noexcept(f())",
+            "__typeof__(f())",
+            "static_cast<int>(x)",
+            "reinterpret_cast<void (*)(int)>(p)",
+            "const_cast<std::function<void()> &>(x)",
+        ] {
+            assert!(!expression_may_call(text), "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod index_window_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31099,6 +31519,7 @@ mod qualified_variable_lookup_tests {
             default_scopes: Vec::new(),
             call_default_bindings: HashMap::default(),
             initializer_default_scopes: RefCell::default(),
+            defaults_in_progress: Vec::new(),
             declared_default_nodes: RefCell::default(),
             declaration_syntax: RefCell::default(),
             is_cpp: true,

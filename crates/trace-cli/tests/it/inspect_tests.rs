@@ -136,6 +136,26 @@ fn lambda_free_public_graph_and_cli_count_scheduled_callbacks_as_one_hop() {
 }
 
 #[test]
+fn immediately_invoked_default_member_initializer_contracts_to_its_body_calls() {
+    let db = export_tree_with(
+        &fixture("cpp_default_member_initializers"),
+        "default_member_initializers",
+        false,
+    );
+    let conn = open_db(&db).unwrap();
+    let edges: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM call_edges e JOIN functions c ON c.id=e.caller_fn_id \
+             JOIN functions t ON t.id=e.callee_fn_id \
+             WHERE c.name='Lambda::Lambda' AND t.name='Lh'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(edges, 1);
+}
+
+#[test]
 fn immediately_invoked_lambdas_contract_to_their_body_calls() {
     for full in [false, true] {
         let db = export_tree_with(&fixture("immediate_lambda"), "immediate_lambda", full);

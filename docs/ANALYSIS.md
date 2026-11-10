@@ -4199,6 +4199,22 @@ C++-aware only where it must be — everything else reuses the C machinery.
   class members as well as bases. Omitted members first use their default member
   initializer, retained with declaration scope and source mapping through cached
   headers; explicit initializers and copies do not apply those defaults.
+  A user-provided constructor runs the default of every member its list does
+  not name, as the caller of the expression's calls, and reaches defaults nested
+  in omitted bases and members that have no user-provided constructor of their
+  own; a list entry replaces the default, and a delegating constructor leaves
+  defaults to its target. A class with no user-provided constructor has no body
+  to own them, so the function that declares, braces or `new`s the object is
+  their caller, at that construction in the call-sequence graph. Each caller
+  keeps its own site at the initializer's spelling, the same ownership a default
+  argument has, however many objects it constructs and whatever its linkage. A temporary (`return T{}`, `T x = T()`) does not run its defaults
+  in this model, and a file-scope `new T()` has no function to own them. Inside a body, defaults are lowered
+  only when they can have an effect: one evaluating a call (a keyword cast's own parentheses and an unevaluated operand such as `sizeof(f())` or `decltype(f())` are not one) or `new`, building a
+  class the tree defines, storing an address into a pointer member, or naming a
+  function for a member of unknown type. A class outside the tree records no constructor site
+  from a default, because it has no body to model and stores nothing; only the
+  calls in its expression run. Operators on names (`a + b`) are not treated as
+  calls here.
   Declaration-scope namespace imports are restored for the expression, without
   the caller's locals or aliases. Distinct initializer variants remain possible
   alternatives when type metadata merges.

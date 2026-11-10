@@ -1,5 +1,5 @@
 {
-  "note": "Fresh 2026-11-08 release comparison for #244 rebased on local master 5555e9a; measurements and historical recaptures are authoritative in docs/EVAL_REPORT.md, Store projections and declaration-scoped defaults. Argument-flow band centers are HDF 72232 (both entries), HiView 32470 and Camera 58694, with tolerances unchanged. Keep the exact HDF indirect total 5139 separate from named recovery and known-imprecision probes. Preserve master's 222-site Camera named-cast calibration and ability_runtime SendTransactCmd IPC probes. Added ability_runtime probes retain matching integer StartAbility overloads, exclude the six remote-token overload edges, and pin evaluated DataObsOption defaults and four conservative LifecycleFlow aggregate calls. Correctness metrics use exact or named-site checks; bulk totals keep their established bands.",
+  "note": "Fresh 2026-11-08 release comparison for #244 rebased on local master 5555e9a; measurements and historical recaptures are authoritative in docs/EVAL_REPORT.md, Store projections and declaration-scoped defaults. Argument-flow band centers are HDF 72400 (both entries), HiView 32470 and Camera 58694, with tolerances unchanged. Keep the exact HDF indirect total 5139 separate from named recovery and known-imprecision probes. Preserve master's 222-site Camera named-cast calibration and ability_runtime SendTransactCmd IPC probes. Added ability_runtime probes retain matching integer StartAbility overloads, exclude the six remote-token overload edges, and pin evaluated DataObsOption defaults and four conservative LifecycleFlow aggregate calls. Correctness metrics use exact or named-site checks; bulk totals keep their established bands.",
   "budget_pops": 800000,
   "jobs": 8,
   "corpora": {
@@ -18,11 +18,11 @@
         "edges_indirect": {"cmp": "exact", "value": 5139},
         "edges_external": {"cmp": "band", "value": 23909, "tol": 200},
         "edges_ipc": {"cmp": "exact", "value": 58},
-        "arg_flow_edges": {"cmp": "band", "value": 72232, "tol": 150},
+        "arg_flow_edges": {"cmp": "band", "value": 72400, "tol": 150},
         "diagnostics": {"cmp": "exact", "value": 1910},
         "dlsym_edges": {"cmp": "exact", "value": 6},
         "public_functions_total": {"cmp": "band", "value": 12145, "tol": 20},
-        "public_edges_total": {"cmp": "band", "value": 78613, "tol": 80}
+        "public_edges_total": {"cmp": "band", "value": 78709, "tol": 80}
       },
       "sites": [
       {"case": "HdfRemoteServiceCheckInterfaceToken -> the C++ adapter body (#83: the `extern \"C\"` prototype in hdf_remote_adapter_if.h and the definition in hdf_remote_adapter.cpp interned `struct HdfRemoteService *` under two ids, so the overload check split them and this call stopped at the undefined prototype)", "caller": "%HdfRemoteServiceCheckInterfaceToken", "line": 68, "resolution": "direct", "expected": 1},
@@ -67,7 +67,7 @@
       {"name": "no external name carries both a definition and a declaration-only entity (#83: a prototype the overload check refused to merge with its own definition leaves callers bound to the undefined entity; hdf's C-over-C++ IPC interface put 10 names in this state)", "sql": "SELECT COUNT(*) FROM (SELECT name FROM functions WHERE linkage='external' GROUP BY name HAVING SUM(is_defined)>0 AND SUM(1-is_defined)>0)", "cmp": "exact", "value": 0},
         {"name": "DevHostServiceAddDevice reaches the driver loader's GetDriver and both ReclaimDriver bodies (#127 review: the constructor stores them through `HdfDriverLoader.super`, the call loads them through `IDriverLoader *`; two interned snapshots of `IDriverLoader` split the field summary, which the pointer-static seed used to paper over)", "sql": "SELECT COUNT(DISTINCT tf.name) FROM call_edges e JOIN functions cf ON cf.id=e.caller_fn_id JOIN functions tf ON tf.id=e.callee_fn_id WHERE cf.name='DevHostServiceAddDevice' AND e.resolution='indirect' AND tf.name IN ('HdfDriverLoaderGetDriver', 'HdfDriverLoaderReclaimDriver', 'HdfDriverLoaderFullReclaimDriver')", "cmp": "exact", "value": 3},
         {"name": "flow_graph_nodes", "sql": "SELECT COUNT(*) FROM flow_nodes", "cmp": "min", "value": 100000},
-        {"name": "arg_flow_rows_per_call_edge", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites cs ON cs.id=a.call_site_id", "cmp": "band", "value": 72232, "tol": 150},
+        {"name": "arg_flow_rows_per_call_edge", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites cs ON cs.id=a.call_site_id", "cmp": "band", "value": 72400, "tol": 150},
         {"name": "no member indexed under a declarator fragment (#46: a conversion operator's `operator_cast` declarator was unknown to both member walks, so `operator bool() const {...}` fell out of a generic walk as `X::()const`; the real `operator()` stays, and so does a conversion whose target is a function pointer or reference — `X::operator void(*)` is the correct name for one)", "sql": "SELECT COUNT(*) FROM functions WHERE name GLOB '*(*' AND name NOT GLOB '*operator()' AND name NOT GLOB '*operator *(*'", "cmp": "exact", "value": 0},
         {"name": "no member indexed under the bare keyword `operator` (#46: `normalize_qualified` stripped `<...>` as a template-argument span, truncating the whole `operator<` / `<=` / `<<` / `<=>` family to the keyword and collapsing a class's comparison operators into one symbol)", "sql": "SELECT COUNT(*) FROM functions WHERE name='operator' OR name GLOB '*::operator'", "cmp": "exact", "value": 0},
         {"name": "no member indexed under a standard attribute (#46 review: `[[deprecated]] void LockForControl();` parses cleanly -- no error recovery involved -- but the attribute holds an identifier in front of the declaration and the member walk took it, collapsing every annotated member of a class into one symbol; camera lost 26 `CameraInput` / `CameraManager` members to 7 such phantoms)", "sql": "SELECT COUNT(*) FROM functions WHERE name GLOB '*::deprecated' OR name GLOB '*::nodiscard' OR name GLOB '*::maybe_unused' OR name GLOB '*::noreturn' OR name GLOB '*::fallthrough' OR name GLOB '*::visibility' OR name GLOB '*::dllexport' OR name GLOB '*::dllimport'", "cmp": "exact", "value": 0},
@@ -196,10 +196,12 @@
       "analyze_args": ["--ignore-logging", "--timeout-secs", "600"],
       "globals": {
         "edges_ipc": {"cmp": "exact", "value": 1762},
+        "edges_indirect": {"cmp": "exact", "value": 1848},
         "public_functions_total": {"cmp": "band", "value": 78881, "tol": 400},
         "public_edges_total": {"cmp": "band", "value": 373780, "tol": 1300}
       },
       "probes": [
+        {"name": "the solver converges within the check's budget (a partial fixpoint silently drops indirect edges, as 800000 pops did for #271)", "sql": "SELECT COUNT(*) FROM diagnostics WHERE stage='analyze' AND message LIKE 'solver stopped early%'", "cmp": "exact", "value": 0},
         {"name": "an IN_PROCESS_CALL of a local lambda reaches the lambda's callee (#268: implicit_start_processor.cpp:260 had no entering edge, 0 on the baseline)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id WHERE c.name='OHOS::AAFwk::ImplicitStartProcessor::ImplicitStartAbility' AND t.name='OHOS::AAFwk::ImplicitStartProcessor::CallStartAbilityInner'", "relations": "public", "cmp": "exact", "value": 1},
         {"name": "no immediately invoked lambda is left without an edge (#268: every site with the lambda's source as callee had 0 edges on the baseline)", "sql": "SELECT COUNT(*) FROM call_sites s WHERE (s.callee_text GLOB '*::$lambda[0-9]*:[0-9]*' OR s.callee_text LIKE '[%') AND NOT EXISTS (SELECT 1 FROM call_edges e WHERE e.call_site_id=s.id)", "cmp": "exact", "value": 0},
         {"name": "parenthesized auto self at mission_list_manager.cpp:2195 reaches both captured receiver calls", "sql": "SELECT COUNT(DISTINCT t.name) FROM raw_call_edges e JOIN raw_call_sites s ON s.id=e.call_site_id JOIN files p ON p.id=s.file_id JOIN raw_functions t ON t.id=e.callee_fn_id WHERE p.path LIKE '%/services/abilitymgr/src/mission/mission_list_manager.cpp' AND e.resolution='direct' AND ((s.line=2198 AND t.name='OHOS::AAFwk::MissionListManager::PrintTimeOutLog') OR (s.line=2199 AND t.name='OHOS::AAFwk::MissionListManager::CompleteBackground'))", "cmp": "exact", "value": 2},
