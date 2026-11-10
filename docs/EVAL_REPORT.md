@@ -1,5 +1,64 @@
 # Evaluation Report
 
+## Indexing cost of conditional lowering — 2026-11-10
+
+Conditional lowering (#256, `07a7935`) made Camera indexing 5.5 s slower
+single-threaded and raised its peak resident set by 64 MB. Two causes:
+
+- **Enum names copied on every merge.** #256 added the unscoped enum tags and
+  enumerators to the type table, and `merge_struct_declarations` copied both
+  sets into the importing table on every unit merge. On Camera that call runs
+  99,924 times; the enumerator set it reads averages 163 names (16.3 million
+  in all), of which 740,000 (4.5%) were new to the destination. Each name was
+  hashed and cloned before the destination rejected it, and every table held
+  its own copy. The sets are now shared: a merge adds a reference to a set it
+  does not hold ([Conditional values](ANALYSIS.md#conditional-values)).
+- **New lookups on every declaration and call.** A member prototype looked its
+  return type up three times instead of once (return category, the new
+  reference check, return cv), and every C++ call asked whether its callee is
+  a pointer, function or reference alias by walking the enclosing classes,
+  their bases and the namespaces. Each declaration now looks its return type up
+  once; reference and callable-reference lookups are skipped when no such alias
+  exists; and alias-cast recognition first checks a hash of every alias name's
+  last segment, then asks about shadowing values only once an alias is found.
+
+Exported data is unchanged: all 139 relations match on HDF, HiView and Camera
+except run metadata, and the 175 pinned-corpus checks pass.
+
+Median of three interleaved runs, `--jobs 8`, 8 cores, 11 GiB. "Worker time" is
+`TRACE_PROFILE_INDEX=1` summed over workers. "This change" is on master at
+`a8a65de`, so it also carries the commits after #256.
+
+| Camera | Parent (`5555e9a`) | #256 (`07a7935`) | This change |
+|---|---:|---:|---:|
+| Type import, worker time | 12.5 s | 16.0 s | 12.9 s |
+| `merge-types`, worker time | 4.9 s | 6.1 s | 4.9 s |
+| `ast-lower`, worker time | 17.8 s | 20.3 s | 18.8 s |
+| Peak resident set | 658 MB | 721 MB | 670 MB |
+| User CPU | 83.5 s | 90.1 s | 88.6 s |
+| Wall time | 27.4 s | 30.1 s | 31.6 s |
+
+Single-threaded (`--jobs 1`, one run), where the indexing phase excludes export:
+
+| Camera | Parent | #256 | This change |
+|---|---:|---:|---:|
+| Indexing phase | 71.3 s | 76.8 s | 74.4 s |
+| `ast-lower` | 15.7 s | 17.9 s | 17.2 s |
+| Type import | 11.9 s | 15.6 s | 12.6 s |
+| Export phase | 4.9 s | 5.9 s | 8.6 s |
+| Peak resident set | 567 MB | 632 MB | 581 MB |
+
+HiView's peak resident set is 213, 222 and 216 MB, its `ast-lower` 3.9, 4.5 and
+4.2 s. HDF's `ast-lower` is 5.4, 6.1 and 6.0 s; its 17 MB of growth is not in the
+enum sets and is unchanged.
+
+The wall time includes the commits after #256. Camera's export phase grew from
+5.9 to 8.6 s with lambda-free publication (`d1679a2`) and its foreign-key
+verification (#277); that serial phase, not indexing, now holds the wall time above
+#256. What remains of #256 in lowering is spread over the per-expression probes
+it added (cast detection, return-flow collection, default arguments) at a few
+dozen samples each.
+
 ## Foreign-key verification after publication — 2026-11-10
 
 Issue #272, `PRAGMA foreign_key_check` timed alone on exported databases at

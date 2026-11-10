@@ -1256,6 +1256,10 @@ Reference-return classification follows the complete declarator to the
 function's own return binding, including pointer-reference returns such as
 `F *&get()`, and resolves trailing reference aliases (`auto get() -> R`). A
 pointer to a function returning a reference remains a pointer return.
+One declaration's return category and return cv qualification share a single
+lookup of its return type. The lookup is skipped when no reference alias exists
+in the type table or an enclosing block, since then no spelling can name one;
+the same holds for callable aliases that return references.
 Ordinary consumers of a returned pointer reference still receive the loaded
 pointer value; its original cell address is a separate `LvalueAddress` fact.
 Callable aliases also retain whether their function returns a reference,
@@ -1408,6 +1412,13 @@ all evaluated operands retain their calls, effects and source provenance.
 For a reference cast, the argument-list-shaped comma operand forwards its last
 operand's original cell to address lowering as well as its value.
 The same nearest-type/value/function shadowing rules as reference casts apply.
+Recognition asks first whether any alias name ends in the callee's last `::`
+segment, then walks the scopes, and only after finding an alias asks whether a
+nearer value hides it: most calls name a function, so neither lookup runs for
+them. Every alias-only scope lookup (alias casts, alias cv and reference
+categories, callable aliases, aliased instantiations) makes the same
+last-segment check first; the type table keeps a hash of each alias name's last
+segment for it.
 
 Built-in array ranges consume the same element summary when a range-for
 expression selects arrays or uses comma/assignment values. Explicit, `auto`
@@ -1546,7 +1557,12 @@ known unscoped enum tags and directly spelled defined unscoped enumerators
 also admit integer offsets. Class bodies register their enums in the owning
 scope, and enum/enumerator offset lookup uses ordinary enclosing scopes,
 using-declarations and using-directives. Their integer category survives shared
-type imports. Built-in integral arithmetic, shifts, bitwise/unary operations,
+type imports. A table keeps the names it noted itself and a reference to each
+imported table's set; it does not copy them. A header's set is its whole
+include closure and the header is imported into every including unit, so a copy
+per import costs a hash probe per name per merge and a set per table, while a
+lookup, which is rare, probes each layer. An imported layer is a snapshot.
+Built-in integral arithmetic, shifts, bitwise/unary operations,
 comparisons and logical operations retain integral offset compatibility when
 their operands establish the required built-in types. Integral cast targets
 and `sizeof`/`alignof` also establish it. This category probe stays separate
