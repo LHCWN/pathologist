@@ -15,6 +15,22 @@ edges.
 See [C++ support](docs/ANALYSIS.md#c-support-first-step);
 measurements in `docs/EVAL_REPORT.md` ("Default member initializers").
 
+### Compact raw relations for lambda-free exports
+
+The lambda-free publication step no longer copies every changed relation into
+`raw_*`. Each changed `raw_*` relation is now a view over the public table plus
+a compact delta of the original rows the projection rewrote or removed, and a
+key list for rows it added. Unchanged rows are stored once. On the camera
+checkout the minimal export shrank from 122,650,624 to 70,295,552 bytes
+(−42.7%); public and `raw_*` rows are unchanged. Identity provenance rows are
+reconstructed as a view instead of stored, saving another 9.34 MB on Ability
+runtime; an edge reached both directly and through a lambda keeps its identity
+mapping. The raw views are attachable under another schema name, and
+`trace-merge` materializes the overlays it scans to recover most of its bulk
+read cost. See
+[projection provenance](docs/SQLITE_SCHEMA.md#complete-graph-and-projection-provenance)
+and [measurements](docs/EVAL_REPORT.md#lambda-free-raw-overlays--2026-11-10).
+
 ### Resolve immediately invoked lambdas (#268)
 
 A lambda invoked where it is written, every `IN_PROCESS_CALL(...)` expansion

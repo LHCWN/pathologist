@@ -236,8 +236,12 @@ targets use their inherited stable function identities, so adding unrelated
 inputs does not renumber unchanged contracted edges. A hash collision rejects
 publication instead of assigning an order-dependent ID. Public edges are
 deduplicated on `(caller_fn_id, callee_fn_id, call_site_id, resolution)`;
-`lambda_call_provenance(edge_id, entry_edge_id)` maps every public edge to its
-original `raw_call_edges.id` entering edges. One entering edge can have
+`lambda_call_provenance(edge_id, entry_edge_id)` is a view that maps every
+public edge to its original `raw_call_edges.id` entering edges. An ordinary
+edge maps to itself and is reconstructed from `call_edges`; only contracted
+mappings are stored in `trace_lambda_call_provenance`, plus the identity pair
+when that same public edge is also reached directly. One entering edge can
+have
 multiple projected leaves, and a public edge reached via multiple entering
 edges links to each one. SQL row order is unspecified; use `ORDER BY`.
 
@@ -273,10 +277,13 @@ visible ownership; full linking always uses the raw facts.
 Every original relation has a `raw_` counterpart, for example
 `raw_functions`, `raw_call_edges`, `raw_variables`, `raw_flow_nodes`,
 `raw_execution_contexts`, and `raw_link_method_facts`. These expose the complete
-analysis, including original lambda ownership, text, and provenance. Changed
-storage is copied before projection; unaffected raw relations alias shared
-storage. This adds disk and export work for affected relations, without
-copying the large unchanged flow-edge and operation-provenance tables.
+analysis, including original lambda ownership, text, and provenance. A changed
+relation is published as a view over the public table plus a compact
+`trace_raw_delta_*` table holding only the original rows the projection rewrote
+or removed, and `trace_raw_added_*` listing public keys it added. Unchanged rows
+therefore exist once, in the public table. Unaffected raw relations alias shared
+storage directly. The temporary whole-table snapshots used while publication
+runs live in the temporary schema and leave no trace in the file.
 Minimal/full exports and merged outputs share the same publication step.
 `trace-merge` reads raw relations when present, including when re-merging a
 merged output, so projection never changes linking inputs.
@@ -308,6 +315,8 @@ Projection closure is computed at export time and public call edges are
 indexed before publication. A large reachable lambda component can still
 increase export work; the earlier [synthetic query measurements](EVAL_REPORT.md#lambda-free-view-review--2026-11-06)
 measure the old v8 view implementation, not production v9 export scalability.
+The compact overlay cost is measured in
+[EVAL_REPORT.md](EVAL_REPORT.md#lambda-free-raw-overlays--2026-11-10).
 
 ```sql
 SELECT caller.name, callee.name, e.resolution, e.call_site_id

@@ -115,6 +115,43 @@ to retain its intended count of 75. The public projection contains 74:
 probe's relation selection changes. All 17 ability-runtime checks pass
 against the fresh release database with these raw-graph probes.
 
+## Lambda-free raw overlays — 2026-11-10
+
+The v9 publication step physically copied every relation the projection
+rewrites into `raw_*` and duplicated its indexes. On the Ability-runtime
+export this duplicated **233.9 MiB** (171.9 MiB tables, 61.9 MiB indexes) of a
+**576,716,800-byte** database, even though only 3,403 of 82,304 functions and
+18,264 of 1.06M variables actually changed. The camera checkout (`8ffd69d`)
+had **52,183,040 bytes** (49.8 MiB) of the same duplication in a
+122,650,624-byte pre-rebase export.
+
+Changed relations are now published as `raw_*` views over the public table plus
+a `trace_raw_delta_*` table holding only the original rows the projection
+rewrote or removed and a `trace_raw_added_*` key list. The temporary
+whole-table snapshots needed during publication live in the temporary schema.
+The current tree's camera export is **70,295,552 bytes**, 42.7% below the
+pre-rebase full-copy measurement, and the public and `raw_*` relations compare
+row-for-row identical to the full-copy output.
+Export time moves from 7.7 s to 9.9 s for the extra delta work.
+
+`lambda_call_provenance` no longer stores an identity row for every edge:
+678,006 of its 683,288 rows on Ability runtime repeated `(edge_id, edge_id)`.
+The public relation is now a view that reconstructs those rows from
+`call_edges`; only the 5,282 contracted mappings are stored. An edge reached
+both directly and through a lambda keeps its identity entry, so the view does
+not lose a mapping. This removes another 9.34 MB there and 1.50 MB on camera.
+An Ability-runtime export with the same include set (the unavailable generated
+dependency root omitted) fell from **576,716,800 to 332,525,568 bytes
+(−42.3%)**. Public columns and row semantics are unchanged.
+
+`trace-merge` materializes the overlay relations it scans once per input. On
+`--full-export --sequencing` camera and hiview inputs, two merge rounds moved
+from 47.0 s and 50.5 s before this change to 36.2 s and 37.0 s after it. The
+merged output compares row for row with the earlier output. Merging physical
+`raw_*` tables is still faster because it never reconstructs unchanged rows;
+that is the disk-versus-bulk-read trade-off, and the merged file still shrinks
+from 144.6 MB to 75.3 MB.
+
 ## Lambda-free view review — 2026-11-06
 
 These are historical measurements of the SQL view prototype developed while

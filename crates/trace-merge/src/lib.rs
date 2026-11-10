@@ -23,6 +23,24 @@ use identity::Identity;
 /// Call-order graph ids read from an input at a time.
 const CFG_READ_CHUNK: i64 = 1024;
 
+// Merge scans and joins these relations in full. Lambda-free overlays are
+// materialized once per input so each row is not reconstructed repeatedly.
+const MATERIALIZED_RELATIONS: &[&str] = &[
+    "functions",
+    "call_sites",
+    "call_edges",
+    "execution_contexts",
+    "cfg_functions",
+    "cfg_blocks",
+    "cfg_edges",
+    "cfg_events",
+    "cfg_event_sites",
+    "cfg_event_order",
+    "cfg_gaps",
+    "merge_function_identities",
+    "merge_call_site_identities",
+];
+
 // Use the same projections for capability checks and ingestion. Additive v7
 // flow metadata is optional here because the merger only preserves call graphs.
 const READ_FILES: &str = "SELECT id, path, sha256, is_dep FROM files ORDER BY id";
@@ -556,6 +574,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         // Linking must consume the complete graph, never a previously
         // contracted public projection (including on a merge of merges).
         trace_db::use_raw_relations(&conn)?;
+        trace_db::materialize_raw_relations(&conn, MATERIALIZED_RELATIONS)?;
         // Preparing every ingestion query checks required tables and columns,
         // including empty inputs, before any output is created or replaced.
         require_reads(

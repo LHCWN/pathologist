@@ -2,7 +2,7 @@
 //! finish on the complete graph before this final presentation step.
 use anyhow::{bail, Context, Result};
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -129,7 +129,121 @@ fn raw_sql(sql: &str, names: &BTreeSet<String>) -> String {
         .into_owned()
 }
 
-fn preserve_raw(conn: &Connection, has_lambdas: bool) -> Result<()> {
+/// Fallback columns for a relation without a primary key that is not keyed by
+/// rowid. Tables with a primary key use it directly, so overlay keys cannot
+/// drift from the relation's own identity. `flow_calls` and
+/// `flow_return_calls` are keyed by rowid instead, since duplicates are legal.
+fn fallback_key_columns(table: &str) -> &'static [&'static str] {
+    match table {
+        "flow_return_calls" => &["src_node", "dst_node", "call_site_id", "callee_fn_id"],
+        "flow_calls" => &["src_node", "dst_node", "call_site_id", "arg_index"],
+        _ => &["id"],
+    }
+}
+
+/// Columns identifying a row of `table`. The projection only deletes or
+/// rewrites rows; the overlay view needs a stable key to pick the original
+/// version out of `trace_raw_delta_*` instead of the public row.
+fn primary_key_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare("SELECT name FROM pragma_table_info(?1,'main') WHERE pk>0 ORDER BY pk")?
+        .query_map([table], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn key_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let primary = primary_key_columns(conn, table)?;
+    if !primary.is_empty() {
+        return Ok(primary);
+    }
+    Ok(fallback_key_columns(table)
+        .iter()
+        .map(|c| (*c).to_owned())
+        .collect())
+}
+
+/// These changed relations have no primary key. Their overlay uses the
+/// original rowid so duplicate value rows keep their multiplicity.
+fn rowid_keyed(table: &str) -> bool {
+    matches!(table, "flow_calls" | "flow_return_calls")
+}
+
+fn row_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare("SELECT name FROM pragma_table_info(?1,'main') ORDER BY cid")?
+        .query_map([table], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Relations that keep their original definition and therefore only need a
+/// `raw_*` alias after publication.
+struct RawPlan {
+    /// Original relations that the projection rewrites; each has a temporary
+    /// whole-table snapshot while publication runs.
+    changed: Vec<String>,
+    /// Relations the projection leaves untouched, as `(kind, name, sql)`.
+    unchanged: Vec<(String, String, String)>,
+    /// Every original relation name, for rewriting raw view definitions.
+    relations: BTreeSet<String>,
+}
+
+/// Rebuild the source table's lookup indexes on a temporary snapshot. The
+/// snapshots have no primary key of their own, and publication's recursive
+/// closure joins them; without these indexes it scans whole tables per row.
+fn snapshot_indexes(conn: &Connection, table: &str) -> Result<()> {
+    let raw = quote(&format!("raw_{table}"));
+    let key_columns = if rowid_keyed(table) {
+        vec!["__trace_rowid".to_owned()]
+    } else {
+        key_columns(conn, table)?
+    };
+    let key_list = key_columns
+        .iter()
+        .map(|c| quote(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute_batch(&format!(
+        "CREATE UNIQUE INDEX temp.{} ON {raw}({key_list})",
+        quote(&format!("trace_snapshot_key_{table}"))
+    ))
+    .with_context(|| format!("projection key columns are not unique for {table}"))?;
+    let indexes: Vec<(String, i64)> = conn
+        .prepare("SELECT name, partial FROM pragma_index_list(?1)")?
+        .query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (index, partial) in indexes {
+        if partial != 0 {
+            continue;
+        }
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?
+            .query_map([&index], |r| r.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        // The primary key is already covered by the unique key index above.
+        if columns.is_empty() || columns == key_columns {
+            continue;
+        }
+        let columns = columns
+            .iter()
+            .map(|c| quote(c))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute_batch(&format!(
+            "CREATE INDEX temp.{} ON {raw}({columns})",
+            quote(&format!("trace_snapshot_{index}"))
+        ))?;
+    }
+    Ok(())
+}
+
+/// Snapshot every changed table into the temporary schema and create the
+/// `raw_*` aliases the projection reads. The snapshots keep projection stable
+/// while it rewrites the public tables, and the temporary aliases keep the
+/// projection SQL identical whether or not a relation is changed.
+fn preserve_raw(conn: &Connection, has_lambdas: bool) -> Result<RawPlan> {
     let objects = conn
         .prepare(
             "SELECT type,name,tbl_name,sql FROM sqlite_schema
@@ -156,30 +270,287 @@ fn preserve_raw(conn: &Connection, has_lambdas: bool) -> Result<()> {
         .filter(|_| has_lambdas)
         .map(|s| (*s).to_owned())
         .collect();
-    for (kind, name, table, sql) in &objects {
-        match kind.as_str() {
-            "table" if changed.contains(name) => {
-                conn.execute_batch(&raw_sql(sql, &changed))?;
-                conn.execute_batch(&format!(
-                    "INSERT INTO {} SELECT * FROM {}",
+    if !has_lambdas {
+        for (kind, name, _table, sql) in &objects {
+            match kind.as_str() {
+                "table" => conn.execute_batch(&format!(
+                    "CREATE VIEW {} AS SELECT * FROM {}",
                     quote(&format!("raw_{name}")),
                     quote(name)
+                ))?,
+                "view" => conn.execute_batch(&raw_sql(sql, &relations))?,
+                _ => {}
+            }
+        }
+        return Ok(RawPlan {
+            changed: Vec::new(),
+            unchanged: Vec::new(),
+            relations,
+        });
+    }
+    let mut snapshotted = Vec::new();
+    let mut unchanged = Vec::new();
+    for (kind, name, _table, sql) in &objects {
+        let raw_name = quote(&format!("raw_{name}"));
+        match kind.as_str() {
+            "table" if changed.contains(name) => {
+                conn.execute_batch(&format!(
+                    "CREATE TEMP TABLE {raw_name} AS SELECT {} * FROM {}",
+                    if rowid_keyed(name) {
+                        "rowid AS \"__trace_rowid\","
+                    } else {
+                        ""
+                    },
+                    quote(name)
                 ))?;
+                snapshot_indexes(conn, name)?;
+                snapshotted.push(name.clone());
             }
             "table" => conn.execute_batch(&format!(
-                "CREATE VIEW {} AS SELECT * FROM {}",
+                "CREATE TEMP VIEW {raw_name} AS SELECT * FROM {}",
+                quote(name)
+            ))?,
+            "view" => {
+                let rewritten =
+                    raw_sql(sql, &relations).replacen("CREATE VIEW", "CREATE TEMP VIEW", 1);
+                conn.execute_batch(&rewritten)?;
+            }
+            _ => continue,
+        }
+        if kind != "table" || !changed.contains(name) {
+            unchanged.push((kind.clone(), name.clone(), sql.clone()));
+        }
+    }
+    Ok(RawPlan {
+        changed: snapshotted,
+        unchanged,
+        relations,
+    })
+}
+
+/// Publish a changed relation that has no primary key by keeping the original
+/// rowids. Duplicate value rows are legal in these relations, so keying on
+/// their columns would lose multiplicity.
+fn publish_rowid_overlay(conn: &Connection, table: &str) -> Result<()> {
+    let delta = format!("trace_raw_delta_{table}");
+    let added = format!("trace_raw_added_{table}");
+    let raw = quote(&format!("raw_{table}"));
+    let public = quote(table);
+    let columns = row_columns(conn, table)?
+        .iter()
+        .map(|c| quote(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute_batch(&format!(
+        "CREATE TABLE main.{} AS SELECT * FROM {raw} s
+         WHERE s.{} NOT IN (SELECT rowid FROM {public})",
+        quote(&delta),
+        quote("__trace_rowid")
+    ))?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE main.{} AS SELECT rowid AS {} FROM {public} t
+         WHERE t.rowid NOT IN (SELECT {} FROM {raw})",
+        quote(&added),
+        quote("__trace_rowid"),
+        quote("__trace_rowid")
+    ))?;
+    for (prefix, name) in [("delta", &delta), ("added", &added)] {
+        conn.execute_batch(&format!(
+            "CREATE INDEX {} ON {}({})",
+            quote(&format!("trace_raw_{prefix}_key_{table}")),
+            quote(name),
+            quote("__trace_rowid")
+        ))?;
+    }
+    conn.execute_batch(&format!(
+        "DROP TABLE temp.{}",
+        quote(&format!("raw_{table}"))
+    ))?;
+    conn.execute_batch(&format!(
+        "CREATE VIEW main.{} AS
+         SELECT {columns} FROM {public} t
+          WHERE t.rowid NOT IN (SELECT {} FROM {added})
+            AND t.rowid NOT IN (SELECT {} FROM {delta})
+         UNION ALL
+         SELECT {columns} FROM {delta}",
+        quote(&format!("raw_{table}")),
+        quote("__trace_rowid"),
+        quote("__trace_rowid")
+    ))?;
+    Ok(())
+}
+
+/// Replace the temporary snapshots with `raw_*` views over the public tables
+/// plus one compact delta of the original rows. `trace_raw_delta_*` holds the
+/// rows the projection changed or removed; `trace_raw_added_*` holds public
+/// keys the projection added. Unchanged rows are read from the public table,
+/// so a lambda in one function no longer duplicates every changed relation.
+fn publish_raw_overlays(conn: &Connection, plan: &RawPlan) -> Result<()> {
+    for table in &plan.changed {
+        if rowid_keyed(table) {
+            publish_rowid_overlay(conn, table)?;
+            continue;
+        }
+        let delta = format!("trace_raw_delta_{table}");
+        let added = format!("trace_raw_added_{table}");
+        let keys = key_columns(conn, table)?;
+        let key_list = keys.iter().map(|k| quote(k)).collect::<Vec<_>>().join(",");
+        let raw = quote(&format!("raw_{table}"));
+        let public = quote(table);
+        if !primary_key_columns(conn, table)?.is_empty() {
+            // Probe the public primary key instead of sorting both relations:
+            // unchanged rows are the overwhelmingly common case, and a merged
+            // export has enough rows that the sort dominates publication.
+            let key_match = keys
+                .iter()
+                .map(|k| format!("t.{} IS s.{}", quote(k), quote(k)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let same_row = row_columns(conn, table)?
+                .iter()
+                .map(|c| format!("t.{} IS s.{}", quote(c), quote(c)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            conn.execute_batch(&format!(
+                "CREATE TABLE main.{} AS SELECT s.* FROM {raw} s
+                 WHERE NOT EXISTS (SELECT 1 FROM {public} t WHERE {key_match} AND {same_row})",
+                quote(&delta)
+            ))?;
+            conn.execute_batch(&format!(
+                "CREATE TABLE main.{} AS SELECT {key_list} FROM {public} t
+                 WHERE NOT EXISTS (SELECT 1 FROM {raw} s WHERE {key_match})",
+                quote(&added)
+            ))?;
+        } else {
+            // No primary key: the composite key is validated by the snapshot's
+            // unique index, but neither relation can probe it cheaply.
+            conn.execute_batch(&format!(
+                "CREATE TABLE main.{} AS SELECT * FROM {raw} EXCEPT SELECT * FROM {public}",
+                quote(&delta)
+            ))?;
+            conn.execute_batch(&format!(
+                "CREATE TABLE main.{} AS SELECT {key_list} FROM {public} EXCEPT SELECT {key_list} FROM {raw}",
+                quote(&added)
+            ))?;
+        }
+        conn.execute_batch(&format!(
+            "CREATE INDEX {} ON {}({key_list})",
+            quote(&format!("trace_raw_delta_key_{table}")),
+            quote(&delta)
+        ))?;
+        conn.execute_batch(&format!(
+            "CREATE INDEX {} ON {}({key_list})",
+            quote(&format!("trace_raw_added_key_{table}")),
+            quote(&added)
+        ))?;
+        conn.execute_batch(&format!(
+            "DROP TABLE temp.{}",
+            quote(&format!("raw_{table}"))
+        ))?;
+        let matches = |prefix: &str| {
+            keys.iter()
+                .map(|k| {
+                    format!(
+                        "{prefix}.{k} IS {table}.{k}",
+                        prefix = quote(prefix),
+                        k = quote(k),
+                        table = quote(table)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        conn.execute_batch(&format!(
+            "CREATE VIEW main.{} AS
+             SELECT * FROM {table}
+              WHERE NOT EXISTS (SELECT 1 FROM {added} WHERE {added_match})
+                AND NOT EXISTS (SELECT 1 FROM {delta} WHERE {delta_match})
+             UNION ALL
+             SELECT * FROM {delta}",
+            quote(&format!("raw_{table}")),
+            table = quote(table),
+            added = quote(&added),
+            delta = quote(&delta),
+            added_match = matches(&added),
+            delta_match = matches(&delta),
+        ))?;
+    }
+    // Temporary aliases for unchanged relations are no longer needed once the
+    // changed overlays above are stored.
+    let temp_raw: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT type,name FROM sqlite_temp_master
+             WHERE name GLOB 'raw_*' AND type IN ('table','view')",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (kind, name) in temp_raw {
+        conn.execute_batch(&format!(
+            "DROP {} temp.{}",
+            if kind == "view" { "VIEW" } else { "TABLE" },
+            quote(&name)
+        ))?;
+    }
+    for (kind, name, sql) in &plan.unchanged {
+        match kind.as_str() {
+            "table" => conn.execute_batch(&format!(
+                "CREATE VIEW main.{} AS SELECT * FROM {}",
                 quote(&format!("raw_{name}")),
                 quote(name)
             ))?,
-            "view" => conn.execute_batch(&raw_sql(sql, &relations))?,
-            "index" if changed.contains(table) => {
-                let mut names = changed.clone();
-                names.insert(name.clone());
-                conn.execute_batch(&raw_sql(sql, &names))?;
-            }
+            "view" => conn.execute_batch(&raw_sql(sql, &plan.relations))?,
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// Materialize selected complete-graph relations into temporary tables.
+/// Bulk readers such as `trace-merge` scan and join whole relations; rebuilding
+/// an overlay view for every row is much slower than scanning a table once,
+/// while legacy snapshots with physical `raw_*` tables need no copy.
+pub fn materialize_raw_relations(conn: &Connection, relations: &[&str]) -> Result<()> {
+    for name in relations {
+        let overlay = if crate::table_exists(conn, &format!("trace_raw_delta_{name}"))? {
+            true
+        } else {
+            crate::table_exists(conn, &format!("trace_raw_delta_{name}_data"))?
+        };
+        let raw = format!("raw_{name}");
+        if !overlay || !crate::table_exists(conn, &raw)? {
+            continue;
+        }
+        let temp_kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM sqlite_temp_master WHERE name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(kind) = temp_kind {
+            conn.execute_batch(&format!(
+                "DROP {} temp.{}",
+                if kind == "view" { "VIEW" } else { "TABLE" },
+                quote(name)
+            ))?;
+        }
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE {} AS SELECT * FROM main.{}",
+            quote(name),
+            quote(&raw)
+        ))?;
+        let key_list = key_columns(conn, name)?
+            .iter()
+            .map(|c| quote(c))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute_batch(&format!(
+            "CREATE INDEX temp.{} ON {}({key_list})",
+            quote(&format!("trace_materialized_key_{name}")),
+            quote(name)
+        ))?;
+    }
+    conn.flush_prepared_statement_cache();
     Ok(())
 }
 
@@ -256,7 +627,7 @@ pub(crate) fn with_raw_relations<T>(
 }
 
 fn project_call_ids(conn: &Connection) -> Result<()> {
-    let inherited = crate::table_exists(conn, "raw_merge_function_identities")?;
+    let inherited = crate::table_exists(conn, "merge_function_identities")?;
     let target_key = if inherited {
         "(SELECT identity FROM raw_merge_function_identities WHERE function_id=p.callee_fn_id)"
     } else {
@@ -313,7 +684,7 @@ pub fn publish_lambda_free(conn: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    preserve_raw(conn, has_lambdas)?;
+    let changed = preserve_raw(conn, has_lambdas)?;
     conn.execute_batch(PROJECTION_VIEWS)?;
     conn.execute_batch(
         r#"
@@ -321,11 +692,23 @@ CREATE TABLE lambda_owners (
     lambda_fn_id INTEGER PRIMARY KEY,
     owner_fn_id INTEGER REFERENCES functions(id)
 );
-CREATE TABLE lambda_call_provenance (
-    edge_id INTEGER NOT NULL REFERENCES call_edges_data(id),
+-- An ordinary edge's provenance is itself, so the public view reconstructs
+-- those identity rows. Only edges with a contracted mapping store their
+-- entries explicitly, including the identity entry when the same public edge
+-- is reached both directly and through a lambda.
+CREATE TABLE trace_lambda_call_provenance (
+    edge_id INTEGER NOT NULL,
     entry_edge_id INTEGER NOT NULL,
     PRIMARY KEY (edge_id, entry_edge_id)
 ) WITHOUT ROWID;
+CREATE VIEW main.lambda_call_provenance AS
+SELECT e.id AS edge_id, e.id AS entry_edge_id
+FROM call_edges_data e
+WHERE NOT EXISTS (
+    SELECT 1 FROM trace_lambda_call_provenance p WHERE p.edge_id = e.id
+)
+UNION ALL
+SELECT edge_id, entry_edge_id FROM trace_lambda_call_provenance;
 -- Preserve unresolved-path semantics before lifting lexical ownership. In
 -- particular, an uninvoked lambda must not add unresolved calls to its parent.
 CREATE TABLE lambda_unresolved_calls (
@@ -337,8 +720,8 @@ INSERT INTO lambda_unresolved_calls SELECT * FROM _projection_unresolved;
     )?;
     if !has_lambdas {
         // No changed storage needs a second physical copy or a rewrite. This
-        // also preserves ordinary edge IDs at the full SQLite integer range.
-        conn.execute_batch("INSERT INTO lambda_call_provenance SELECT id,id FROM call_edges_data")?;
+        // also preserves ordinary edge IDs at the full SQLite integer range;
+        // the provenance view maps each of them to itself.
         drop_projection_views(conn)?;
         return Ok(());
     }
@@ -365,6 +748,7 @@ SELECT id,owner FROM (
 -- in provenance.
 CREATE TEMP TABLE projected_call_provenance AS
 SELECT * FROM _projection_call_edges;
+CREATE INDEX temp.projected_prov_entry ON projected_call_provenance(entry_edge_id);
 
 CREATE TEMP TABLE projected_calls AS
 SELECT
@@ -386,14 +770,28 @@ INSERT INTO call_edges_data
 SELECT p.projected_id,p.call_site_id,p.caller_fn_id,p.callee_fn_id,r.resolution_id
 FROM projected_calls p JOIN raw_call_edges_data r ON r.id=p.entry_edge_id;
 
-INSERT INTO lambda_call_provenance
+INSERT INTO trace_lambda_call_provenance
 SELECT DISTINCT p.projected_id, prov.entry_edge_id
 FROM projected_calls p
 JOIN projected_call_provenance prov
   ON prov.caller_fn_id = p.caller_fn_id
  AND prov.callee_fn_id = p.callee_fn_id
  AND prov.call_site_id IS p.call_site_id
- AND prov.resolution = p.resolution;
+ AND prov.resolution = p.resolution
+WHERE p.projected_id <> prov.entry_edge_id;
+-- A public edge reached both directly and through a lambda has a contracted
+-- entry and an ordinary identity entry. The view only rebuilds the identity
+-- row when no stored row exists, so store it when the original provenance had
+-- it. Contracted-only edges have no entry whose id is the public id.
+INSERT OR IGNORE INTO trace_lambda_call_provenance
+SELECT DISTINCT t.edge_id, t.edge_id
+FROM trace_lambda_call_provenance t
+JOIN projected_calls p ON p.projected_id = t.edge_id
+JOIN projected_call_provenance prov ON prov.entry_edge_id = t.edge_id
+WHERE prov.caller_fn_id = p.caller_fn_id
+  AND prov.callee_fn_id = p.callee_fn_id
+  AND prov.call_site_id IS p.call_site_id
+  AND prov.resolution = p.resolution;
 DROP TABLE projected_calls;
 DROP TABLE projected_call_provenance;
 
@@ -536,6 +934,7 @@ DELETE FROM functions WHERE id IN (SELECT lambda_fn_id FROM lambda_owners);
     for (id, text) in strings {
         update.execute(params![id, segment.replace_all(&text, "").as_ref()])?;
     }
+    publish_raw_overlays(conn, &changed)?;
     drop_projection_views(conn)?;
     Ok(())
 }
@@ -667,7 +1066,7 @@ mod tests {
     fn a_damaged_raw_graph_is_not_silently_replaced_with_the_public_graph() {
         let conn = complete_graph();
         publish_lambda_free(&conn).unwrap();
-        conn.execute_batch("DROP TABLE raw_functions").unwrap();
+        conn.execute_batch("DROP VIEW raw_functions").unwrap();
         assert!(use_raw_relations(&conn)
             .unwrap_err()
             .to_string()
@@ -694,6 +1093,242 @@ mod tests {
     }
 
     #[test]
+    fn bulk_reads_materialize_overlay_relations_once() {
+        let conn = complete_graph();
+        conn.execute_batch(
+            "CREATE TABLE merge_function_identities (
+                function_id INTEGER PRIMARY KEY, identity BLOB NOT NULL
+             );
+             INSERT INTO merge_function_identities
+                SELECT id, CAST(printf('%032d', id) AS BLOB) FROM functions;
+             CREATE TABLE merge_call_site_identities (
+                call_site_id INTEGER PRIMARY KEY, identity BLOB NOT NULL
+             );
+             INSERT INTO merge_call_site_identities
+                SELECT id, CAST(printf('%032d', id) AS BLOB) FROM call_sites_data;",
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        use_raw_relations(&conn).unwrap();
+        materialize_raw_relations(
+            &conn,
+            &[
+                "functions",
+                "call_edges",
+                "flow_calls",
+                "cfg_edges",
+                "cfg_event_order",
+                "merge_function_identities",
+                "merge_call_site_identities",
+            ],
+        )
+        .unwrap();
+        for relation in [
+            "functions",
+            "call_edges",
+            "flow_calls",
+            "cfg_edges",
+            "cfg_event_order",
+            "merge_function_identities",
+            "merge_call_site_identities",
+        ] {
+            let kind: String = conn
+                .query_row(
+                    "SELECT type FROM sqlite_temp_master WHERE name=?1",
+                    [relation],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(kind, "table", "{relation} is materialized");
+            assert_eq!(
+                count(&conn, &format!("SELECT count(*) FROM {relation}")),
+                count(&conn, &format!("SELECT count(*) FROM main.raw_{relation}")),
+                "materialized {relation}"
+            );
+        }
+        for (relation, expected) in [
+            (
+                "cfg_edges",
+                ["src_block", "dst_block", "kind_id"].as_slice(),
+            ),
+            ("cfg_event_order", ["event_id", "next_event_id"].as_slice()),
+            ("merge_function_identities", ["function_id"].as_slice()),
+        ] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_temp_master
+                     WHERE name=?1 AND type='index'",
+                    [format!("trace_materialized_key_{relation}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            for column in expected {
+                assert!(
+                    sql.contains(&format!("\"{column}\"")),
+                    "{relation} index uses {column}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn published_views_are_readable_when_attached_under_another_schema() {
+        let conn = complete_graph();
+        publish_lambda_free(&conn).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("snapshot.db");
+        conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        let read = Connection::open_in_memory().unwrap();
+        read.execute("ATTACH ?1 AS other", [path.to_str().unwrap()])
+            .unwrap();
+        for (relation, expected) in [
+            ("functions", 4),
+            ("raw_functions", 8),
+            (
+                "call_edges",
+                count(&conn, "SELECT count(*) FROM call_edges"),
+            ),
+            (
+                "lambda_call_provenance",
+                count(&conn, "SELECT count(*) FROM lambda_call_provenance"),
+            ),
+        ] {
+            let actual: i64 = read
+                .query_row(
+                    &format!("SELECT count(*) FROM other.{}", quote(relation)),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|error| panic!("cannot read attached {relation}: {error}"));
+            assert_eq!(actual, expected, "attached {relation}");
+        }
+    }
+
+    #[test]
+    fn changed_relations_are_overlays_over_compact_deltas() {
+        let conn = complete_graph();
+        publish_lambda_free(&conn).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE name='raw_functions' AND type='view'"
+            ),
+            1
+        );
+        // Only the four deleted lambda functions are duplicated in the delta.
+        assert_eq!(count(&conn, "SELECT count(*) FROM raw_functions"), 8);
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM trace_raw_delta_functions"),
+            4
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM trace_raw_delta_functions WHERE id=0"
+            ),
+            0
+        );
+        // A changed relation with unchanged rows keeps them only in public.
+        for (table, public) in [
+            ("trace_raw_delta_variables_data", "variables_data"),
+            ("trace_raw_delta_flow_nodes_data", "flow_nodes_data"),
+        ] {
+            let delta = count(&conn, &format!("SELECT count(*) FROM {table}"));
+            let total = count(&conn, &format!("SELECT count(*) FROM {public}"));
+            assert!(delta > 0, "{table} stores the original changed rows");
+            assert!(delta < total, "{table} is not a whole-table copy");
+            assert_eq!(
+                count(&conn, &format!("SELECT count(*) FROM {table} WHERE id=0")),
+                0,
+                "{table} leaves unchanged rows in place"
+            );
+        }
+        // Projected new call edges are excluded from the raw overlay.
+        assert!(
+            count(
+                &conn,
+                "SELECT count(*) FROM trace_raw_added_call_edges_data"
+            ) > 0
+        );
+    }
+
+    #[test]
+    fn mixed_direct_and_contracted_provenance_keeps_identity_row() {
+        let conn = complete_graph();
+        let indirect: i64 = conn
+            .query_row("SELECT id FROM strings WHERE text = 'indirect'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // The same call site reaches Leaf directly and through a lambda.
+        conn.execute(
+            "INSERT INTO call_edges_data VALUES(100,0,0,3,?1)",
+            [indirect],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        let edge_id: i64 = conn
+            .query_row(
+                "SELECT id FROM call_edges WHERE caller_fn_id=0 AND callee_fn_id=3 \
+                 AND call_site_id=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let entries: Vec<i64> = conn
+            .prepare("SELECT entry_edge_id FROM lambda_call_provenance WHERE edge_id=?1 ORDER BY 1")
+            .unwrap()
+            .query_map([edge_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(entries, vec![0, 100]);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM trace_lambda_call_provenance
+                 WHERE edge_id=entry_edge_id"
+            ),
+            1,
+            "the identity entry is stored because the edge is also contracted"
+        );
+    }
+
+    #[test]
+    fn no_primary_key_relation_preserves_duplicate_rows_through_rowids() {
+        let conn = complete_graph();
+        conn.execute_batch(
+            "INSERT INTO flow_calls VALUES(0,1,0,0),(0,1,0,0),(0,1,11,0);
+             INSERT INTO flow_return_calls VALUES(0,1,0,3),(0,1,0,3),(0,1,11,3);",
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        // Duplicate value rows keep their multiplicity through rowid keys.
+        assert_eq!(count(&conn, "SELECT count(*) FROM raw_flow_calls"), 3);
+        assert_eq!(count(&conn, "SELECT count(*) FROM flow_calls"), 2);
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM trace_raw_delta_flow_calls"),
+            1
+        );
+        // complete_graph already contributes one return row, which the
+        // lambda-callee cleanup removes.
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM raw_flow_return_calls"),
+            4
+        );
+        assert_eq!(count(&conn, "SELECT count(*) FROM flow_return_calls"), 2);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM trace_raw_delta_flow_return_calls"
+            ),
+            2
+        );
+    }
+
+    #[test]
     fn ordinary_edges_keep_their_ids_including_the_integer_boundary() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
@@ -715,6 +1350,36 @@ mod tests {
         publish_lambda_free(&conn).unwrap();
         assert_eq!(count(&conn, "SELECT id FROM call_edges"), i64::MAX);
         assert_eq!(count(&conn, "SELECT count(*) FROM lambda_owners"), 0);
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM trace_lambda_call_provenance"),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM lambda_call_provenance
+                 WHERE edge_id=entry_edge_id"
+            ),
+            1,
+            "an ordinary edge maps to itself through the view"
+        );
+    }
+
+    #[test]
+    fn provenance_stores_only_non_identity_mappings() {
+        let conn = complete_graph();
+        publish_lambda_free(&conn).unwrap();
+        let stored = count(&conn, "SELECT count(*) FROM trace_lambda_call_provenance");
+        assert!(stored > 0, "contracted edges are stored");
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM trace_lambda_call_provenance
+                 WHERE edge_id=entry_edge_id"
+            ),
+            0,
+            "identity mappings are reconstructed, never stored"
+        );
     }
 
     #[test]
