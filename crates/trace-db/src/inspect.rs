@@ -500,6 +500,33 @@ fn leak_resolution(resolution: &str) -> &'static str {
     }
 }
 
+/// One column of a table, as `PRAGMA table_info` reports it.
+pub(crate) struct TableColumn {
+    pub(crate) name: String,
+    pub(crate) declared_type: String,
+    /// Position in the primary key, from 1; 0 outside it.
+    pub(crate) pk: i64,
+}
+
+/// The columns of `table` in declaration order.
+pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<Vec<TableColumn>> {
+    Ok(conn
+        .prepare("SELECT name, type, pk FROM pragma_table_info(?1) ORDER BY cid")?
+        .query_map([table], |r| {
+            Ok(TableColumn {
+                name: r.get(0)?,
+                declared_type: r.get(1)?,
+                pk: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// `name` as an SQL identifier.
+pub(crate) fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// True when the named table or view exists. Names are compile-time constants.
 pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     let n: i64 = conn.query_row(

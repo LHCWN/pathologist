@@ -273,10 +273,24 @@ visible ownership; full linking always uses the raw facts.
 Every original relation has a `raw_` counterpart, for example
 `raw_functions`, `raw_call_edges`, `raw_variables`, `raw_flow_nodes`,
 `raw_execution_contexts`, and `raw_link_method_facts`. These expose the complete
-analysis, including original lambda ownership, text, and provenance. Changed
-storage is copied before projection; unaffected raw relations alias shared
-storage. This adds disk and export work for affected relations, without
-copying the large unchanged flow-edge and operation-provenance tables.
+analysis, including original lambda ownership, text, and provenance.
+
+Publication keeps only what the projection changes. A
+`raw_preimage_<table>` table holds the original of each row that was rewritten
+or removed, with the source table's secondary indexes, and the keys of rows that
+exist only in the public graph (`preimage_added = 1`). A table the projection
+can change has a `raw_` view over its untouched public rows plus those
+pre-images; other raw relations alias the public table directly. Query `raw_*`
+rather than `raw_preimage_*`, which holds only part of a relation. Like every
+`raw_` name, these hold the original lambda names.
+
+Tables publication rewrites without removing rows (`strings`, `variables_data`,
+`flow_nodes_data`, `link_dispatch_queries`) use a single-table `raw_` view that
+overlays the rewritten columns. The other changed relations are `UNION ALL`
+views. SQLite copies such a view whole when it is on the right of a `LEFT JOIN`,
+when the outer query is aggregate or `DISTINCT`, or when an `ORDER BY` term is
+not selected, so a complete-graph read should select its ordering columns and
+reach those relations by key rather than `LEFT JOIN` them.
 Minimal/full exports and merged outputs share the same publication step.
 `trace-merge` reads raw relations when present, including when re-merging a
 merged output, so projection never changes linking inputs.
@@ -286,8 +300,9 @@ ownership is lifted. Its columns are `call_site_id`, `caller_fn_id`,
 `callee_text`, `file_id`, `line`, and `col`. Thus an uninvoked lambda's
 unresolved site does not become an unresolved call in its parent. Shared
 lambdas may expose an unresolved site under multiple callers. Direct sites
-without edges are not unresolved leaves. Export-only projection views are
-temporary and are removed before publication; they are not public relations.
+without edges are not unresolved leaves. The working tables and triggers of
+the projection are temporary and removed before publication; they are not
+public relations.
 
 The CLI uses the public graph by default on v9 snapshots, so
 `ScheduleAbilityTransaction → HandleAbilityTransaction` takes one visible hop
@@ -304,10 +319,12 @@ lambda return bindings and asynchronous execution boundaries remain accurate.
 Its result can name lambda functions; subsequent SQL queries still see the
 public projection. This does not change the stored public tables or views.
 
-Projection closure is computed at export time and public call edges are
-indexed before publication. A large reachable lambda component can still
-increase export work; the earlier [synthetic query measurements](EVAL_REPORT.md#lambda-free-view-review--2026-11-06)
-measure the old v8 view implementation, not production v9 export scalability.
+Projection closure is computed once at export time. An edge with a lambda
+endpoint is replaced by its contracted paths, and edges that agree on
+`(caller_fn_id, callee_fn_id, call_site_id, resolution)` collapse to the lowest
+ID. Every other public edge keeps its row. A snapshot with no lambdas is not
+deduplicated. Corpus timings and sizes are in
+[Compact lambda-free publication](EVAL_REPORT.md#compact-lambda-free-publication--2026-11-10).
 
 ```sql
 SELECT caller.name, callee.name, e.resolution, e.call_site_id

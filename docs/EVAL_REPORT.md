@@ -1,5 +1,94 @@
 # Evaluation Report
 
+## Compact lambda-free publication — 2026-11-10
+
+Schema v9 (`d1679a2`) published the lambda-free relations by copying every
+relation the projection rewrites into `raw_*`, with its indexes, whenever a
+snapshot held one lambda, and by recomputing the projection's helper views on
+each statement that used them. On the pinned corpora this cost:
+
+| `ability_ability_runtime` + Camera, default export | v8 (`d1679a2^`) | v9 (`497e31c`) | This change |
+|---|---:|---:|---:|
+| Ability runtime database | 241 MB | 435 MB | 254 MB |
+| Camera database | 67 MB | 122 MB | 71 MB |
+| Ability runtime export phase | 35.8 s | 49.4 s | 37.7 s |
+| `trace-merge` of the two | 25.3 s | 81.4 s | 29.0 s |
+| Merged database | 132 MB | 271 MB | 150 MB |
+
+Measured on an 8-core, 11 GiB machine with `--jobs 8`, one analysis per
+corpus; the merge shows the slower of two rounds (v9 78.5 and 81.4 s, this
+change 28.6 and 29.0 s). Peak resident set
+size did not move: analysis peaks at 1.67 GB in every version, set by indexing,
+and `trace-merge` at 0.57 GB. The growth was in the database written and in
+export and merge time.
+
+With `--full-export --sequencing`, Camera falls from 171 to 98 MB, HiView from
+59 to 34 MB and their merge from 143 to 78 MB. That merge takes 17.8 s at v9 and
+16.0 s here.
+
+### Where the time went
+
+`publish_lambda_free` alone, on the Ability-runtime export: 14.8 s, of which
+copying to `raw_*` and indexing the copies was about 2.3 s and the projection
+the other 12 s. On the merged database it took 67 s. One statement,
+the lift of file-scope lambda call sites, took 28 s because it recomputed a view
+over every call edge per updated row. Edge rewriting, provenance and the
+projection's own recursive views cost most of the rest.
+
+The change:
+
+- **Only changed rows are kept.** `raw_preimage_<table>` holds the original of
+  each row the projection rewrote or removed, and the keys of rows only the
+  public graph has. A captured row equal to its public row is dropped, so
+  the table is exactly the delta. On Ability runtime that is 3,403 functions,
+  12,185 variables, 16,445 flow nodes and 9,419 call sites, not 82k to 870k
+  rows per table.
+- **The projection reads materialized, indexed working tables** (reachability,
+  entering callers) instead of recomputing views, and leaves edges with no
+  lambda endpoint in place, apart from collapsing duplicates of one edge group
+  as v9 did. Publication takes 3.3 s on Ability runtime and 4.9 s on the
+  merged database.
+- **`raw_*` views read like the old tables.** SQLite copies a `UNION ALL` view
+  whole when it is the right side of a `LEFT JOIN`, or when an `ORDER BY` term
+  is not selected. With `UNION ALL` views throughout, an early version of this
+  change made one `inspect slice` take 103 s: its per-node variable lookup ran
+  141 times, each materializing the 867k rows of `raw_variables`. Tables the
+  projection only updates (`strings`, `variables_data`, `flow_nodes_data`,
+  `link_dispatch_queries`) are single-table views that overlay the rewritten
+  columns, and the readers of the others select every ordering column or
+  look rows up by key. A plan test fails on `MATERIALIZE` for the statements
+  `trace-merge`, `read_cfgs` and slicing run on the complete graph.
+
+### Readers
+
+| Ability runtime database | v9 | This change |
+|---|---:|---:|
+| `inspect slice` (141 nodes) | 0.40 s | 0.36 s |
+| `inspect callgraph`, lambda-free (default) | 0.86 s | 0.87 s |
+| `inspect callgraph --show-lambdas` | 0.88 s | 2.2 s |
+
+`--show-lambdas` reads every call edge through compound views of the complete
+graph. A per-key form of that query was slower on the default graph (1.28 s
+against 0.70 s on plain tables) and no faster here, so the join stays. A full
+scan of `raw_variables` takes 0.63 s against 0.09 s for the plain table;
+nothing on a merge or inspect path does one.
+
+### Equality
+
+Exports of the Ability-runtime and Camera corpora, and of Camera and HiView
+with `--full-export --sequencing`, compare row for row identical to v9's in
+all 121 relations, public and `raw_*`, except `analysis_run`, which holds the
+run's timestamp and version. At `--jobs 1` and `--jobs 8` a fixture exports an
+identical database identity. `scripts/eval_check.py` reports 175 checks and one
+failure, the #267 `mission_list_manager.cpp:2195` probe that fails on master.
+
+Merges differ in 21 of 127 relations: `analysis_run`, and those that carry
+merge-assigned or dictionary IDs. An input's identity covers what it stores, and merged IDs derive from it, so
+re-merging re-analysed inputs renumbers once: 2,569 of 501,339 edges keep their
+ID. The call graph is the same by name (296,337 caller, callee and resolution
+groups, none differing; 114,819 for the sequencing merge), as are the call-order
+and execution-context row counts.
+
 ## Default member initializers — 2026-11-09
 
 Issue #271, measured with `scripts/eval_check.py` on the pinned corpora, the

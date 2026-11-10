@@ -153,7 +153,7 @@ def connect(db, relations="raw"):
             con.close()
             raise ValueError(f"{db}: incomplete raw graph, missing {sorted(missing)}")
         for name in names:
-            if name.startswith("raw_"):
+            if name.startswith("raw_") and not name.startswith("raw_preimage_"):
                 alias = quote_identifier(name.removeprefix("raw_"))
                 con.execute(f"CREATE TEMP VIEW {alias} AS SELECT * FROM main.{quote_identifier(name)}")
     return con

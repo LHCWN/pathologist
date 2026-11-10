@@ -6,8 +6,9 @@ use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-// Only changed storage is copied. Unchanged raw relations are aliases, so the
-// large flow-edge and provenance tables do not need a second physical copy.
+// Tables the projection can rewrite. Only the rows it actually changes are
+// retained, in a `raw_preimage_*` table; their `raw_*` relation reads the
+// untouched public rows plus those pre-images.
 const CHANGED: &[&str] = &[
     "functions",
     "strings",
@@ -40,93 +41,212 @@ const CHANGED: &[&str] = &[
     "merge_call_site_identities",
 ];
 
-// Export-only views over the complete graph. They are temporary and never
-// become a public schema or a compatibility obligation.
-const PROJECTION_VIEWS: &str = r#"
-CREATE TEMP VIEW _projection_functions AS
-SELECT id, name, file_id, line_start, line_end, linkage, signature,
-       is_defined, is_dep, is_weak, target_id
-FROM raw_functions WHERE name NOT GLOB '*::$lambda[0-9]*:[0-9]*';
+const LAMBDA_NAME: &str = "*::$lambda[0-9]*:[0-9]*";
 
--- Compute reachability once per distinct entering lambda, independently of
--- how many visible callers enter it. UNION bounds cycles by lambda pairs.
-CREATE TEMP VIEW _projection_lambda_reachability AS
-WITH RECURSIVE paths(start_fn_id, lambda_fn_id) AS (
-    SELECT ce.callee_fn_id, ce.callee_fn_id
-    FROM raw_call_edges ce
-    JOIN _projection_functions caller ON caller.id = ce.caller_fn_id
-    LEFT JOIN _projection_functions callee ON callee.id = ce.callee_fn_id
-    WHERE callee.id IS NULL
-    UNION
-    SELECT p.start_fn_id, ce.callee_fn_id
-    FROM paths p JOIN raw_call_edges ce ON ce.caller_fn_id = p.lambda_fn_id
-    LEFT JOIN _projection_functions callee ON callee.id = ce.callee_fn_id
-    WHERE callee.id IS NULL
-)
-SELECT start_fn_id, lambda_fn_id FROM paths;
+/// Tables publication rewrites in place and never removes a row from, with the
+/// columns it changes. Their `raw_*` view reads one table and overlays those
+/// columns, because SQLite materializes a whole `UNION ALL` view on the right
+/// of a `LEFT JOIN`: reading one flow node would cost all of `raw_variables`.
+/// The overlay probes the pre-image by key, per column, rather than joining it:
+/// a join inside the view would also stop SQLite flattening it.
+const IN_PLACE: &[(&str, &[&str])] = &[
+    ("strings", &["text"]),
+    ("variables_data", &["kind", "fn_id"]),
+    ("flow_nodes_data", &["label_id", "fn_id", "call_site_id"]),
+    ("link_dispatch_queries", &["callee_fn_id"]),
+];
 
--- Attach original entering-edge provenance only after the shared closure.
-CREATE TEMP VIEW _projection_lambda_callers AS
-SELECT ce.id AS entry_edge_id, ce.call_site_id, ce.caller_fn_id,
-       p.lambda_fn_id, ce.resolution
-FROM raw_call_edges ce
-JOIN _projection_functions caller ON caller.id = ce.caller_fn_id
-JOIN _projection_lambda_reachability p ON p.start_fn_id = ce.callee_fn_id;
+/// Marks a pre-image row that stands for a public-only row: the complete
+/// graph never had it, so its key only hides the public row.
+const ADDED_COLUMN: &str = "preimage_added";
 
-CREATE TEMP VIEW _projection_call_edges AS
-SELECT ce.id AS entry_edge_id, ce.call_site_id, ce.caller_fn_id, ce.callee_fn_id, ce.resolution
-FROM raw_call_edges ce
-JOIN _projection_functions caller ON caller.id = ce.caller_fn_id
-JOIN _projection_functions callee ON callee.id = ce.callee_fn_id
-UNION
-SELECT p.entry_edge_id, p.call_site_id, p.caller_fn_id, ce.callee_fn_id, p.resolution
-FROM _projection_lambda_callers p JOIN raw_call_edges ce ON ce.caller_fn_id = p.lambda_fn_id
-JOIN _projection_functions callee ON callee.id = ce.callee_fn_id;
-
-CREATE TEMP VIEW _projection_unresolved AS
-SELECT cs.id AS call_site_id, cs.caller_fn_id, cs.callee_text, cs.file_id, cs.line, cs.col
-FROM raw_call_sites cs JOIN _projection_functions caller ON caller.id = cs.caller_fn_id
-WHERE cs.is_direct = 0
-  AND NOT EXISTS (SELECT 1 FROM raw_call_edges ce WHERE ce.call_site_id = cs.id)
-UNION
-SELECT cs.id, p.caller_fn_id, cs.callee_text, cs.file_id, cs.line, cs.col
-FROM raw_call_sites cs JOIN _projection_lambda_callers p ON p.lambda_fn_id = cs.caller_fn_id
-WHERE cs.is_direct = 0
-  AND NOT EXISTS (SELECT 1 FROM raw_call_edges ce WHERE ce.call_site_id = cs.id);
-"#;
-
-fn drop_projection_views(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "DROP VIEW _projection_unresolved;
-        DROP VIEW _projection_call_edges;
-        DROP VIEW _projection_lambda_callers;
-        DROP VIEW _projection_lambda_reachability;
-        DROP VIEW _projection_functions;",
-    )?;
-    Ok(())
-}
-
-fn quote(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
+use crate::quote_identifier as quote;
 
 // Rewrite identifiers in our own schema DDL, leaving literals and comments
 // intact. No user SQL is accepted here.
-fn raw_sql(sql: &str, names: &BTreeSet<String>) -> String {
+fn rename_identifiers(sql: &str, rename: impl Fn(&str) -> Option<String>) -> String {
     static TOKENS: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"'(?:''|[^'])*'|--[^\n]*|[A-Za-z_][A-Za-z_0-9]*").unwrap()
     });
-    let tokens = &*TOKENS;
-    tokens
+    TOKENS
         .replace_all(sql, |caps: &regex::Captures<'_>| {
             let token = &caps[0];
-            if names.contains(token) {
-                format!("raw_{token}")
-            } else {
-                token.to_owned()
-            }
+            rename(token).unwrap_or_else(|| token.to_owned())
         })
         .into_owned()
+}
+
+fn raw_sql(sql: &str, names: &BTreeSet<String>) -> String {
+    rename_identifiers(sql, |token| {
+        names.contains(token).then(|| format!("raw_{token}"))
+    })
+}
+
+fn preimage_table(table: &str) -> String {
+    // Original lambda names live here, so the table belongs to the raw namespace
+    // that consumers already read as the complete graph, not to a public relation.
+    format!("raw_preimage_{table}")
+}
+
+fn capture_trigger(event: &str, table: &str) -> String {
+    format!("_projection_capture_{event}_{table}")
+}
+
+fn column_list(prefix: &str, columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|column| format!("{prefix}{}", quote(column)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A trigger statement that aborts when any of `conditions` holds, and nothing
+/// when there are none: `WHERE ;` is not SQL, so an empty set must not reach it.
+fn raise_when(message: &str, conditions: &[String]) -> String {
+    if conditions.is_empty() {
+        return String::new();
+    }
+    format!(
+        "SELECT RAISE(ABORT, '{message}') WHERE {};",
+        conditions.join(" OR ")
+    )
+}
+
+/// Create the pre-image table of `table`, its `raw_*` view, and the temporary
+/// triggers that retain each row's complete-graph state the first time
+/// publication changes it, whichever statement does.
+fn capture_preimages(conn: &Connection, table: &str) -> Result<()> {
+    let info = crate::table_columns(conn, table)?;
+    let columns: Vec<String> = info.iter().map(|column| column.name.clone()).collect();
+    let mut key: Vec<_> = info.iter().filter(|column| column.pk > 0).collect();
+    key.sort_by_key(|column| column.pk);
+    let key: Vec<String> = key.into_iter().map(|column| column.name.clone()).collect();
+
+    let image = quote(&preimage_table(table));
+    let source = quote(table);
+    let raw = quote(&format!("raw_{table}"));
+    let select = column_list("", &columns);
+    let old = column_list("OLD.", &columns);
+    let [update, delete, insert] =
+        ["update", "delete", "insert"].map(|event| quote(&capture_trigger(event, table)));
+    let declared = info
+        .iter()
+        .map(|column| format!("{} {}", quote(&column.name), column.declared_type))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if key.is_empty() {
+        // A row without a key cannot be matched to its later state, so such
+        // tables may only lose rows, and the complete graph is what remains
+        // plus what was removed. The guards turn a future in-place rewrite
+        // into an export error rather than a silently wrong raw relation.
+        conn.execute_batch(&format!(
+            "CREATE TABLE {image} ({declared});
+             CREATE VIEW {raw} AS SELECT {select} FROM {source}
+                UNION ALL SELECT {select} FROM {image};
+             CREATE TEMP TRIGGER {delete} BEFORE DELETE ON main.{source} BEGIN
+                INSERT INTO {image}({select}) VALUES({old});
+             END;
+             CREATE TEMP TRIGGER {update} BEFORE UPDATE ON main.{source} BEGIN
+                SELECT RAISE(ABORT, 'projection cannot rewrite rows of a table without a key');
+             END;
+             CREATE TEMP TRIGGER {insert} BEFORE INSERT ON main.{source} BEGIN
+                SELECT RAISE(ABORT, 'projection cannot add rows to a table without a key');
+             END;"
+        ))?;
+        return Ok(());
+    }
+
+    let added = quote(ADDED_COLUMN);
+    let key_columns = column_list("", &key);
+    let key_values = column_list("NEW.", &key);
+    let same_row = key
+        .iter()
+        .map(|column| format!("image.{0} IS public.{0}", quote(column)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let capture = format!("INSERT OR IGNORE INTO {image}({select}) VALUES({old});");
+    let key_changed: Vec<String> = key
+        .iter()
+        .map(|column| format!("OLD.{0} IS NOT NEW.{0}", quote(column)))
+        .collect();
+    let in_place = IN_PLACE
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map(|(_, rewritten)| *rewritten);
+    let (view, on_delete, on_update) = if let Some(rewritten) = in_place {
+        if let Some(column) = key
+            .iter()
+            .find(|column| rewritten.contains(&column.as_str()))
+        {
+            bail!("`{table}.{column}` is a key and cannot be rewritten in place");
+        }
+        let overlaid = columns
+            .iter()
+            .map(|column| {
+                let name = quote(column);
+                if rewritten.contains(&column.as_str()) {
+                    format!(
+                        "CASE WHEN EXISTS (SELECT 1 FROM {image} AS image WHERE {same_row})
+                         THEN (SELECT image.{name} FROM {image} AS image WHERE {same_row})
+                         ELSE public.{name} END AS {name}"
+                    )
+                } else {
+                    format!("public.{name} AS {name}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        // A column the view reads straight from the public row must not change.
+        let fixed: Vec<String> = columns
+            .iter()
+            .filter(|column| !rewritten.contains(&column.as_str()))
+            .map(|column| format!("OLD.{0} IS NOT NEW.{0}", quote(column)))
+            .collect();
+        (
+            format!(
+                "SELECT {overlaid} FROM {source} AS public
+                 WHERE NOT EXISTS (SELECT 1 FROM {image} AS image
+                                   WHERE {same_row} AND image.{added} = 1)"
+            ),
+            "SELECT RAISE(ABORT, 'projection must not remove rows of this table');".to_owned(),
+            format!(
+                "{} {capture}",
+                raise_when(
+                    "projection rewrote a column its raw view does not overlay",
+                    &fixed
+                )
+            ),
+        )
+    } else {
+        (
+            format!(
+                "SELECT {select} FROM {source} AS public
+                 WHERE NOT EXISTS (SELECT 1 FROM {image} AS image WHERE {same_row})
+                 UNION ALL SELECT {select} FROM {image} WHERE {added} = 0"
+            ),
+            capture.clone(),
+            // A moved key would leave the old row and the new one both in `raw_*`.
+            format!(
+                "{} {capture}",
+                raise_when(
+                    "projection must not rewrite a key of this table",
+                    &key_changed
+                )
+            ),
+        )
+    };
+    conn.execute_batch(&format!(
+        "CREATE TABLE {image} ({declared},
+            {added} INTEGER NOT NULL DEFAULT 0, PRIMARY KEY({key_columns}));
+         CREATE VIEW {raw} AS {view};
+         CREATE TEMP TRIGGER {update} BEFORE UPDATE ON main.{source} BEGIN {on_update} END;
+         CREATE TEMP TRIGGER {delete} BEFORE DELETE ON main.{source} BEGIN {on_delete} END;
+         CREATE TEMP TRIGGER {insert} AFTER INSERT ON main.{source} BEGIN
+            INSERT OR IGNORE INTO {image}({key_columns},{added}) VALUES({key_values},1);
+         END;"
+    ))?;
+    Ok(())
 }
 
 fn preserve_raw(conn: &Connection, has_lambdas: bool) -> Result<()> {
@@ -158,14 +278,7 @@ fn preserve_raw(conn: &Connection, has_lambdas: bool) -> Result<()> {
         .collect();
     for (kind, name, table, sql) in &objects {
         match kind.as_str() {
-            "table" if changed.contains(name) => {
-                conn.execute_batch(&raw_sql(sql, &changed))?;
-                conn.execute_batch(&format!(
-                    "INSERT INTO {} SELECT * FROM {}",
-                    quote(&format!("raw_{name}")),
-                    quote(name)
-                ))?;
-            }
+            "table" if changed.contains(name) => capture_preimages(conn, name)?,
             "table" => conn.execute_batch(&format!(
                 "CREATE VIEW {} AS SELECT * FROM {}",
                 quote(&format!("raw_{name}")),
@@ -173,13 +286,51 @@ fn preserve_raw(conn: &Connection, has_lambdas: bool) -> Result<()> {
             ))?,
             "view" => conn.execute_batch(&raw_sql(sql, &relations))?,
             "index" if changed.contains(table) => {
-                let mut names = changed.clone();
-                names.insert(name.clone());
-                conn.execute_batch(&raw_sql(sql, &names))?;
+                // A complete-graph lookup by this column must stay indexed
+                // in the pre-images too.
+                conn.execute_batch(&rename_identifiers(sql, |token| {
+                    if token == table {
+                        Some(preimage_table(token))
+                    } else if token == name {
+                        Some(format!("raw_{token}"))
+                    } else {
+                        None
+                    }
+                }))?;
             }
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// A write that left a row as it was still captured it. Dropping those makes a
+/// pre-image table exactly the rows whose complete-graph state differs, so the
+/// snapshot's identity depends on its content and not on which statements ran.
+fn drop_unchanged_preimages(conn: &Connection, table: &str) -> Result<()> {
+    let image = preimage_table(table);
+    if !crate::table_exists(conn, &image)? {
+        return Ok(());
+    }
+    let columns = crate::table_columns(conn, table)?;
+    if !columns.iter().any(|column| column.pk > 0) {
+        return Ok(());
+    }
+    let equal = columns
+        .iter()
+        .map(|column| {
+            let name = quote(&column.name);
+            format!("public.{name} IS image.{name}")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    conn.execute_batch(&format!(
+        "DELETE FROM {image_q} AS image WHERE {added} = 0
+           AND EXISTS (SELECT 1 FROM {source} AS public WHERE {equal})",
+        image_q = quote(&image),
+        added = quote(ADDED_COLUMN),
+        source = quote(table),
+    ))?;
     Ok(())
 }
 
@@ -195,7 +346,8 @@ pub fn use_raw_relations(conn: &Connection) -> Result<()> {
         }
     }
     let names = conn.prepare(
-        "SELECT name FROM main.sqlite_schema WHERE name GLOB 'raw_*' AND type IN ('table','view') ORDER BY name",
+        "SELECT name FROM main.sqlite_schema WHERE name GLOB 'raw_*' AND name NOT GLOB 'raw_preimage_*'
+           AND type IN ('table','view') ORDER BY name",
     )?.query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for raw in names {
@@ -255,16 +407,18 @@ pub(crate) fn with_raw_relations<T>(
     res
 }
 
+/// Assign the deterministic ID of every contracted edge that no ordinary edge
+/// already represents.
 fn project_call_ids(conn: &Connection) -> Result<()> {
-    let inherited = crate::table_exists(conn, "raw_merge_function_identities")?;
+    let inherited = crate::table_exists(conn, "merge_function_identities")?;
     let target_key = if inherited {
-        "(SELECT identity FROM raw_merge_function_identities WHERE function_id=p.callee_fn_id)"
+        "(SELECT identity FROM merge_function_identities WHERE function_id=p.callee_fn_id)"
     } else {
         "NULL"
     };
     let mut rows = conn.prepare(&format!(
-        "SELECT p.rowid,p.entry_edge_id,p.callee_fn_id,r.callee_fn_id,{target_key}
-         FROM projected_calls p JOIN raw_call_edges_data r ON r.id=p.entry_edge_id
+        "SELECT p.rowid,p.entry_edge_id,p.callee_fn_id,{target_key}
+         FROM projected_calls p WHERE p.projected_id IS NULL
          ORDER BY p.entry_edge_id,p.callee_fn_id"
     ))?;
     let mut update = conn.prepare("UPDATE projected_calls SET projected_id=?2 WHERE rowid=?1")?;
@@ -273,21 +427,16 @@ fn project_call_ids(conn: &Connection) -> Result<()> {
         let row_id: i64 = row.get(0)?;
         let entry: i64 = row.get(1)?;
         let callee: i64 = row.get(2)?;
-        let original_callee: i64 = row.get(3)?;
-        let id = if callee == original_callee {
-            entry
-        } else {
-            let mut hash = Sha256::new();
-            hash.update(b"trace-lambda-projected-edge-v1");
-            hash.update(entry.to_be_bytes());
-            let identity: Option<Vec<u8>> = row.get(4)?;
-            if inherited && identity.is_none() {
-                bail!("missing merged function identity for projected callee {callee}");
-            }
-            hash.update(identity.as_deref().unwrap_or(&callee.to_be_bytes()));
-            let digest = hash.finalize();
-            i64::from_be_bytes(digest[..8].try_into().unwrap()) & i64::MAX
-        };
+        let mut hash = Sha256::new();
+        hash.update(b"trace-lambda-projected-edge-v1");
+        hash.update(entry.to_be_bytes());
+        let identity: Option<Vec<u8>> = row.get(3)?;
+        if inherited && identity.is_none() {
+            bail!("missing merged function identity for projected callee {callee}");
+        }
+        hash.update(identity.as_deref().unwrap_or(&callee.to_be_bytes()));
+        let digest = hash.finalize();
+        let id = i64::from_be_bytes(digest[..8].try_into().unwrap()) & i64::MAX;
         update.execute(params![row_id, id])?;
     }
     // Treat even the extremely unlikely digest collision as an export error;
@@ -295,9 +444,22 @@ fn project_call_ids(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE UNIQUE INDEX temp.projected_call_ids ON projected_calls(projected_id)",
     )
-    .context("hash collision detected while assigning deterministic projected call edge IDs")?;
+    .context(CALL_ID_COLLISION)?;
     Ok(())
 }
+
+const CALL_ID_COLLISION: &str =
+    "hash collision detected while assigning deterministic projected call edge IDs";
+
+// Every call site with no edge reaching a visible caller directly.
+const UNRESOLVED_VISIBLE_CALLERS: &str = r#"
+INSERT INTO lambda_unresolved_calls
+SELECT cs.id, cs.caller_fn_id, cs.callee_text, cs.file_id, cs.line, cs.col
+FROM call_sites cs
+WHERE cs.is_direct = 0
+  AND cs.caller_fn_id NOT IN (SELECT lambda_fn_id FROM lambda_owners)
+  AND NOT EXISTS (SELECT 1 FROM call_edges_data ce WHERE ce.call_site_id = cs.id);
+"#;
 
 /// Publish the master-compatible column layouts with lambda-free meanings.
 /// Must run once, inside the export transaction, after all graph/link facts
@@ -309,12 +471,11 @@ pub fn publish_lambda_free(conn: &Connection) -> Result<()> {
         bail!("lambda-free projection has already been published");
     }
     let has_lambdas: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM functions WHERE name GLOB '*::$lambda[0-9]*:[0-9]*')",
+        &format!("SELECT EXISTS(SELECT 1 FROM functions WHERE name GLOB '{LAMBDA_NAME}')"),
         [],
         |r| r.get(0),
     )?;
     preserve_raw(conn, has_lambdas)?;
-    conn.execute_batch(PROJECTION_VIEWS)?;
     conn.execute_batch(
         r#"
 CREATE TABLE lambda_owners (
@@ -332,68 +493,159 @@ CREATE TABLE lambda_unresolved_calls (
     call_site_id INTEGER, caller_fn_id INTEGER, callee_text TEXT,
     file_id INTEGER, line INTEGER, col INTEGER
 );
-INSERT INTO lambda_unresolved_calls SELECT * FROM _projection_unresolved;
 "#,
     )?;
     if !has_lambdas {
         // No changed storage needs a second physical copy or a rewrite. This
         // also preserves ordinary edge IDs at the full SQLite integer range.
-        conn.execute_batch("INSERT INTO lambda_call_provenance SELECT id,id FROM call_edges_data")?;
-        drop_projection_views(conn)?;
+        conn.execute_batch(UNRESOLVED_VISIBLE_CALLERS)?;
+        conn.execute_batch(
+            "INSERT INTO lambda_call_provenance SELECT id,id FROM call_edges_data ORDER BY id",
+        )?;
         return Ok(());
     }
+    // Everything below the capture triggers only reads the public tables,
+    // which still hold the complete graph until the first statement that
+    // changes them: their pre-images are not readable through `raw_*` while
+    // a statement is writing them.
+    //
     // Ownership is lexical, scoped to file and image, with the containing
     // definition preferred over another TU's same-named definition. A lambda
     // in a file-scope initializer has no enclosing function (NULL owner).
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         r#"
 INSERT INTO lambda_owners
 SELECT id,owner FROM (
  SELECT l.id,f.id AS owner,row_number() OVER (PARTITION BY l.id ORDER BY
         (f.line_start <= l.line_start AND f.line_end >= l.line_end) DESC,
         f.is_defined DESC,f.id) AS rank
- FROM raw_functions l LEFT JOIN raw_functions f
+ FROM functions l LEFT JOIN functions f
    ON f.name=substr(l.name,1,instr(l.name,'::$lambda')-1)
   AND f.file_id=l.file_id AND f.target_id IS l.target_id
- WHERE l.name GLOB '*::$lambda[0-9]*:[0-9]*'
+ WHERE l.name GLOB '{LAMBDA_NAME}'
 ) WHERE rank=1;
+"#
+    ))?;
+    conn.execute_batch(
+        r#"
+-- Compute reachability once per distinct entering lambda, independently of
+-- how many visible callers enter it. UNION bounds cycles by lambda pairs.
+CREATE TEMP TABLE projected_reachability (
+    start_fn_id INTEGER NOT NULL, lambda_fn_id INTEGER NOT NULL,
+    PRIMARY KEY (start_fn_id, lambda_fn_id)
+) WITHOUT ROWID;
+INSERT INTO projected_reachability
+WITH RECURSIVE paths(start_fn_id, lambda_fn_id) AS (
+    SELECT e.callee_fn_id, e.callee_fn_id
+    FROM lambda_owners l JOIN call_edges_data e ON e.callee_fn_id = l.lambda_fn_id
+    WHERE e.caller_fn_id NOT IN (SELECT lambda_fn_id FROM lambda_owners)
+    UNION
+    SELECT p.start_fn_id, e.callee_fn_id
+    FROM paths p JOIN call_edges_data e ON e.caller_fn_id = p.lambda_fn_id
+    WHERE e.callee_fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
+)
+SELECT start_fn_id, lambda_fn_id FROM paths;
 
--- Materialize before changing either endpoint relation. An entering edge can
--- reach multiple leaves, and multiple entering edges can reach the same
--- visible callee from the same site. Deduplicate public edges on
--- (caller, callee, call_site, resolution) while preserving every entering edge
--- in provenance.
+-- Attach original entering-edge provenance only after the shared closure.
+CREATE TEMP TABLE projected_lambda_callers AS
+SELECT e.id AS entry_edge_id, e.call_site_id, e.caller_fn_id, r.lambda_fn_id, e.resolution_id
+FROM projected_reachability r JOIN call_edges_data e ON e.callee_fn_id = r.start_fn_id
+WHERE e.caller_fn_id NOT IN (SELECT lambda_fn_id FROM lambda_owners);
+CREATE INDEX temp.projected_lambda_callers_lambda ON projected_lambda_callers(lambda_fn_id);
+"#,
+    )?;
+    conn.execute_batch(UNRESOLVED_VISIBLE_CALLERS)?;
+    conn.execute_batch(
+        r#"
+INSERT INTO lambda_unresolved_calls
+SELECT DISTINCT cs.id, p.caller_fn_id, cs.callee_text, cs.file_id, cs.line, cs.col
+FROM projected_lambda_callers p JOIN call_sites cs ON cs.caller_fn_id = p.lambda_fn_id
+WHERE cs.is_direct = 0
+  AND NOT EXISTS (SELECT 1 FROM call_edges_data ce WHERE ce.call_site_id = cs.id);
+
+-- An entering edge can reach multiple leaves, and multiple entering edges can
+-- reach the same visible callee from the same site. Public edges are
+-- deduplicated on (caller, callee, call_site, resolution) while every
+-- entering edge stays in provenance; an ordinary edge in the same group keeps
+-- its ID and absorbs the contracted paths.
 CREATE TEMP TABLE projected_call_provenance AS
-SELECT * FROM _projection_call_edges;
+SELECT DISTINCT p.entry_edge_id, p.call_site_id, p.caller_fn_id, e.callee_fn_id, p.resolution_id
+FROM projected_lambda_callers p JOIN call_edges_data e ON e.caller_fn_id = p.lambda_fn_id
+WHERE e.callee_fn_id NOT IN (SELECT lambda_fn_id FROM lambda_owners);
 
 CREATE TEMP TABLE projected_calls AS
-SELECT
-    CASE WHEN min(CASE WHEN r.callee_fn_id = p.callee_fn_id THEN p.entry_edge_id END) IS NOT NULL
-         THEN min(CASE WHEN r.callee_fn_id = p.callee_fn_id THEN p.entry_edge_id END)
-         ELSE min(p.entry_edge_id)
-    END AS entry_edge_id,
-    p.call_site_id, p.caller_fn_id, p.callee_fn_id, p.resolution,
-    CAST(NULL AS INTEGER) AS projected_id
-FROM projected_call_provenance p
-JOIN raw_call_edges_data r ON r.id = p.entry_edge_id
-GROUP BY p.caller_fn_id, p.callee_fn_id, p.call_site_id, p.resolution;
+SELECT min(m.entry_edge_id) AS entry_edge_id,
+       m.call_site_id, m.caller_fn_id, m.callee_fn_id, m.resolution_id,
+       (SELECT min(o.id) FROM call_edges_data o
+        WHERE o.call_site_id IS m.call_site_id AND o.caller_fn_id = m.caller_fn_id
+          AND o.callee_fn_id = m.callee_fn_id AND o.resolution_id = m.resolution_id) AS ordinary_id,
+       CAST(NULL AS INTEGER) AS projected_id
+FROM projected_call_provenance m
+GROUP BY m.caller_fn_id, m.callee_fn_id, m.call_site_id, m.resolution_id;
+UPDATE projected_calls SET projected_id = ordinary_id WHERE ordinary_id IS NOT NULL;
+
+-- Entry points describe execution, so use reachable visible callees, never
+-- the lexical parent. Cycles terminate through UNION on function pairs.
+CREATE TEMP TABLE projected_contexts AS
+WITH RECURSIVE reach(start,fn_id) AS (
+ SELECT entry_fn_id,entry_fn_id FROM execution_contexts
+ WHERE entry_fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
+ UNION
+ SELECT r.start,e.callee_fn_id FROM reach r JOIN call_edges_data e ON e.caller_fn_id=r.fn_id
+ WHERE r.fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
+), leaves AS (
+ SELECT c.id AS original_id,r.fn_id AS entry_fn_id
+ FROM execution_contexts c JOIN reach r ON r.start=c.entry_fn_id
+ WHERE r.fn_id NOT IN (SELECT lambda_fn_id FROM lambda_owners)
+)
+SELECT CASE WHEN row_number() OVER (PARTITION BY p.original_id ORDER BY p.entry_fn_id)=1 THEN p.original_id
+       ELSE (SELECT coalesce(max(id),0) FROM execution_contexts)
+            + row_number() OVER (ORDER BY p.original_id,p.entry_fn_id) END AS id,
+       c.kind,p.entry_fn_id,c.call_site_id,c.api_fn_id,c.param_index,c.receiver_var_id,
+       c.model,c.multi_instance,c.self_concurrent
+FROM leaves p JOIN execution_contexts c ON c.id=p.original_id;
 "#,
     )?;
     project_call_ids(conn)?;
-    conn.execute_batch(r#"
-DELETE FROM call_edges_data;
-INSERT INTO call_edges_data
-SELECT p.projected_id,p.call_site_id,p.caller_fn_id,p.callee_fn_id,r.resolution_id
-FROM projected_calls p JOIN raw_call_edges_data r ON r.id=p.entry_edge_id;
+    // From here on the public tables diverge from the complete graph. Only
+    // edges with a lambda endpoint, and duplicates of one edge group, change; the
+    // rest stay in place.
+    conn.execute_batch(
+        r#"
+DELETE FROM call_edges_data
+WHERE caller_fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
+   OR callee_fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 
+CREATE TEMP TABLE duplicate_calls AS
+SELECT id AS duplicate_id, keep_id
+FROM (SELECT id, min(id) OVER (
+          PARTITION BY caller_fn_id, callee_fn_id, call_site_id, resolution_id) AS keep_id
+      FROM call_edges_data)
+WHERE id <> keep_id;
+DELETE FROM call_edges_data WHERE id IN (SELECT duplicate_id FROM duplicate_calls);
+
+-- Merged edge IDs are hashes: visit them in key order so the primary key is
+-- appended to rather than rewritten at random.
+INSERT INTO lambda_call_provenance SELECT id,id FROM call_edges_data ORDER BY id;
+INSERT INTO lambda_call_provenance SELECT keep_id,duplicate_id FROM duplicate_calls;
+"#,
+    )?;
+    conn.execute_batch(
+        "INSERT INTO call_edges_data
+         SELECT projected_id,call_site_id,caller_fn_id,callee_fn_id,resolution_id
+         FROM projected_calls WHERE ordinary_id IS NULL",
+    )
+    .context(CALL_ID_COLLISION)?;
+    conn.execute_batch(&format!(r#"
 INSERT INTO lambda_call_provenance
-SELECT DISTINCT p.projected_id, prov.entry_edge_id
+SELECT DISTINCT p.projected_id, m.entry_edge_id
 FROM projected_calls p
-JOIN projected_call_provenance prov
-  ON prov.caller_fn_id = p.caller_fn_id
- AND prov.callee_fn_id = p.callee_fn_id
- AND prov.call_site_id IS p.call_site_id
- AND prov.resolution = p.resolution;
+JOIN projected_call_provenance m
+  ON m.caller_fn_id = p.caller_fn_id
+ AND m.callee_fn_id = p.callee_fn_id
+ AND m.call_site_id IS p.call_site_id
+ AND m.resolution_id = p.resolution_id;
+DROP TABLE duplicate_calls;
 DROP TABLE projected_calls;
 DROP TABLE projected_call_provenance;
 
@@ -432,16 +684,16 @@ SELECT (SELECT coalesce(max(id), 0) + 1 FROM strings), '<lambda>'
 WHERE NOT EXISTS (SELECT 1 FROM strings WHERE text = '<lambda>')
   AND EXISTS (
     SELECT 1 FROM call_sites_data cs JOIN strings t ON t.id = cs.callee_text_id
-    WHERE t.text GLOB '*::$lambda[0-9]*:[0-9]*'
+    WHERE t.text GLOB '{LAMBDA_NAME}'
 );
 UPDATE call_sites_data SET callee_text_id = (SELECT max(id) FROM strings WHERE text = '<lambda>')
-WHERE callee_text_id IN (SELECT id FROM strings WHERE text GLOB '*::$lambda[0-9]*:[0-9]*');
+WHERE callee_text_id IN (SELECT id FROM strings WHERE text GLOB '{LAMBDA_NAME}');
 -- File-scope lambdas have no lexical function. Use a recorded visible caller
 -- when available; otherwise their body sites exist only in the raw interface.
-UPDATE call_sites_data SET caller_fn_id=(SELECT min(caller_fn_id) FROM _projection_lambda_callers p
+UPDATE call_sites_data SET caller_fn_id=(SELECT min(caller_fn_id) FROM projected_lambda_callers p
                                         WHERE p.lambda_fn_id=call_sites_data.caller_fn_id)
 WHERE caller_fn_id IN (SELECT lambda_fn_id FROM lambda_owners WHERE owner_fn_id IS NULL)
-  AND EXISTS (SELECT 1 FROM _projection_lambda_callers p WHERE p.lambda_fn_id=call_sites_data.caller_fn_id);
+  AND EXISTS (SELECT 1 FROM projected_lambda_callers p WHERE p.lambda_fn_id=call_sites_data.caller_fn_id);
 DELETE FROM call_sites_data WHERE caller_fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 UPDATE flow_nodes_data SET call_site_id=NULL WHERE call_site_id IS NOT NULL
   AND call_site_id NOT IN (SELECT id FROM call_sites_data);
@@ -456,28 +708,11 @@ UPDATE arg_flow_edges SET actual_fn_id=NULL WHERE actual_fn_id IN (SELECT lambda
 DELETE FROM flow_parameters_data WHERE fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 DELETE FROM flow_return_calls WHERE callee_fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 
--- Entry points describe execution, so use reachable visible callees, never
--- the lexical parent. Cycles terminate through UNION on function pairs.
-CREATE TEMP TABLE projected_contexts AS
-WITH RECURSIVE reach(start,fn_id) AS (
- SELECT entry_fn_id,entry_fn_id FROM raw_execution_contexts
- WHERE entry_fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
- UNION
- SELECT r.start,e.callee_fn_id FROM reach r JOIN raw_call_edges e ON e.caller_fn_id=r.fn_id
- WHERE r.fn_id IN (SELECT lambda_fn_id FROM lambda_owners)
-)
-SELECT c.id AS original_id,r.fn_id AS entry_fn_id
-FROM raw_execution_contexts c JOIN reach r ON r.start=c.entry_fn_id
-WHERE r.fn_id NOT IN (SELECT lambda_fn_id FROM lambda_owners);
 DELETE FROM execution_contexts WHERE entry_fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
-INSERT INTO execution_contexts
-SELECT CASE WHEN row_number() OVER (PARTITION BY p.original_id ORDER BY p.entry_fn_id)=1 THEN p.original_id
-       ELSE (SELECT coalesce(max(id),0) FROM raw_execution_contexts)
-            + row_number() OVER (ORDER BY p.original_id,p.entry_fn_id) END,
-       c.kind,p.entry_fn_id,c.call_site_id,c.api_fn_id,c.param_index,c.receiver_var_id,
-       c.model,c.multi_instance,c.self_concurrent
-FROM projected_contexts p JOIN raw_execution_contexts c ON c.id=p.original_id;
+INSERT INTO execution_contexts SELECT * FROM projected_contexts;
 DROP TABLE projected_contexts;
+DROP TABLE projected_lambda_callers;
+DROP TABLE projected_reachability;
 UPDATE execution_contexts SET api_fn_id=NULL WHERE api_fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 UPDATE execution_contexts SET call_site_id=NULL WHERE call_site_id IS NOT NULL
   AND call_site_id NOT IN (SELECT id FROM call_sites_data);
@@ -510,7 +745,7 @@ DELETE FROM cfg_blocks WHERE cfg_id IN (SELECT id FROM cfg_functions WHERE fn_id
 DELETE FROM cfg_functions WHERE fn_id IN (SELECT lambda_fn_id FROM lambda_owners);
 
 DELETE FROM functions WHERE id IN (SELECT lambda_fn_id FROM lambda_owners);
-"#)?;
+"#))?;
     for (table, key, parent) in [
         ("merge_function_identities", "function_id", "functions"),
         (
@@ -529,14 +764,23 @@ DELETE FROM functions WHERE id IN (SELECT lambda_fn_id FROM lambda_owners);
     // source-level lambda expressions and ordinary strings are retained.
     let segment = Regex::new(r"::\$lambda[0-9]+:[0-9]+")?;
     let strings = conn
-        .prepare("SELECT id,text FROM strings WHERE text GLOB '*::$lambda[0-9]*:[0-9]*'")?
+        .prepare(&format!(
+            "SELECT id,text FROM strings WHERE text GLOB '{LAMBDA_NAME}'"
+        ))?
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut update = conn.prepare("UPDATE strings SET text=?2 WHERE id=?1")?;
     for (id, text) in strings {
         update.execute(params![id, segment.replace_all(&text, "").as_ref()])?;
     }
-    drop_projection_views(conn)?;
+    drop(update);
+    for table in CHANGED {
+        for event in ["update", "delete", "insert"] {
+            let trigger = quote(&capture_trigger(event, table));
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS temp.{trigger}"))?;
+        }
+        drop_unchanged_preimages(conn, table)?;
+    }
     Ok(())
 }
 
@@ -667,7 +911,7 @@ mod tests {
     fn a_damaged_raw_graph_is_not_silently_replaced_with_the_public_graph() {
         let conn = complete_graph();
         publish_lambda_free(&conn).unwrap();
-        conn.execute_batch("DROP TABLE raw_functions").unwrap();
+        conn.execute_batch("DROP VIEW raw_functions").unwrap();
         assert!(use_raw_relations(&conn)
             .unwrap_err()
             .to_string()
@@ -861,11 +1105,7 @@ mod tests {
         let conn = complete_graph();
         // Add another entering edge from Root (fn 0) to lambda 5 at call site 0,
         // which also reaches Leaf (fn 3).
-        let indirect: i64 = conn
-            .query_row("SELECT id FROM strings WHERE text = 'indirect'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
+        let indirect = count(&conn, "SELECT id FROM strings WHERE text = 'indirect'");
         conn.execute(
             "INSERT INTO call_edges_data VALUES(100, 0, 0, 5, ?1)",
             [indirect],
@@ -900,6 +1140,397 @@ mod tests {
         assert_eq!(prov_count, 2);
     }
 
+    /// A snapshot of `functions` ordinary callers, each with a body the
+    /// projection has no reason to touch, and one lambda entered by the first.
+    fn mostly_ordinary_graph(functions: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        conn.execute_batch(crate::SCHEMA_V8).unwrap();
+        conn.execute_batch("INSERT INTO files VALUES(0,'/src/main.cpp','',0);INSERT INTO types VALUES(0,'int','int',4,'{}');").unwrap();
+        let mut texts = crate::TextPool::new(&conn).unwrap();
+        for text in ["direct", "value", "callee()", "var"] {
+            texts.intern(text).unwrap();
+        }
+        drop(texts);
+        let text = |value: &str| -> i64 {
+            conn.query_row("SELECT id FROM strings WHERE text=?1", [value], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let (direct, name, callee, var) =
+            (text("direct"), text("value"), text("callee()"), text("var"));
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE n AS
+                WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<{functions})
+                SELECT i FROM n;
+             INSERT INTO functions SELECT i,'ordinary_function_with_a_long_name_'||i,0,i,i,'external','void()',1,0,0,NULL FROM n WHERE i<{functions};
+             INSERT INTO functions VALUES
+                ({functions},'ordinary_function_with_a_long_name_0::$lambda1:1',0,0,0,'internal','void()',1,0,0,NULL);
+             INSERT INTO call_sites_data(id,caller_fn_id,file_id,line,col,callee_text_id,is_direct)
+                SELECT i,i,0,i,1,{callee},1 FROM n WHERE i<{functions};
+             INSERT INTO call_sites_data(id,caller_fn_id,file_id,line,col,callee_text_id,is_direct)
+                VALUES({functions},{functions},0,1,1,{callee},1);
+             INSERT INTO call_edges_data SELECT i,i,i,(i+1)%{functions},{direct} FROM n WHERE i BETWEEN 1 AND {functions}-1;
+             INSERT INTO call_edges_data VALUES(0,0,0,{functions},{direct}),({functions},{functions},{functions},1,{direct});
+             INSERT INTO variables_data(id,name_id,kind,fn_id,type_id,file_id,line)
+                SELECT i,{name},'local',i,0,0,i FROM n;
+             INSERT INTO flow_nodes_data(id,kind_id,var_id,fn_id) SELECT i,{var},i,i FROM n;
+             DROP TABLE n;"
+        ))
+        .unwrap();
+        conn.execute_batch(crate::INDEXES_V8).unwrap();
+        conn
+    }
+
+    #[test]
+    fn publication_stores_only_the_rows_it_rewrites() {
+        // Large enough that the fixed root pages of empty pre-image tables
+        // are noise, as they are on any real snapshot.
+        let conn = mostly_ordinary_graph(20_000);
+        let pages = |conn: &Connection| count(conn, "SELECT page_count FROM pragma_page_count");
+        let before = pages(&conn);
+        publish_lambda_free(&conn).unwrap();
+        let grown = pages(&conn) - before;
+        assert!(
+            grown * 5 < before,
+            "one lambda among 20000 functions grew {before} pages by {grown}"
+        );
+        for (raw, rows) in [
+            ("raw_functions", 20_001),
+            ("raw_call_sites", 20_001),
+            ("raw_call_edges", 20_001),
+            ("raw_variables", 20_001),
+            ("raw_flow_nodes", 20_001),
+        ] {
+            assert_eq!(
+                count(&conn, &format!("SELECT count(*) FROM {raw}")),
+                rows,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_does_not_rewrite_a_unique_edge_without_a_lambda_endpoint() {
+        let conn = complete_graph();
+        let direct = count(&conn, "SELECT id FROM strings WHERE text = 'direct'");
+        conn.execute(
+            "INSERT INTO call_edges_data VALUES(300,NULL,3,4,?1)",
+            [direct],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE rewritten(id INTEGER);
+             CREATE TEMP TRIGGER watch_delete BEFORE DELETE ON main.call_edges_data
+             BEGIN INSERT INTO rewritten VALUES(OLD.id); END;
+             CREATE TEMP TRIGGER watch_insert AFTER INSERT ON main.call_edges_data
+             BEGIN INSERT INTO rewritten VALUES(NEW.id); END;",
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM rewritten WHERE id=300"),
+            0
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM call_edges WHERE id=300"),
+            1
+        );
+    }
+
+    #[test]
+    fn an_edge_reached_directly_and_through_a_lambda_keeps_its_identity_row() {
+        let conn = complete_graph();
+        let indirect = count(&conn, "SELECT id FROM strings WHERE text = 'indirect'");
+        // Site 0 already enters lambda 1, which reaches Leaf (3) through
+        // lambda 2. This edge resolves the same site straight to Leaf.
+        conn.execute(
+            "INSERT INTO call_edges_data VALUES(400, 0, 0, 3, ?1)",
+            [indirect],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM call_edges WHERE caller_fn_id=0 AND callee_fn_id=3 AND call_site_id=0"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM call_edges WHERE id=400"),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM lambda_call_provenance
+                 WHERE edge_id=400 AND entry_edge_id IN (400, 0)"
+            ),
+            2,
+            "the ordinary edge links to itself and to the entering edge"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_stays_readable_when_attached_under_another_name() {
+        let conn = complete_graph();
+        publish_lambda_free(&conn).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("snapshot.db");
+        conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        let reader = Connection::open_in_memory().unwrap();
+        reader
+            .execute("ATTACH DATABASE ?1 AS other", [path.to_str().unwrap()])
+            .unwrap();
+        for (relation, rows) in [
+            ("functions", 4),
+            ("raw_functions", 8),
+            ("raw_call_edges", 9),
+            (
+                "raw_strings",
+                count(&conn, "SELECT count(*) FROM raw_strings"),
+            ),
+        ] {
+            assert_eq!(
+                count(&reader, &format!("SELECT count(*) FROM other.{relation}")),
+                rows,
+                "{relation}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_graph_reads_do_not_materialize_a_raw_view() {
+        let conn = complete_graph();
+        publish_lambda_free(&conn).unwrap();
+        use_raw_relations(&conn).unwrap();
+        // Materializing a view on the right of a join costs a whole relation
+        // per statement, and `read_cfgs` runs these once per batch of graphs.
+        let mut reads: Vec<&str> = vec![
+            "SELECT s.text,c.flags FROM link_class_facts c
+             LEFT JOIN strings s ON s.id=c.name_id ORDER BY c.ordinal",
+            crate::linking::METHOD_FACTS_SQL,
+            crate::linking::MEMBER_CALLS_SQL,
+            crate::NODE_ROW_SQL,
+            crate::CONTEXT_ROWS_SQL,
+        ];
+        reads.extend(crate::CFG_READS.map(|(_, sql)| sql));
+        for sql in reads {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let unbound = vec![0_i64; stmt.parameter_count()];
+            let plan: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(unbound), |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.contains("MATERIALIZE") || step.contains("CO-ROUTINE")),
+                "{sql}\n{plan:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn original_lambda_names_are_stored_only_in_the_raw_namespace() {
+        let conn = complete_graph();
+        publish_lambda_free(&conn).unwrap();
+        // Anything outside `raw_*` is a public relation, which names no lambda.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table'
+                 AND name GLOB '*preimage*' AND name NOT GLOB 'raw_*'"
+            ),
+            0
+        );
+        assert!(
+            count(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name GLOB 'raw_preimage_*'"
+            ) > 0
+        );
+    }
+
+    /// Capture triggers on `table` of a lambda-bearing complete graph, as
+    /// `publish_lambda_free` installs them.
+    fn with_capture(table: &str) -> Connection {
+        let conn = complete_graph();
+        capture_preimages(&conn, table).unwrap();
+        conn
+    }
+
+    #[test]
+    fn rewriting_a_key_of_a_keyed_table_is_rejected() {
+        let conn = with_capture("call_sites_data");
+        let error = conn
+            .execute("UPDATE call_sites_data SET id = id + 1000", [])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("key"), "{error}");
+        // An ordinary column is captured, not rejected.
+        conn.execute("UPDATE call_sites_data SET line = line + 1", [])
+            .unwrap();
+        assert!(count(&conn, "SELECT count(*) FROM raw_preimage_call_sites_data") > 0);
+    }
+
+    #[test]
+    fn an_in_place_table_rejects_a_column_its_raw_view_does_not_overlay() {
+        let conn = with_capture("variables_data");
+        conn.execute("UPDATE variables_data SET kind = 'local' WHERE id = 0", [])
+            .unwrap();
+        let error = conn
+            .execute("UPDATE variables_data SET type_id = 7 WHERE id = 0", [])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlay"), "{error}");
+        let error = conn
+            .execute("DELETE FROM variables_data WHERE id = 0", [])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("remove"), "{error}");
+    }
+
+    #[test]
+    fn in_place_overlays_cover_every_rewritten_table_of_a_published_graph() {
+        let conn = complete_graph();
+        // A dispatch query that resolves to a lambda is cleared by publication.
+        let text = |value: &str| -> i64 {
+            conn.query_row("SELECT id FROM strings WHERE text=?1", [value], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let (name, receiver) = (text("p"), text("direct"));
+        conn.execute(
+            "INSERT INTO link_dispatch_queries(id,name_id,receiver_id,callee_fn_id,flags,origin_id)
+             VALUES(0,?1,?2,1,0,?1)",
+            [name, receiver],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT callee_fn_id IS NULL FROM link_dispatch_queries WHERE id=0"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT callee_fn_id FROM raw_link_dispatch_queries WHERE id=0"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_write_that_changes_nothing_leaves_no_preimage() {
+        let conn = complete_graph();
+        // The glob matches a name the generated-segment pattern does not strip.
+        conn.execute(
+            "INSERT INTO strings(id,text) VALUES(900,'kept::$lambda1x:2')",
+            [],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM raw_preimage_strings WHERE id = 900"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT text = 'kept::$lambda1x:2' FROM raw_strings WHERE id = 900"
+            ),
+            1
+        );
+        // And every row it does keep differs from the public row.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM raw_preimage_strings i JOIN strings s ON s.id = i.id
+                 WHERE i.preimage_added = 0 AND i.text IS s.text"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn ordinary_duplicate_edges_collapse_in_a_snapshot_with_lambdas() {
+        let conn = complete_graph();
+        let direct: i64 = conn
+            .query_row("SELECT id FROM strings WHERE text = 'direct'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Two ordinary edges of one group, neither touching a lambda.
+        conn.execute(
+            "INSERT INTO call_edges_data VALUES(300,NULL,3,4,?1),(301,NULL,3,4,?1)",
+            [direct],
+        )
+        .unwrap();
+        publish_lambda_free(&conn).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM call_edges WHERE id IN (300,301)"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM call_edges WHERE id = 300"),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM lambda_call_provenance WHERE edge_id = 300 AND entry_edge_id IN (300, 301)"
+            ),
+            2
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM raw_call_edges WHERE id IN (300,301)"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn a_guard_with_no_condition_emits_no_statement() {
+        assert_eq!(raise_when("never", &[]), "");
+        let guard = raise_when("moved", &["OLD.a IS NOT NEW.a".to_owned()]);
+        assert!(
+            guard.contains("RAISE(ABORT, 'moved')") && guard.contains("WHERE OLD.a"),
+            "{guard}"
+        );
+    }
+
+    #[test]
+    fn complete_graph_aliases_skip_the_preimage_storage() {
+        let conn = complete_graph();
+        publish_lambda_free(&conn).unwrap();
+        use_raw_relations(&conn).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM temp.sqlite_schema WHERE name GLOB '*preimage*'"
+            ),
+            0
+        );
+        assert_eq!(count(&conn, "SELECT count(*) FROM functions"), 8);
+    }
+
     #[test]
     fn hash_collision_error_is_annotated() {
         let conn = Connection::open_in_memory().unwrap();
@@ -908,19 +1539,12 @@ mod tests {
                 entry_edge_id INTEGER,
                 callee_fn_id INTEGER,
                 projected_id INTEGER
-            );
-            CREATE TABLE raw_call_edges_data (
-                id INTEGER PRIMARY KEY,
-                callee_fn_id INTEGER
             );",
         )
         .unwrap();
         // Insert two rows that will produce the same hash: identical entry_edge_id and callee_fn_id
-        conn.execute_batch(
-            "INSERT INTO raw_call_edges_data VALUES(1, 10);
-             INSERT INTO projected_calls VALUES(1, 20, NULL), (1, 20, NULL);",
-        )
-        .unwrap();
+        conn.execute_batch("INSERT INTO projected_calls VALUES(1, 20, NULL), (1, 20, NULL);")
+            .unwrap();
         let err = project_call_ids(&conn).unwrap_err();
         assert!(
             err.to_string().contains(

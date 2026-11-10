@@ -1278,7 +1278,8 @@ pub fn export_cfg<'a>(
 // table in its `ORDER BY` order. Kinds are read as their names, and rows
 // in the order they were written (edges, whose order is not stored, by
 // kind name), so a graph reads back the same whatever ids its database
-// gave its sites and kinds.
+// gave its sites and kinds. Every `ORDER BY` term is selected, including ones
+// `read_cfgs` ignores: SQLite would otherwise materialize a `raw_cfg_*` view.
 const READ_CFG_FUNCTIONS: &str =
     "SELECT id, fn_id, tu_file_id, variant, entry_block, exit_block, exceptional_exit_block \
      FROM cfg_functions WHERE id BETWEEN ?1 AND ?2 ORDER BY id";
@@ -1292,7 +1293,7 @@ const READ_CFG_EVENTS: &str = "SELECT e.id, b.cfg_id, e.block_id, e.ordinal, k.t
             e.file_id, e.line, e.col, e.expansion_file_id, e.expansion_line, e.expansion_col \
      FROM cfg_blocks b CROSS JOIN cfg_events e ON e.block_id = b.id JOIN strings k ON k.id = e.kind_id \
      WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY e.id";
-const READ_CFG_EVENT_SITES: &str = "SELECT es.event_id, es.call_site_id \
+const READ_CFG_EVENT_SITES: &str = "SELECT es.event_id, es.call_site_id, es.ordinal \
      FROM cfg_blocks b CROSS JOIN cfg_events e ON e.block_id = b.id \
      CROSS JOIN cfg_event_sites es ON es.event_id = e.id \
      WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY es.event_id, es.ordinal";
@@ -1301,7 +1302,7 @@ const READ_CFG_EVENT_ORDER: &str = "SELECT o.event_id, o.next_event_id \
      CROSS JOIN cfg_event_order o ON o.event_id = e.id \
      WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY o.event_id, o.next_event_id";
 const READ_CFG_GAPS: &str = "SELECT g.cfg_id, k.text, g.file_id, g.line, g.col, \
-            g.first_event, g.last_event \
+            g.first_event, g.last_event, g.id \
      FROM cfg_gaps g JOIN strings k ON k.id = g.kind_id \
      WHERE g.cfg_id BETWEEN ?1 AND ?2 ORDER BY g.id";
 

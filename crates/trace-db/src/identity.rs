@@ -60,10 +60,6 @@ pub fn record_database_identity(conn: &Connection) -> Result<DatabaseIdentity> {
     Ok(identity)
 }
 
-fn quoted(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
 fn field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);
@@ -80,11 +76,9 @@ fn compute(conn: &Connection) -> Result<DatabaseIdentity> {
     let mut hash = Sha256::new();
     field(&mut hash, ALGORITHM.as_bytes());
     for table in tables {
-        let columns: Vec<(String, i64)> = conn
-            .prepare("SELECT name, pk FROM pragma_table_info(?1) ORDER BY cid")?
-            .query_map([&table], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+        let columns: Vec<(String, i64)> = crate::table_columns(conn, &table)?
             .into_iter()
+            .map(|column| (column.name, column.pk))
             .filter(|(name, _)| table != "analysis_run" || name != "created_at")
             .collect();
         hash.update([0x10]);
@@ -95,7 +89,7 @@ fn compute(conn: &Connection) -> Result<DatabaseIdentity> {
         }
         let select = columns
             .iter()
-            .map(|(name, _)| quoted(name))
+            .map(|(name, _)| crate::quote_identifier(name))
             .collect::<Vec<_>>()
             .join(",");
         // Use indexed primary-key order where available. Relations without a
@@ -109,13 +103,13 @@ fn compute(conn: &Connection) -> Result<DatabaseIdentity> {
             primary
         }
         .into_iter()
-        .map(|(name, _)| format!("{} COLLATE BINARY", quoted(name)))
+        .map(|(name, _)| format!("{} COLLATE BINARY", crate::quote_identifier(name)))
         .collect::<Vec<_>>()
         .join(",");
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {select} FROM {} ORDER BY {order}",
-                quoted(&table)
+                crate::quote_identifier(&table)
             ))
             .with_context(|| format!("cannot hash database table {table}"))?;
         let mut rows = stmt.query([])?;

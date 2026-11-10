@@ -29,6 +29,12 @@ fn checked_flags(flags: u8, mask: u8) -> Result<u8> {
     Ok(flags)
 }
 
+// `functions` and `call_sites` can be complete-graph views that lose rows, so a
+// join against one would copy the whole relation: read them by key instead.
+// `ordinal` is selected because the views cannot be flattened otherwise.
+pub(crate) const METHOD_FACTS_SQL: &str = "SELECT m.fn_id,(SELECT name FROM functions WHERE id=m.fn_id),(SELECT is_defined FROM functions WHERE id=m.fn_id),m.params_id,s.text,m.flags,m.ordinal FROM link_method_facts m LEFT JOIN strings s ON s.id=m.params_id ORDER BY m.ordinal";
+pub(crate) const MEMBER_CALLS_SQL: &str = "SELECT m.call_site_id,(SELECT caller_fn_id FROM call_sites WHERE id=m.call_site_id),m.query_id,COALESCE(m.source_site_id,m.call_site_id),CASE WHEN m.source_site_id IS NULL THEN m.call_site_id ELSE (SELECT id FROM call_sites WHERE id=m.source_site_id) END,m.ordinal FROM link_member_calls m ORDER BY m.ordinal";
+
 pub fn write_linking_facts(
     conn: &Connection,
     facts: &LinkingFacts,
@@ -221,11 +227,37 @@ fn read_normalized(conn: &Connection, header: Header, version: i64) -> Result<Li
         .query_map([],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))? {
         let (id,origin)=row?;origins.entry(fn_id(id)?).or_default().push(origin);
     }
-    for row in conn.prepare("SELECT m.fn_id,f.name,f.is_defined,m.params_id,s.text,m.flags FROM link_method_facts m LEFT JOIN functions f ON f.id=m.fn_id LEFT JOIN strings s ON s.id=m.params_id ORDER BY m.ordinal")?
-        .query_map([],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,Option<i64>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,u8>(5)?)))? {
-        let (id,name,defined,shape_id,shape,flags)=row?;let flags=checked_flags(flags,15)?;let id=fn_id(id)?;
-        let params=match shape_id { Some(_) => Some(serde_json::from_str(&shape.context("missing method parameter shape")?)?),None=>None };
-        out.functions.push(LinkFunction { id,name,params,guessed_params: vec![],defined,virtual_member:flags&1!=0,final_member:flags&2!=0,static_member:flags&4!=0,variadic:flags&8!=0,definition_origins:origins.remove(&id).unwrap_or_default() });
+    for row in conn.prepare(METHOD_FACTS_SQL)?.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, bool>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, u8>(5)?,
+        ))
+    })? {
+        let (id, name, defined, shape_id, shape, flags) = row?;
+        let flags = checked_flags(flags, 15)?;
+        let id = fn_id(id)?;
+        let params = match shape_id {
+            Some(_) => Some(serde_json::from_str(
+                &shape.context("missing method parameter shape")?,
+            )?),
+            None => None,
+        };
+        out.functions.push(LinkFunction {
+            id,
+            name,
+            params,
+            guessed_params: vec![],
+            defined,
+            virtual_member: flags & 1 != 0,
+            final_member: flags & 2 != 0,
+            static_member: flags & 4 != 0,
+            variadic: flags & 8 != 0,
+            definition_origins: origins.remove(&id).unwrap_or_default(),
+        });
     }
     if !origins.is_empty() {
         bail!("definition origins reference a missing method");
@@ -289,12 +321,34 @@ fn read_normalized(conn: &Connection, header: Header, version: i64) -> Result<Li
         let (id,name,receiver,callee,flags,origin)=row?;
         queries.insert(id,Query {name,receiver,callee:callee.map(fn_id).transpose()?,flags:checked_flags(flags,7)?,origin});
     }
-    for row in conn.prepare("SELECT m.call_site_id,c.caller_fn_id,m.query_id,COALESCE(m.source_site_id,m.call_site_id),s.id FROM link_member_calls m LEFT JOIN call_sites c ON c.id=m.call_site_id LEFT JOIN call_sites s ON s.id=COALESCE(m.source_site_id,m.call_site_id) ORDER BY m.ordinal")?
-        .query_map([],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,Option<i64>>(4)?)))? {
-        let (id,caller,query,source,source_exists)=row?;
-        if source_exists.is_none() { bail!("member call references a missing source invocation"); }
-        let q=queries.get(&query).context("member call references a missing dispatch query")?;
-        out.calls.push(LinkCall {id:site_id(id)?,source_site:site_id(source)?,caller:fn_id(caller)?,callee:q.callee,name:q.name.clone(),receiver:q.receiver.clone(),receiver_declared:q.flags&1!=0,exact:q.flags&2!=0,implicit:q.flags&4!=0,origin:q.origin.clone()});
+    for row in conn.prepare(MEMBER_CALLS_SQL)?.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+        ))
+    })? {
+        let (id, caller, query, source, source_exists) = row?;
+        if source_exists.is_none() {
+            bail!("member call references a missing source invocation");
+        }
+        let q = queries
+            .get(&query)
+            .context("member call references a missing dispatch query")?;
+        out.calls.push(LinkCall {
+            id: site_id(id)?,
+            source_site: site_id(source)?,
+            caller: fn_id(caller)?,
+            callee: q.callee,
+            name: q.name.clone(),
+            receiver: q.receiver.clone(),
+            receiver_declared: q.flags & 1 != 0,
+            exact: q.flags & 2 != 0,
+            implicit: q.flags & 4 != 0,
+            origin: q.origin.clone(),
+        });
     }
     out.senders = conn
         .prepare("SELECT fn_id FROM link_ipc_senders ORDER BY fn_id")?
@@ -454,6 +508,27 @@ mod tests {
         assert!(format!("{:#}", read_linking_facts(&conn).unwrap_err())
             .contains("missing dispatch query"));
     }
+    #[test]
+    fn dangling_member_call_sites_are_rejected() {
+        let (conn, facts) = sample();
+        write(&conn, &facts);
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        // A named source invocation that does not exist.
+        conn.execute_batch(
+            "UPDATE link_member_calls SET source_site_id = 9999 WHERE call_site_id = 11;",
+        )
+        .unwrap();
+        assert!(format!("{:#}", read_linking_facts(&conn).unwrap_err())
+            .contains("missing source invocation"));
+        // The call itself missing: its caller cannot be read either.
+        conn.execute_batch(
+            "UPDATE link_member_calls SET source_site_id = NULL WHERE call_site_id = 11;
+             DELETE FROM call_sites_data WHERE id = 11;",
+        )
+        .unwrap();
+        assert!(read_linking_facts(&conn).is_err());
+    }
+
     #[test]
     fn provider_views_and_guessed_parameters_roundtrip_in_v3() {
         let (conn, mut facts) = sample();
