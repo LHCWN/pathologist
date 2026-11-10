@@ -12378,7 +12378,8 @@ fn lower_declaration(
         return false;
     }
     if node.cached_kind() == "declaration"
-        && callback_declarations::try_lower(program, ctx, source, node)
+        && (callback_declarations::try_lower(program, ctx, source, node)
+            || callback_declarations::try_lower_auto_initializer(program, ctx, source, node))
     {
         return true;
     }
@@ -12406,6 +12407,22 @@ fn lower_declaration(
                              owner: Node,
                              decl: Node,
                              value: Option<Node>| {
+        // `auto x(expr)` deduces and stores the one expression's value;
+        // the parentheses do not call the deduced class's constructor.
+        let value = value.map(|value| {
+            if is_placeholder_type(ctx, type_node) && value.cached_kind() == "argument_list" {
+                let mut cursor = value.walk();
+                let mut args = value
+                    .named_children(&mut cursor)
+                    .filter(|n| n.cached_kind() != "comment");
+                if let Some(arg) = args.next() {
+                    if args.next().is_none() {
+                        return arg;
+                    }
+                }
+            }
+            value
+        });
         let capture = start_initializer_capture(program, ctx).filter(|_| value.is_some());
         let ty = local_type(program, ctx, source, type_node, type_id, decl, value);
         let var = lower_one_declarator(
@@ -12825,9 +12842,13 @@ fn direct_init_argument(
     if let Some(&var) = ctx.locals.get(&name) {
         return Some(DirectInitArg::Var(var));
     }
-    if names_type_in_scope(program, ctx, &name) {
+    if names_type_in_scope(program, ctx, &name)
+        || callback_declarations::template_type_name(ctx, source, name_node, &name) == Some(true)
+    {
         // A type declared nearer than any global of that name hides it:
         // `using Value = int;` makes `Worker make(Value);` a declaration.
+        // A type template parameter is a type too (`auto make(T);` inside
+        // `template<class T>`).
         return None;
     }
     if this_field_named(program, ctx, &name).is_some() {
@@ -13471,11 +13492,15 @@ fn lower_one_declarator(
                     program,
                     &declared_members_upward(program, &cls, &trace_ir::MethodKind::Ctor),
                 );
+            // A single-expression `auto` initializer was unwrapped above.
+            // Its leftover argument list must not be re-read as constructor
+            // arguments through the span fallback.
             let ctor_args: Option<Node> = match init_expr {
                 Some(n) if n.cached_kind() == "argument_list" || braced_ctor => Some(n),
-                _ => span_node
+                None => span_node
                     .children(&mut span_node.walk())
                     .find(|c| c.cached_kind() == "argument_list"),
+                Some(_) => None,
             };
             if ctor_args.is_some() {
                 let span = node_call_span(program, ctx, span_node);

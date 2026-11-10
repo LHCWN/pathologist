@@ -1,4 +1,4 @@
-//! Recovery for the C++ grammar's expression/declaration ambiguity in #219.
+//! Recovery for C++ expression/declaration ambiguities.
 //! Rules and source-location contract: docs/ANALYSIS.md, C++ parse-input normalization.
 
 use super::*;
@@ -43,6 +43,121 @@ pub(super) fn try_lower(
     if !has_empty_callback(declaration) {
         return false;
     }
+    lower_recovered(program, ctx, source, node, Arc::clone(&tree), declaration);
+    true
+}
+
+/// `auto self(get());` parses as a function taking a function pointer.
+/// When the parameter's apparent type names no type in the original scope,
+/// reparse the initializer as `auto self=get() ;`, at identical offsets. A
+/// call-shaped apparent type must name a known value; a bare unresolved name
+/// keeps the block-scope value assumption direct initialization already uses
+/// (`T w(E::kind);`).
+pub(super) fn try_lower_auto_initializer(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+) -> bool {
+    if !ctx.is_cpp
+        || ctx.current_fn.is_none()
+        || node.cached_kind() != "declaration"
+        || !node
+            .cached_field("type")
+            .is_some_and(|ty| is_placeholder_type(ctx, ty))
+    {
+        return false;
+    }
+    let mut rewritten = None;
+    for decl in node.children_by_field_name("declarator", &mut node.walk()) {
+        let Some((function, _, _)) = fn_decl_under_pointer(decl) else {
+            continue;
+        };
+        let Some(params) = function.cached_field("parameters") else {
+            continue;
+        };
+        if function
+            .cached_field("declarator")
+            .is_none_or(|name| !matches!(name.cached_kind(), "identifier" | "field_identifier"))
+            || function.cached_field("trailing_return_type").is_some()
+        {
+            continue;
+        }
+        let mut cursor = params.walk();
+        let mut children = params
+            .named_children(&mut cursor)
+            .filter(|n| n.cached_kind() != "comment");
+        let Some(param) = children.next() else {
+            continue;
+        };
+        if children.next().is_some() || param.cached_kind() != "parameter_declaration" {
+            continue;
+        }
+        let Some(ty) = param.cached_field("type") else {
+            continue;
+        };
+        let declarator = param.cached_field("declarator");
+        if !matches!(
+            ty.cached_kind(),
+            "type_identifier" | "qualified_identifier" | "template_type"
+        ) || declarator.is_some_and(|decl| decl.cached_kind() != "abstract_function_declarator")
+        {
+            continue;
+        }
+        let kind = callback_name_kind(
+            program,
+            ctx,
+            source,
+            ty,
+            &normalize_qualified(node_text(source, &ty)),
+        );
+        if kind == NameKind::Type || (declarator.is_some() && kind != NameKind::Value) {
+            continue;
+        }
+        let bytes = rewritten.get_or_insert_with(|| node_text(source, &node).as_bytes().to_vec());
+        bytes[params.start_byte() - node.start_byte()] = b'=';
+        bytes[params.end_byte() - node.start_byte() - 1] = b' ';
+    }
+    let Some(bytes) = rewritten else {
+        return false;
+    };
+    // A prefix gives relocation an edit even when the statement starts at 0.
+    let input = format!(
+        " {}",
+        String::from_utf8(bytes).expect("ASCII edits preserve UTF-8")
+    );
+    let Ok(mut parsed) = parse_source_with_lang(input, SourceLang::Cpp) else {
+        return false;
+    };
+    let root = parsed.tree.root_node();
+    if root.has_error()
+        || root.named_child_count() != 1
+        || root
+            .named_child(0)
+            .is_none_or(|n| n.cached_kind() != "declaration")
+    {
+        return false;
+    }
+    relocate(
+        &mut parsed.tree,
+        1,
+        node.start_byte(),
+        node.start_position(),
+    );
+    let tree = Arc::new(parsed.tree);
+    let declaration = tree.root_node().named_child(0).unwrap();
+    lower_recovered(program, ctx, source, node, Arc::clone(&tree), declaration);
+    true
+}
+
+fn lower_recovered(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    tree: Arc<Tree>,
+    declaration: Node,
+) {
     ctx.recovered_trees.push(Arc::clone(&tree));
     let outer_origin = ctx
         .recovery_origin
@@ -61,12 +176,13 @@ pub(super) fn try_lower(
         }
     }
     ctx.recovery_origin = outer_origin;
-    true
 }
 
-/// Walk evaluated array bounds along the declarator chain, in source order.
-/// A function declarator can wrap an array of callbacks, so follow its
-/// declarator too, but never descend into prototype parameters or type syntax.
+/// Walk evaluated array bounds and initializer values along the declarator
+/// chain, in source order. A function declarator can wrap an array of
+/// callbacks, so follow its declarator too, but never descend into prototype
+/// parameters or type syntax. Recovered initializers are walked here once
+/// because lowering does not register their call sites.
 fn walk_declarator_expressions(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -91,6 +207,11 @@ fn walk_declarator_expressions(
     if node.cached_kind() == "array_declarator" {
         if let Some(size) = node.cached_field("size") {
             walk_function_body(program, ctx, source, size, caller);
+        }
+    }
+    if node.cached_kind() == "init_declarator" {
+        if let Some(value) = node.cached_field("value") {
+            walk_function_body(program, ctx, source, value, caller);
         }
     }
 }
@@ -124,7 +245,8 @@ fn ambiguous_callback(program: &Program, ctx: &LowerContext, source: &str, node:
                         {
                             let name = normalize_qualified(node_text(source, &ty));
                             if ty.cached_kind() == "primitive_type"
-                                || callback_type_name(program, ctx, source, ty, &name)
+                                || callback_name_kind(program, ctx, source, ty, &name)
+                                    == NameKind::Type
                             {
                                 return true;
                             }
@@ -143,53 +265,81 @@ fn ambiguous_callback(program: &Program, ctx: &LowerContext, source: &str, node:
     false
 }
 
+/// What the nearest binding of a spelled name is, or `Unknown` when no
+/// binding in the original scope answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameKind {
+    Type,
+    Value,
+    Unknown,
+}
+
 /// Classify the nearest binding, rather than collecting type and value hits
 /// independently: a derived alias can hide a base field of the same name.
-fn callback_type_name(
+fn callback_name_kind(
     program: &Program,
     ctx: &LowerContext,
     source: &str,
     node: Node,
     name: &str,
-) -> bool {
+) -> NameKind {
     let probe = |candidate: &str| {
         if scoped_variable_unless_hidden(program, ctx, candidate).is_some()
             || names_function(program, ctx, candidate)
         {
-            return Some(false);
+            return Some(NameKind::Value);
         }
         (program.types.resolve_alias(candidate).is_some()
             || program.types.is_struct_declared(candidate)
             || program.types.class_type_id(candidate).is_some())
-        .then_some(true)
+        .then_some(NameKind::Type)
+    };
+    let from_bool = |is_type: bool| {
+        if is_type {
+            NameKind::Type
+        } else {
+            NameKind::Value
+        }
     };
     if !name.contains("::") {
         if ctx.current_fn.is_some() && ctx.locals.contains_key(name) {
-            return false;
+            return NameKind::Value;
         }
         if local_alias(ctx, name).is_some() {
-            return true;
+            return NameKind::Type;
         }
         // Body imports hide enclosing bindings just as local declarations do.
-        if let Some(is_type) = imported_by_declaration(ctx, name, &[ImportScope::Body], probe) {
-            return is_type;
+        if let Some(kind) = imported_by_declaration(ctx, name, &[ImportScope::Body], probe) {
+            return kind;
         }
         if let Some(is_type) = template_type_name(ctx, source, node, name) {
-            return is_type;
+            return from_bool(is_type);
         }
     }
-    if let Some(is_type) = resolve_function_named_with_imports(program, ctx, name, probe, probe) {
-        return is_type;
+    if let Some(kind) = resolve_function_named_with_imports(program, ctx, name, probe, probe) {
+        return kind;
     }
-    lookup_var(ctx, program, name).is_none()
-        && resolve_function_named(program, ctx, name).is_none()
-        && (is_fundamental_type_name(name)
-            || names_type_in_scope(program, ctx, name)
-            || scoped_type_desc(program, ctx, name).is_some())
+    if lookup_var(ctx, program, name).is_some()
+        || resolve_function_named(program, ctx, name).is_some()
+    {
+        return NameKind::Value;
+    }
+    if is_fundamental_type_name(name)
+        || names_type_in_scope(program, ctx, name)
+        || scoped_type_desc(program, ctx, name).is_some()
+    {
+        return NameKind::Type;
+    }
+    NameKind::Unknown
 }
 
 /// The nearest template binding decides whether an unqualified name can be a type.
-fn template_type_name(ctx: &LowerContext, source: &str, node: Node, name: &str) -> Option<bool> {
+pub(super) fn template_type_name(
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    name: &str,
+) -> Option<bool> {
     if !ctx.has_templates {
         return None;
     }

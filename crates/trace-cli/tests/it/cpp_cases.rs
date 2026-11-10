@@ -10010,6 +10010,7 @@ fn smart_pointer_promotion_ignores_non_promotions() {
 }
 
 analyzed_fixture!(cpp_shared_from_this);
+analyzed_fixture!(cpp_parenthesized_auto);
 
 /// The one variable `name` of the lambda inside `outer`.
 fn lambda_local(program: &Program, outer: &str, name: &str) -> trace_ir::VarId {
@@ -10064,6 +10065,255 @@ fn shared_from_this_results_reach_the_holders_members() {
         analysis,
         "Manager::ViaShared",
         "std::enable_shared_from_this::shared_from_this"
+    ));
+}
+
+#[test]
+fn shared_from_this_parenthesized_auto_initializer_reaches_captured_object() {
+    let (program, analysis) = cpp_shared_from_this();
+    let standard_member = "std::enable_shared_from_this::shared_from_this";
+    let control_sites = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            site.caller == common::only_function(program, "Manager::ViaShared")
+                && site.callee_name.as_ref() == standard_member
+        })
+        .count();
+    assert!(control_sites > 0);
+    for outer in [
+        "Manager::DirectInit",
+        "Manager::DirectInitExplicit",
+        "Manager::DirectInitGrouped",
+        "Manager::DirectInitCopy",
+        "Manager::DirectInitWeak",
+        "Manager::DirectInitReturn",
+    ] {
+        let self_var = common::local_variable(program, outer, "self");
+        assert_eq!(
+            type_name(program, self_var),
+            "std::shared_ptr<Manager>",
+            "{outer}"
+        );
+        if !["Manager::DirectInitWeak", "Manager::DirectInitReturn"].contains(&outer) {
+            assert!(
+                value_reaches(
+                    program,
+                    common::local_variable(program, outer, "this"),
+                    self_var
+                ),
+                "{outer}: self aliases this"
+            );
+        }
+        let lambda = common::lambda_in(program, outer);
+        assert!(
+            has_any_edge(program, analysis, &lambda.name, "Manager::Handle"),
+            "{outer}: captured receiver"
+        );
+        assert!(
+            program.symbols.call_sites.iter().any(|site| {
+                site.caller == lambda.id
+                    && site
+                        .receiver
+                        .is_some_and(|receiver| value_reaches(program, self_var, receiver))
+            }),
+            "{outer}: the lambda uses self's value"
+        );
+        assert!(
+            !program.symbols.call_sites.iter().any(|site| {
+                site.caller == common::only_function(program, outer)
+                    && site.callee_name.as_ref() == "std::shared_ptr::shared_ptr"
+            }),
+            "{outer}: the initializer must flow into self"
+        );
+    }
+    for outer in [
+        "Manager::DirectInit",
+        "Manager::DirectInitExplicit",
+        "Manager::DirectInitGrouped",
+    ] {
+        let sites: Vec<_> = program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|site| {
+                site.caller == common::only_function(program, outer)
+                    && site.callee_name.as_ref() == standard_member
+            })
+            .collect();
+        assert_eq!(
+            sites.len(),
+            control_sites,
+            "{outer}: match the copy-initialized call's overload sites"
+        );
+        if outer == "Manager::DirectInit" {
+            let source = include_str!("../../../../tests/fixtures/cpp_shared_from_this/main.cpp");
+            let (line, text) = source
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains("auto self(shared_from_this());"))
+                .unwrap();
+            assert_eq!(sites[0].span.line, line as u32 + 1);
+            assert_eq!(
+                sites[0].span.col,
+                text.find("shared_from_this").unwrap() as u32 + 1
+            );
+        }
+        assert!(has_any_edge(
+            program,
+            analysis,
+            outer,
+            &sites[0].callee_name
+        ));
+    }
+    let weak = common::local_variable(program, "Manager::DirectInitWeak", "w");
+    assert_eq!(type_name(program, weak), "std::weak_ptr<Manager>");
+    assert!(value_reaches(
+        program,
+        common::local_variable(program, "Manager::DirectInitWeak", "this"),
+        weak
+    ));
+}
+
+#[test]
+fn parenthesized_auto_function_prototypes_stay_declarations() {
+    let (program, _) = cpp_shared_from_this();
+    let caller = common::only_function(program, "Manager::Prototypes");
+    let vars: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|v| v.fn_id == Some(caller) && ["make", "take", "empty"].contains(&v.name.as_str()))
+        .collect();
+    assert!(vars.is_empty(), "unexpected variables: {vars:?}");
+    for name in ["make", "take", "empty"] {
+        assert!(
+            !program
+                .symbols
+                .function(common::only_function(program, &format!("Manager::{name}")))
+                .is_defined
+        );
+    }
+}
+
+#[test]
+fn parenthesized_auto_types_stay_declarations_but_unknown_bare_names_do_not() {
+    let (program, _) = cpp_parenthesized_auto();
+    for (owner, name) in [
+        ("Holder::TypeParameter", "make"),
+        ("Holder::Alias", "value"),
+        ("Known::TypeAlias", "w"),
+        ("Known::QualifiedType", "x"),
+        ("Known::UnqualifiedTemplateType", "b"),
+        ("Missing::TypeName", "v"),
+    ] {
+        let caller = common::only_function(program, owner);
+        assert!(
+            !program
+                .symbols
+                .variables
+                .iter()
+                .any(|v| v.fn_id == Some(caller) && v.name == name),
+            "{owner}: {name} must stay a declaration"
+        );
+    }
+    let caller = common::only_function(program, "Missing::BareValue");
+    assert!(
+        program
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.fn_id == Some(caller) && v.name == "u"),
+        "a bare unresolved initializer stays a value"
+    );
+}
+
+#[test]
+fn parenthesized_auto_recovers_unqualified_template_ids() {
+    let (program, analysis) = cpp_parenthesized_auto();
+    for (owner, callee) in [
+        ("Templates::UnqualifiedTemplateId", "Lookup"),
+        ("Templates::QualifiedTemplateId", "ns::Find"),
+        ("Templates::CopyTemplateId", "Lookup"),
+    ] {
+        let caller = common::only_function(program, owner);
+        assert!(
+            program
+                .symbols
+                .variables
+                .iter()
+                .any(|v| v.fn_id == Some(caller) && v.name == "w"),
+            "{owner}: the initializer becomes the local w"
+        );
+        assert!(
+            program
+                .symbols
+                .call_sites
+                .iter()
+                .any(|site| { site.caller == caller && site.callee_name.as_ref() == callee }),
+            "{owner}: the recovered initializer keeps its call"
+        );
+        let lambda = common::lambda_in(program, owner);
+        assert!(
+            has_any_edge(program, analysis, &lambda.name, "Worker::Run"),
+            "{owner}: the captured receiver reaches the pointee"
+        );
+    }
+    let caller = common::only_function(program, "Ipc::Cast");
+    assert!(
+        program
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.fn_id == Some(caller) && v.name == "proxy"),
+        "iface_cast template-id initializer becomes the local proxy"
+    );
+    assert!(
+        program
+            .symbols
+            .call_sites
+            .iter()
+            .any(|site| site.caller == caller && site.callee_name.as_ref() == "iface_cast"),
+        "the recovered iface_cast initializer keeps its call"
+    );
+}
+
+#[test]
+fn template_parameter_keeps_non_auto_direct_init_a_declaration() {
+    let (program, analysis) = cpp_parenthesized_auto();
+    for (owner, name) in [
+        ("NonAutoHolder::Proto", "build"),
+        ("OutOfLine::Member", "build"),
+    ] {
+        let caller = common::only_function(program, owner);
+        assert!(
+            !program
+                .symbols
+                .variables
+                .iter()
+                .any(|v| v.fn_id == Some(caller) && v.name == name),
+            "{owner}: Gadget {name}(T) stays a declaration"
+        );
+        assert!(
+            !has_any_edge(program, analysis, owner, "Gadget::Gadget"),
+            "{owner}: no constructor edge for the declaration"
+        );
+    }
+    let value = common::only_function(program, "NonAutoHolder::Value");
+    assert!(
+        program
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.fn_id == Some(value) && v.name == "w"),
+        "Gadget w(n) is still direct-initialized"
+    );
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "NonAutoHolder::Value",
+        "Gadget::Gadget"
     ));
 }
 

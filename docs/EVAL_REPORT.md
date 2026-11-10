@@ -26,6 +26,23 @@ The same run on `d1679a2` already fails 20 expectations in
 those counts are not re-captured here. The template-syntax probe now excludes
 the `<lambda>` callee text, which is not a template spelling.
 
+## Parenthesized `auto` initializers — 2026-11-09
+
+On ability-runtime revision `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`,
+`MissionListManager::MoveToBackgroundTask`'s `auto self(shared_from_this());`
+at `mission_list_manager.cpp:2195` now supplies the captured receiver for
+direct edges to `PrintTimeOutLog` (2198) and `CompleteBackground` (2199).
+The exact corpus probe checks the raw graph: the public projection hides
+this lambda because its callback invocation path is unresolved. See
+[parenthesized initializer recovery](ANALYSIS.md#c-parse-input-normalization).
+
+The existing DataObsOption default-constructor probe also needs the raw graph
+to retain its intended count of 75. The public projection contains 74:
+`DataObsMgrClient::ReRegister::$lambda378:26`'s default at
+`dataobs_mgr_client.h:104` is hidden. The expected count stays 75; only the
+probe's relation selection changes. All 17 ability-runtime checks pass
+against the fresh release database with these raw-graph probes.
+
 ## Lambda-free view review — 2026-11-06
 
 These are historical measurements of the SQL view prototype developed while
