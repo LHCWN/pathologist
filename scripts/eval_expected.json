@@ -1,5 +1,5 @@
 {
-  "note": "Fresh 2026-11-08 release comparison for #244 rebased on local master 5555e9a; measurements and historical recaptures are authoritative in docs/EVAL_REPORT.md, Store projections and declaration-scoped defaults. Argument-flow band centers are HDF 72400 (both entries), HiView 32470 and Camera 58694, with tolerances unchanged. Keep the exact HDF indirect total 5153 separate from named recovery and known-imprecision probes. Preserve master's 222-site Camera named-cast calibration and ability_runtime SendTransactCmd IPC probes. Added ability_runtime probes retain matching integer StartAbility overloads, exclude the six remote-token overload edges, and pin evaluated DataObsOption defaults and four conservative LifecycleFlow aggregate calls. Correctness metrics use exact or named-site checks; bulk totals keep their established bands.",
+  "note": "Fresh 2026-11-08 release comparison for #244 rebased on local master 5555e9a; measurements and historical recaptures are authoritative in docs/EVAL_REPORT.md, Store projections and declaration-scoped defaults. Argument-flow band centers are HDF 72400 (both entries), HiView 32470 and Camera 59919 (58694 before #282), with tolerances unchanged. Keep the exact HDF indirect total 5153 separate from named recovery and known-imprecision probes. Preserve master's 222-site Camera named-cast calibration and ability_runtime SendTransactCmd IPC probes. Added ability_runtime probes retain matching integer StartAbility overloads, exclude the six remote-token overload edges, and pin evaluated DataObsOption defaults and four conservative LifecycleFlow aggregate calls. Correctness metrics use exact or named-site checks; bulk totals keep their established bands.",
   "budget_pops": 800000,
   "jobs": 8,
   "corpora": {
@@ -147,7 +147,7 @@
         "edges_indirect": {"cmp": "exact", "value": 462},
         "edges_external": {"cmp": "band", "value": 46085, "tol": 420},
         "edges_ipc": {"cmp": "exact", "value": 808},
-        "arg_flow_edges": {"cmp": "band", "value": 58694, "tol": 250},
+        "arg_flow_edges": {"cmp": "band", "value": 59919, "tol": 250},
         "diagnostics": {"cmp": "exact", "value": 5251},
         "dlsym_edges": {"cmp": "exact", "value": 6},
         "public_functions_total": {"cmp": "band", "value": 22874, "tol": 120},
@@ -162,6 +162,7 @@
       ],
       "probes": [
         {"name": "a wrapped callable starts no execution context (#283)", "sql": "SELECT COUNT(*) FROM execution_contexts WHERE model IN ('std::bind','std::packaged_task::packaged_task')", "cmp": "exact", "value": 0},
+        {"name": "pack formals receive their arguments: CameraNapiObjectTypes::Hold takes 52 (#282)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN variables f ON f.id=a.formal_var_id JOIN functions c ON c.id=f.fn_id WHERE c.name='OHOS::CameraStandard::CameraNapiObjectTypes::Hold' AND f.name='args'", "cmp": "exact", "value": 52},
         {"name": "const-reference moviePath defaults bind all 136 retained VideoInfo arguments (#244)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN files p ON p.id=s.file_id JOIN variables f ON f.id=a.formal_var_id JOIN variables v ON v.id=a.actual_var_id JOIN files vp ON vp.id=v.file_id WHERE f.name='moviePath' AND a.arg_index=4 AND vp.path LIKE '%/services/deferred_processing_service/include/base/video_info.h' AND v.line IN(30,32) AND EXISTS (SELECT 1 FROM flow_nodes n JOIN flow_edges e ON e.dst_node=n.id WHERE n.var_id=v.id AND e.kind='addr_of')", "cmp": "exact", "value": 136},
         {"name": "known-imprecise SubmitTask default binds 14 param arguments past explicit handle (#244 overload debt; audit changes)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN variables f ON f.id=a.formal_var_id JOIN variables v ON v.id=a.actual_var_id JOIN files p ON p.id=v.file_id WHERE s.callee_text='OHOS::CameraStandard::DeferredProcessing::TaskManager::SubmitTask' AND f.name='param' AND p.path LIKE '%/common/include/task_manager/task_manager.h' AND v.line=36 AND a.arg_index=2", "cmp": "exact", "value": 14},
         {"name": "SubmitTask default never replaces explicit argument position (#244)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN variables f ON f.id=a.formal_var_id JOIN variables v ON v.id=a.actual_var_id JOIN files p ON p.id=v.file_id WHERE s.callee_text='OHOS::CameraStandard::DeferredProcessing::TaskManager::SubmitTask' AND f.name='param' AND p.path LIKE '%/common/include/task_manager/task_manager.h' AND v.line=36 AND a.arg_index<>2", "cmp": "exact", "value": 0},

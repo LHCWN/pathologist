@@ -190,6 +190,12 @@ pub struct Function {
     /// The parameter list ends in `...` or a parameter pack: a call may pass
     /// more arguments than `explicit_arity`.
     pub variadic: bool,
+    /// The parameter list ends in a parameter pack (`Args &&...args`), which
+    /// `explicit_arity` does not count: it takes any number of arguments,
+    /// none included. A definition's pack is the last of `params`; a
+    /// prototype has no `params` (docs/ANALYSIS.md, "Variadic parameter
+    /// packs").
+    pub has_pack_param: bool,
     /// A constructor declared `= default` or `= delete` in its class body. It
     /// is not user-provided, so the class is still an aggregate (C++17) and
     /// braces initialize its fields rather than call it.
@@ -627,6 +633,7 @@ fn absorb_redeclaration(
         existing.explicit_arity = func.explicit_arity;
     }
     existing.variadic |= func.variadic;
+    existing.has_pack_param |= func.has_pack_param;
     // User-provided once any declaration of it is.
     existing.defaulted_in_class &= func.defaulted_in_class;
     existing.is_static_member |= func.is_static_member;
@@ -1982,8 +1989,9 @@ impl SymbolTable {
                 len: arity,
             });
         }
+        let pack = usize::from(f.has_pack_param);
         let skip = match f.explicit_arity {
-            Some(arity) => f.params.len().checked_sub(arity as usize)?,
+            Some(arity) => f.params.len().checked_sub(arity as usize + pack)?,
             None => usize::from(
                 self.variable_by_id(f.params[0])
                     .is_some_and(|v| v.name == "this"),
@@ -1994,7 +2002,7 @@ impl SymbolTable {
             f,
             supplied,
             skip,
-            len: f.params.len() - skip,
+            len: f.params.len().saturating_sub(skip + pack),
         })
     }
 
@@ -4121,6 +4129,7 @@ mod tests {
             reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
+            has_pack_param: false,
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,

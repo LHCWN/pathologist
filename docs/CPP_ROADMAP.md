@@ -168,8 +168,9 @@ so `uc_telemetry_callback.cpp:187` reaches `RunTraceOnTimeTask`.
 `std::bind` and `std::packaged_task` (#250) keep the wrapped callable's edge
 from the wrapping site (`base/plugin.cpp:93`, `base/event_loop.cpp:191`), as
 `docs/ANALYSIS.md`, "Callable wrappers", states; calling the stored task
-(`event.packagedTask->operator()()`) is not tied back to it, and arguments
-through a variadic parameter pack are not followed (#282).
+(`event.packagedTask->operator()()`) is not tied back to it. Arguments
+through a variadic parameter pack are followed since #282
+(`docs/ANALYSIS.md`, "Variadic parameter packs").
 
 **Eval when done:** `Plugin::DelayProcessEvent` reaches `OnEventProxy` (met by
 #250); `EventLoop::ProcessEvent` packaged path reaches

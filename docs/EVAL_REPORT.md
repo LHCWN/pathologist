@@ -80,6 +80,45 @@ standard class and records its site, as `new` does; no corpus count moves for
 it. A narrower rule, naming only the classes a model covers, would keep these
 edges out but cannot be written in the parser, which does not read the models.
 
+## Variadic parameter packs: #282 — 2026-11-11
+
+A parameter pack was not a formal and a pack expansion had no positions, so an
+argument passed through `Args &&...args` reached no formal
+([Variadic parameter packs](ANALYSIS.md#variadic-parameter-packs)). A pack is
+now a formal that takes every argument from its position on, and an expansion
+serves every formal from its position on. Measured with `scripts/eval_check.py`
+on the four pinned corpora.
+
+| Corpus | Count | Before | After |
+|--------|-------|-------:|------:|
+| Camera | `arg_flow_edges` | 58694 | 59919 |
+
+Every other check passes on all four corpora, including the exact indirect-edge
+counts and the seven `UnifiedPipelineThreadpool::Submit` lambda edges (#250). No
+other corpus has a pack formal that moves a count.
+
+- The 1225 new rows are 1096 into pack formals (1145 rows into a formal named
+  `args` instead of 49: `CameraNapiParamParser`'s constructor 686,
+  `EnableSharedCreateInit::Create` 191, `DPS_SendCommand` 128,
+  `CameraNapiObjectTypes::Hold` 52) and the rest through expansions into the
+  formals they are forwarded to. A new probe pins `Hold`'s 52.
+- No indirect edge is added: no corpus passes a callback through a pack that a
+  model or an indirect call then runs. The feature shows in the fixtures
+  (`tests/fixtures/cpp_variadic_packs`, `cpp_bind_packaged_task`), where
+  `Work -> Hit` now appears.
+- A first version counted the pack as a declared parameter. It moved 979 direct
+  edges to external on Camera (a call that passes no pack argument no longer
+  fit) and dropped the seven `Submit` lambda edges (an expansion counted as one
+  passed argument for a callable that takes none). The pack is now outside
+  `explicit_arity`, and only the positions before an expansion count; both
+  have a test.
+- Determinism: two runs on the fixture export identical `arg_flow_edges` and
+  `call_edges`.
+- Cost, Camera, release binary, 8 jobs, alternating runs: 15.4 s and 17.4 s
+  against 16.2 s and 18.0 s for the previous binary (user 41.6 s and 45.7 s
+  against 44.1 s and 47.0 s). The runs drift with the machine; there is no
+  measurable difference.
+
 ## Callable wrappers: #250 — 2026-11-11
 
 `std::bind` and `std::packaged_task::packaged_task` are `invoke` models
@@ -111,8 +150,8 @@ indirect edges from `std::bind` sites (14, 16, 16 and 1). No
   14 in HDF, 16 in HiView, 34 in Camera and 1 in ability_runtime (a callback
   that reaches a declaration and its definition is two rows). Letting a
   wrapper add edges without one is tracked in #283.
-- Arguments passed through a variadic parameter pack are not followed
-  ([Callable wrappers](ANALYSIS.md#callable-wrappers), #282); whether the
+- Arguments passed through a variadic parameter pack were not followed then
+  (they are since #282, [Variadic parameter packs](ANALYSIS.md#variadic-parameter-packs)); whether the
   `packaged_task` constructor model fires through a factory is #284.
 - No baseline binary was run, so movement of the other global counts from
   this change is not separated out; they stay inside their existing bands.

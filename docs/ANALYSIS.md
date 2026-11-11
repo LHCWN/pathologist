@@ -2630,6 +2630,7 @@ When a call edge is created (direct or indirect), actuals are connected to calle
 
 - **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types). Callback-pointer chains retain this persistent edge at every depth, including reference-return addresses that arrive through copies after initial parameter wiring.
 - **Function identifiers** passed as fn-ptr args → `add_pts(formal, fn_loc)`
+- **Parameter packs** (`Args &&...args`, `args...`): a pack formal takes every actual from its position on, and a pack expansion serves every formal from its position on ([Variadic parameter packs](#variadic-parameter-packs))
 - **Dereferenced arguments** (`f(*x)`) pass what [Dereferenced operands](#dereferenced-operands) gives the parameter kind
 - **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` preserves the member’s own field address using the same GEP path as a stored address; unresolved paths and `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument follows the same field path), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`, `&(ns::var)`) takes the same path once it resolves (see [Canonical variable identity](#canonical-variable-identity)), a qualified reference binding included. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
 
@@ -2642,6 +2643,81 @@ After fixpoint, `extract_arg_flow` records:
 Exactly one of `actual_var` or `actual_fn` is set per row. Only arguments that resolve to IR variables or function refs at the call site participate. `arg_index` is the callee's parameter position: for a C++ member function position 0 is the implicit `this`, and the first explicit argument is at 1.
 
 Return-value flow affects **points-to** (what a call expression assigns), not arg-flow formals.
+
+### Variadic parameter packs
+
+A parameter pack (`Args &&...args`, `Args... args`) takes any number of
+arguments, and a pack expansion (`args...`, `std::forward<Args>(args)...`)
+passes any number. Neither is a position, so the analysis treats a pack as
+**one variable that stands for every element** and wires it both ways. This
+section is the authoritative statement of the rule; lowering
+(`lower_parameters`, `collect_call_arg_nodes`, `mark_pack_actuals`,
+`trace-parse/src/lower.rs`), the solver (`wire_actuals`, `recorded_position`,
+`trace-analysis/src/solver.rs`), tests (`tests/fixtures/cpp_variadic_packs`,
+`cpp_bind_packaged_task`) and reports link here. No new flow constraint kind
+is added: the wiring is the ordinary actual-to-formal copy of
+[Argument flow](#argument-flow).
+
+- **The pack formal.** A C++ pack is lowered as a formal of its own, the last
+  one, named without its `...`; C's `...` names nothing and is not a formal.
+  The pack variable is in `Program::pack_vars`. `Function::has_pack_param`
+  records it, and `explicit_arity`, in-class prototypes' counts and the
+  explicit parameter types do **not** count it: a call may pass none
+  (`takes_argument_count`).
+- **A pack formal takes every argument from its position on.** At a call, the
+  pack formal at position `p` receives the actuals at `p`, `p + 1`, and every
+  later position the site passes, as an ordinary persistent copy for each
+  (`wire_actuals`, direct, indirect and `invoke` callbacks alike). A pack
+  variable always counts as able to hold a pointee (`var_may_hold_pointee`),
+  whatever its dependent element type lowered to (`Args &&...args` is an
+  `int *`), so the copy does not depend on the order the sets grow in.
+- **An expansion serves every formal from its position on.** An argument that
+  is a pack expansion records the value of its pattern at its position
+  (`std::forward<Args>(args)` is the same value as `args`) and marks it a pack
+  variable. A formal at that position or any later one takes it when nothing
+  is written at its own position (`recorded_position`: a variable or a function
+  written there is never shadowed), so `Target(first, rest...)` gives formal 0
+  the `first` and every later formal the pack. A formal *before* the expansion
+  never takes it. An argument written after an expansion starts at no known
+  position (it is the expansion's count further on), so it is lowered like any
+  other argument, nested calls included, and recorded at the expansion's
+  position too, as a pack variable: it may reach any formal from there on.
+- **Arity.** An expansion may be empty. At an `invoke` site
+  ([Callback invocation](#callback-invocation-invoke)) only the positions before
+  it count as passed, so a callable that takes nothing is still the one a
+  `std::bind(f, args...)` runs when `args` is empty.
+- **Arg-flow rows.** A row is the position the actual is recorded at and the
+  formal it reached, so a pack formal has one row per later position that
+  passes a variable or a function (a literal records none), and a formal
+  reached through an expansion has the expansion's position. Rows are ordered
+  as the other forwarded pairs are, by `(formal, position)`. When arguments
+  follow an expansion, its position holds several values and the solver wires
+  all of them; the row names the first.
+- **Imprecision (may-analysis).** The pack is instance-insensitive: every
+  element reaches every formal the pack is forwarded to, whatever its
+  position within the pack, so `f(a, b)` through `g(Args... args) {
+  h(args...); }` gives `h`'s first formal `b` as well as `a`. The same holds
+  when the callable is itself in a pack (`std::thread(std::forward<Args>(args)...)`:
+  every element may be the callable). Elements are not typed, so a scalar
+  and a callback meet in one variable. A pack expanded inside a lambda's
+  parameter list (`[](auto &&...args)`) is not lowered as a formal. A
+  `sizeof...(args)` or a fold expression reads nothing.
+- **Scope of the pack marking.** `Program::pack_vars` is global, not per call
+  site: an argument written after an expansion that names a variable (`f(args...,
+  local)`) marks that variable, so another call that passes it where no
+  argument is written for a later formal (`g(local)` to a two-formal `g`) also
+  gives it to that formal, and it always counts as able to hold a pointee. This
+  only adds flows, so it over-approximates; it is not tracked per site.
+  A dereferenced argument after an expansion (`*x`) is recorded at the
+  expansion's position, so its by-reference or by-value treatment is read from
+  that formal rather than its own.
+- **Soundness and determinism.** Wiring only adds copies and points-to
+  members, so the solver stays monotonic and flow-insensitive; the positions a
+  pack formal takes are visited in increasing order, so the export is
+  deterministic.
+- **Cost.** A function that is not a pack function pays one flag test per
+  formal; the rest is the cost of the extra copies, which on Camera is within
+  the run-to-run variation of the analyze phase (`docs/EVAL_REPORT.md`).
 
 ### Flow-graph export
 
@@ -3039,11 +3115,12 @@ constructor, says what it is called with. This is what keeps a
   the callable's formals as for `std::thread`, so a named bound argument
   reaches the callable's formal. The model does not read `std::placeholders`:
   nothing supplies the later caller's arguments.
-- **A parameter pack is not followed.** An argument passed through a
-  variadic template's `Args&&... args` reaches no formal, because a pack is
-  not a formal and `std::forward<Args>(args)...` has no positions. So
-  `Submit(f, a)` with `Args&&... args` reaches `f` but not `a` into `f`'s
-  formals; with a named parameter it does (following packs is #282).
+- **A parameter pack is followed.** An argument passed through a
+  variadic template's `Args&&... args` reaches the callable's formal:
+  `Submit(f, a)` carries `a` through the pack and out through
+  `std::forward<Args>(args)...` into `f`'s formals, as a named parameter
+  would ([Variadic parameter packs](#variadic-parameter-packs), including
+  what it over-approximates).
 - **No execution context.** Both models state `context = "none"`: nothing
   starts at a bind or at a task's construction, so a match exports no
   `execution_contexts` row and, in call sequencing, no `async_start`

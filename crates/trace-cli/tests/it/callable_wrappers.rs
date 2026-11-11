@@ -33,11 +33,11 @@ fn submit_reaches_the_callable_it_binds() {
     );
 }
 
-/// Known imprecision (docs/ANALYSIS.md, "Callable wrappers"): a parameter
-/// pack is not a formal, so `Hit` stops at `Submit`'s `Args&&... args`. When
-/// packs are followed, this test and that section change together.
+/// A parameter pack is followed (docs/ANALYSIS.md, "Variadic parameter
+/// packs"): `Hit` goes into `Submit`'s `Args&&... args`, out through
+/// `std::forward<Args>(args)...` into the bind, and so to `Work`'s `cb`.
 #[test]
-fn a_parameter_pack_does_not_carry_a_bound_argument_to_the_callable() {
+fn a_parameter_pack_carries_a_bound_argument_to_the_callable() {
     let (p, a) = cpp_bind_packaged_task();
     assert!(indirect(p, a, "Submit", "Work"));
     assert!(
@@ -45,8 +45,8 @@ fn a_parameter_pack_does_not_carry_a_bound_argument_to_the_callable() {
         "`Hit` is only an argument; `Submit` never calls it"
     );
     assert!(
-        must_not_have_edge(p, a, "Work", "Hit"),
-        "`Hit` is passed to `Submit` through `Args&&... args`, which reaches no formal"
+        indirect(p, a, "Work", "Hit"),
+        "`Hit` is passed to `Submit` through `Args&&... args` and bound to `Work`'s `cb`"
     );
 }
 

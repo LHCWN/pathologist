@@ -107,6 +107,7 @@ pub fn link_graph_facts_in_targets(
             explicit_arity: f.params.as_ref().map(|p| p.len() as u32),
             owner_unresolved: false,
             variadic: f.variadic,
+            has_pack_param: false,
             defaulted_in_class: false,
             declared_in_class: true,
             is_member_template: false,
