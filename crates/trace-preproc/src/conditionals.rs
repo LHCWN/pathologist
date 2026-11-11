@@ -144,3 +144,28 @@ impl ConditionalChain {
         self.arms.first().map_or(0, |arm| arm.line)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directive_and_outcome_spellings_are_stable() {
+        for (directive, spelling) in [
+            (ArmDirective::If, "if"),
+            (ArmDirective::Ifdef, "ifdef"),
+            (ArmDirective::Ifndef, "ifndef"),
+            (ArmDirective::Elif, "elif"),
+            (ArmDirective::Else, "else"),
+        ] {
+            assert_eq!(directive.as_str(), spelling);
+        }
+        for (outcome, spelling) in [
+            (ArmOutcome::Taken, "taken"),
+            (ArmOutcome::Skipped, "skipped"),
+            (ArmOutcome::Unevaluated, "unevaluated"),
+        ] {
+            assert_eq!(outcome.as_str(), spelling);
+        }
+    }
+}

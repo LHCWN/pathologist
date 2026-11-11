@@ -20,6 +20,22 @@ fn direct_call_exact_edge() {
     ));
 }
 
+/// A namespace-static `Client -> Connection -> Operations` initializer chain
+/// installs `save_payload` in a function-pointer field.
+#[test]
+fn static_operations_chain_resolves_the_installed_callback() {
+    let root = fixture("dataflow_static_null");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "epta::dispatch",
+        "save_payload",
+        ResolutionKind::Indirect
+    ));
+}
+
 #[test]
 fn false_positive_narrowed_fn_ptr() {
     let root = fixture("false_positive");

@@ -18092,3 +18092,34 @@ final workspace/Clippy/build logs. Reproduce paired runs with
 as candidate, and each workload's recorded `setup.json` input paths. Version-1
 JSON and version-2 tables remain readable; legacy undeclared parameter tags
 are conservatively inferred and unattributable class-final boundaries stay open.
+
+## Test-suite build and run costs (2026-11-11)
+
+The test profile now optimizes the `tree-sitter` runtime crate at opt-level 3
+and omits debug info for dependencies, including in the dev profile so
+`cargo build` and `cargo test` keep sharing dependency artifacts. Workspace
+crates still compile at opt-level 0 with line tables, and edits keep
+incremental compilation.
+
+Observations on Linux x86_64 with 16 cores, using `cargo test -p trace-cli
+--test it` (1,580 tests) and `user + sys` CPU time to avoid host-load noise:
+
+| Test profile | Suite CPU s | Relative |
+|---|---:|---:|
+| Unoptimized dependencies | 295.2 | baseline |
+| `tree-sitter` runtime opt-level 3 | 261.9 | -11% |
+| Runtime plus C/C++ grammar crates at opt-level 3 | 248.8 | -16% |
+
+Only the runtime crate is optimized: optimizing the generated grammar crates
+saved another 13.1s of suite CPU but added more clean-build time than it
+removed, since those crates are mostly data tables.
+
+For CI, `CARGO_INCREMENTAL=0` avoids incremental bookkeeping on clean builds.
+A clean `cargo test --workspace --all-features --no-run` measured 52.8s with
+incremental disabled versus 65.2s with it enabled on the same machine. The
+coverage job keeps a separate rust-cache key because `cargo llvm-cov`
+instruments dependencies.
+
+Validation after these changes: `cargo test --workspace --all-features` passes
+**2,967 tests**, Clippy with warnings denied and `cargo fmt --check` pass, and
+the coverage checker's 12 Python tests pass.

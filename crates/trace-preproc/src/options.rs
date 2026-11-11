@@ -1025,3 +1025,41 @@ impl PreprocessOptions {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_methods_append_and_set_the_documented_fields() {
+        let opts = PreprocessOptions::new()
+            .with_compilation_database("build/compile_commands.json")
+            .with_quote_include("third_party/quoted")
+            .with_strict_include_search(true)
+            .with_command_macro(CommandMacro::Define("MODE".into(), "2".into()))
+            .with_forced_include("config.h")
+            .with_working_directory("src");
+
+        assert_eq!(
+            opts.compilation_database.as_deref(),
+            Some(std::path::Path::new("build/compile_commands.json"))
+        );
+        assert_eq!(
+            opts.quote_include_paths,
+            vec![PathBuf::from("third_party/quoted")]
+        );
+        assert!(opts.strict_include_search);
+        assert!(matches!(
+            opts.command_macros.as_slice(),
+            [CommandMacro::Define(name, value)] if name == "MODE" && value == "2"
+        ));
+        assert_eq!(opts.forced_includes, vec![PathBuf::from("config.h")]);
+        assert_eq!(
+            opts.working_directory.as_deref(),
+            Some(std::path::Path::new("src"))
+        );
+
+        let strict = PreprocessOptions::new().with_strict_include_search(false);
+        assert!(!strict.strict_include_search);
+    }
+}

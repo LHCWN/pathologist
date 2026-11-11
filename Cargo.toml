@@ -52,9 +52,21 @@ tempfile = "3"
 lto = "thin"
 codegen-units = 1
 
-# Line-tables only for dev and test builds reduces linker time and dSYM
-# generation overhead on macOS while preserving file:line info in panic
-# backtraces (#214). `test` inherits from `dev`, so keeping the setting here
-# lets `cargo build` and `cargo test` share dependency artifacts.
+# Line-tables only for dev builds reduces linker time and dSYM generation
+# overhead on macOS while preserving file:line info in panic backtraces
+# (#214). Dependencies skip debug info in both dev and test (the test profile
+# inherits dev), so `cargo build` and `cargo test` share their artifacts.
 [profile.dev]
 debug = 1
+
+# Dependency panic backtraces are not worth dependency debug-info generation;
+# workspace crates keep their line tables.
+[profile.dev.package."*"]
+debug = false
+
+# Test runs spend most of their time inside the parser runtime. Optimizing
+# that dependency once makes fixtures parse faster without slowing workspace
+# edits, which still compile at opt-level 0. The generated grammar crates are
+# mostly tables, so they stay unoptimized to keep clean builds cheap.
+[profile.dev.package.tree-sitter]
+opt-level = 3

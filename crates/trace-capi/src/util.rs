@@ -205,3 +205,114 @@ pub unsafe extern "C" fn trace_string_free(s: *mut c_char) {
     }
     drop(CString::from_raw(s));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_char;
+    use std::ptr;
+
+    fn message(err: ApiError) -> String {
+        format!("{} ({})", err.message(), err.status())
+    }
+
+    #[test]
+    fn panic_guard_keeps_domain_errors_and_classifies_panics() {
+        let ok = guard(|| Ok::<_, ApiError>(7)).unwrap();
+        assert_eq!(ok, 7);
+
+        let domain = guard(|| Err::<(), _>(ApiError::NotFound("gone".into()))).unwrap_err();
+        assert_eq!(domain.status(), TraceStatus::TraceErrNotFound as i32);
+
+        let text = guard(|| -> Result<(), ApiError> { panic!("static payload") }).unwrap_err();
+        assert_eq!(
+            message(text),
+            format!(
+                "internal panic: static payload ({})",
+                TraceStatus::TraceErrPanic as i32
+            )
+        );
+
+        let owned =
+            guard(|| -> Result<(), ApiError> { panic!("{}", String::from("owned payload")) })
+                .unwrap_err();
+        assert!(owned.message().contains("owned payload"));
+    }
+
+    #[test]
+    fn anyhow_errors_are_classified_by_the_whole_chain() {
+        let io = ApiError::from(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
+        assert_eq!(io.status(), TraceStatus::TraceErrIo as i32);
+
+        let invalid_path = ApiError::from(anyhow::Error::new(rusqlite::Error::InvalidPath(
+            "unwritable".into(),
+        )));
+        assert_eq!(invalid_path.status(), TraceStatus::TraceErrIo as i32);
+
+        let missing = ApiError::from(anyhow::anyhow!("function not found"));
+        assert_eq!(missing.status(), TraceStatus::TraceErrNotFound as i32);
+
+        let other = ApiError::from(anyhow::anyhow!("schema mismatch"));
+        assert_eq!(other.status(), TraceStatus::TraceErrAnalysis as i32);
+    }
+
+    #[test]
+    fn sqlite_io_classification_covers_io_codes_only() {
+        use rusqlite::ffi;
+        use rusqlite::ErrorCode;
+
+        let cannot_open = rusqlite::Error::SqliteFailure(
+            ffi::Error {
+                code: ErrorCode::CannotOpen,
+                extended_code: 14,
+            },
+            Some("unable to open database file".into()),
+        );
+        assert!(is_sqlite_io_error(&cannot_open));
+        assert!(!is_sqlite_io_error(&rusqlite::Error::InvalidQuery));
+        assert!(is_sqlite_io_error(&rusqlite::Error::InvalidPath(
+            "x".into()
+        )));
+    }
+
+    #[test]
+    fn string_array_rejects_null_with_a_positive_length() {
+        let empty = unsafe { str_array(ptr::null(), 0) }.unwrap();
+        assert!(empty.is_empty());
+
+        let err = unsafe { str_array(ptr::null(), 1) }.unwrap_err();
+        assert_eq!(err.status(), TraceStatus::TraceErrInvalidArg as i32);
+
+        let a = CString::new("a").unwrap();
+        let b = CString::new("b").unwrap();
+        let ptrs = [a.as_ptr(), b.as_ptr()];
+        let got = unsafe { str_array(ptrs.as_ptr(), 2) }.unwrap();
+        assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn cstr_rejects_null_and_invalid_utf8() {
+        let err = unsafe { cstr(ptr::null()) }.unwrap_err();
+        assert!(err.message().contains("null string"));
+
+        let bad = [0x80u8 as c_char, 0];
+        let err = unsafe { cstr(bad.as_ptr()) }.unwrap_err();
+        assert!(err.message().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn string_free_is_null_safe_and_set_error_can_be_ignored() {
+        unsafe {
+            trace_string_free(ptr::null_mut());
+            set_error(ptr::null_mut(), "ignored");
+
+            let mut out: *mut c_char = ptr::null_mut();
+            set_error(&mut out, "boom");
+            assert!(!out.is_null());
+            trace_string_free(out);
+        }
+    }
+}
