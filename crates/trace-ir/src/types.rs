@@ -530,6 +530,13 @@ pub struct TypeTable {
     /// because lowering sees bare identifiers (`fn_t`, `SHandle`) whose
     /// pointer-ness is otherwise lost (they degrade to `Int`).
     aliases: IndexMap<String, Arc<TypeDesc>, FxBuildHasher>,
+    /// Hashes of the last `::` segment of every alias name. A spelling whose
+    /// last segment is absent here names no alias in any scope, which lets
+    /// lowering skip a scope walk for most call names. Unlike the symbol
+    /// table's leaf sets, this one is held by every unit table an alias is
+    /// merged into, so it keeps a hash instead of a second copy of each name;
+    /// a collision only means the walk runs.
+    alias_leaves: FxHashSet<u64>,
     /// Aliases whose outer pointer layer represents a C++ reference.
     /// Kept with alias descriptors through header caching and merging.
     reference_aliases: FxHashSet<String>,
@@ -544,8 +551,8 @@ pub struct TypeTable {
     field_qualifications: FxHashMap<String, FxHashMap<String, FieldQualification>>,
     reference_callable_aliases: FxHashSet<String>,
     reference_callable_fields: FxHashMap<String, FxHashSet<String>>,
-    integer_enums: FxHashSet<String>,
-    integer_enumerators: FxHashSet<String>,
+    integer_enums: SharedNames,
+    integer_enumerators: SharedNames,
     /// Each class's own constructor declaration metadata needed by types-only
     /// header imports, before constructor symbols merge into a translation unit.
     user_provided_ctors: FxHashSet<String>,
@@ -592,6 +599,7 @@ impl TypeTable {
             canonical: CanonicalCache::default(),
             union_epoch: 0,
             aliases: IndexMap::default(),
+            alias_leaves: FxHashSet::default(),
             reference_aliases: FxHashSet::default(),
             rvalue_reference_aliases: FxHashSet::default(),
             alias_qualifications: FxHashMap::default(),
@@ -599,8 +607,8 @@ impl TypeTable {
             field_qualifications: FxHashMap::default(),
             reference_callable_aliases: FxHashSet::default(),
             reference_callable_fields: FxHashMap::default(),
-            integer_enums: FxHashSet::default(),
-            integer_enumerators: FxHashSet::default(),
+            integer_enums: SharedNames::default(),
+            integer_enumerators: SharedNames::default(),
             user_provided_ctors: FxHashSet::default(),
             declared_ctors: FxHashSet::default(),
             default_ctors: FxHashMap::default(),
@@ -979,6 +987,7 @@ impl TypeTable {
         if !alias.is_empty() {
             let shared = self.descriptors.share(desc);
             self.aliases.insert(alias.to_string(), shared);
+            self.alias_leaves.insert(alias_leaf_hash(alias));
             if reference {
                 self.reference_aliases.insert(alias.to_owned());
                 if rvalue_reference {
@@ -1005,6 +1014,12 @@ impl TypeTable {
 
     pub fn alias_callable_returns_reference(&self, alias: &str) -> bool {
         self.reference_callable_aliases.contains(alias)
+    }
+
+    /// Whether any callable alias returns a reference: without one, no
+    /// spelling can name such an alias and lowering skips the scope lookup.
+    pub fn has_callable_reference_aliases(&self) -> bool {
+        !self.reference_callable_aliases.is_empty()
     }
 
     pub fn alias_is_reference(&self, alias: &str) -> bool {
@@ -1208,6 +1223,13 @@ impl TypeTable {
         self.constructor_epoch
     }
 
+    /// Whether `name`, spelled in any scope, may name an alias: false when no
+    /// alias name ends in the same last `::` segment. Every candidate a scope
+    /// walk asks about ends in `name`, so a false answer holds for all of them.
+    pub fn may_name_alias(&self, name: &str) -> bool {
+        self.alias_leaves.contains(&alias_leaf_hash(name))
+    }
+
     pub fn resolve_alias(&self, alias: &str) -> Option<&TypeDesc> {
         self.aliases.get(alias).map(Arc::as_ref)
     }
@@ -1236,6 +1258,8 @@ impl TypeTable {
         }
         self.types.shrink_to_fit();
         self.aliases.shrink_to_fit();
+        // Only lowering asks; a merge rebuilds the destination's from its names.
+        self.alias_leaves = FxHashSet::default();
         self.reference_aliases.shrink_to_fit();
         self.rvalue_reference_aliases.shrink_to_fit();
         self.alias_qualifications.shrink_to_fit();
@@ -1558,13 +1582,10 @@ impl TypeTable {
                 self.tag_declared_guess(name);
             }
         }
-        self.defined_structs
-            .extend(other.defined_structs.iter().cloned());
-        self.guessed_tags.extend(other.guessed_tags.iter().cloned());
-        self.user_provided_ctors
-            .extend(other.user_provided_ctors.iter().cloned());
-        self.declared_ctors
-            .extend(other.declared_ctors.iter().cloned());
+        extend_missing(&mut self.defined_structs, &other.defined_structs);
+        extend_missing(&mut self.guessed_tags, &other.guessed_tags);
+        extend_missing(&mut self.user_provided_ctors, &other.user_provided_ctors);
+        extend_missing(&mut self.declared_ctors, &other.declared_ctors);
         for (class, provided) in &other.default_ctors {
             if let Some(known) = self.default_ctors.get_mut(class) {
                 *known |= provided;
@@ -1617,21 +1638,22 @@ impl TypeTable {
         }
         // Membership metadata only: iteration order cannot affect type IDs
         // or output, just as for the declaration sets above.
-        self.integer_enums
-            .extend(other.integer_enums.iter().cloned());
-        self.integer_enumerators
-            .extend(other.integer_enumerators.iter().cloned());
-        for (class, fields) in &other.reference_callable_fields {
-            self.reference_callable_fields
-                .entry(class.clone())
-                .or_default()
-                .extend(fields.iter().cloned());
-        }
-        for (class, fields) in &other.reference_fields {
-            self.reference_fields
-                .entry(class.clone())
-                .or_default()
-                .extend(fields.iter().cloned());
+        self.integer_enums.import(&other.integer_enums);
+        self.integer_enumerators.import(&other.integer_enumerators);
+        for (dst, src) in [
+            (
+                &mut self.reference_callable_fields,
+                &other.reference_callable_fields,
+            ),
+            (&mut self.reference_fields, &other.reference_fields),
+        ] {
+            for (class, fields) in src {
+                let known = match dst.get_mut(class) {
+                    Some(known) => known,
+                    None => dst.entry(class.clone()).or_default(),
+                };
+                extend_missing(known, fields);
+            }
         }
         for (class, fields) in &other.field_qualifications {
             self.field_qualifications
@@ -1842,6 +1864,92 @@ fn same_param_type_inner(
     // top-level only -- nested, `int (*)[10]` and `int **` are different types,
     // which is why `same_type_shape` does not do this itself.
     same_decayed_param(da, db, unresolved_matches)
+}
+
+fn alias_leaf_hash(name: &str) -> u64 {
+    let leaf = name.rfind("::").map_or(name, |at| &name[at + 2..]);
+    let mut hasher = rustc_hash::FxHasher::default();
+    leaf.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Copy into `dst` the entries it lacks, cloning only what is missing.
+fn extend_missing<T: Clone + Eq + Hash>(dst: &mut FxHashSet<T>, src: &FxHashSet<T>) {
+    for name in src {
+        if !dst.contains(name) {
+            dst.insert(name.clone());
+        }
+    }
+}
+
+/// A set of names that tables import from one another by sharing.
+///
+/// A header unit's table is merged into every translation unit that includes
+/// it, and its names are the header's whole include closure: hundreds per
+/// merge, tens of thousands of merges, of which a few percent add anything.
+/// Copying them costs a hash probe per name per merge and one set per table.
+/// A table instead holds the names it noted itself (`own`) and a reference to
+/// each imported table's `own` set; importing a table already imported adds
+/// nothing. Lookups probe each layer, which is cheap because they are rare
+/// next to merges. A layer is a snapshot: noting a name in a table whose set
+/// another table imported copies the set first, so the importer never sees
+/// later additions.
+#[derive(Clone, Default)]
+struct SharedNames {
+    own: Arc<FxHashSet<Arc<str>>>,
+    imported: Vec<Arc<FxHashSet<Arc<str>>>>,
+    /// The address of each `imported` layer, so an import asks one set per
+    /// layer rather than scanning them all. `imported` keeps every layer
+    /// alive, so an address cannot be reused while it is recorded.
+    imported_addresses: FxHashSet<usize>,
+}
+
+/// The names, sorted: layer addresses and set order vary between runs, and a
+/// table's `Debug` output is compared across indexing paths.
+impl std::fmt::Debug for SharedNames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&str> = std::iter::once(&self.own)
+            .chain(&self.imported)
+            .flat_map(|layer| layer.iter().map(|name| name.as_ref()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        f.debug_set().entries(names).finish()
+    }
+}
+
+impl SharedNames {
+    /// Note a name in this table's own set. A name an imported layer already
+    /// holds is noted again: membership is unaffected, and the table's own
+    /// set stays the complete record of what it declares.
+    fn insert(&mut self, name: String) {
+        if !self.own.contains(name.as_str()) {
+            Arc::make_mut(&mut self.own).insert(name.into());
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.own.contains(name) || self.imported.iter().any(|layer| layer.contains(name))
+    }
+
+    fn import(&mut self, other: &Self) {
+        let layers = std::iter::once(&other.own).chain(&other.imported);
+        for layer in layers.filter(|layer| !layer.is_empty()) {
+            if !Arc::ptr_eq(&self.own, layer)
+                && self.imported_addresses.insert(Arc::as_ptr(layer) as usize)
+            {
+                self.imported.push(Arc::clone(layer));
+            }
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        if let Some(own) = Arc::get_mut(&mut self.own) {
+            own.shrink_to_fit();
+        }
+        self.imported.shrink_to_fit();
+        self.imported_addresses.shrink_to_fit();
+    }
 }
 
 /// Whether two parameter types may be one type spelled two ways: a qualified
@@ -2728,6 +2836,101 @@ mod tests {
             },
             &pointer(TypeDesc::Int),
         ));
+    }
+
+    /// Every unit merge carries each header's enumerator names into the
+    /// importing table. The destination must share the source's names, not
+    /// copy them, and a repeated merge must add nothing.
+    #[test]
+    fn merging_enum_names_shares_the_source_layer() {
+        let mut header = TypeTable::new();
+        header.note_integer_enum("ns::E".to_owned());
+        header.note_integer_enumerator("ns::A".to_owned());
+        header.note_integer_enumerator("ns::E::A".to_owned());
+        let mut dst = TypeTable::new();
+        dst.merge_struct_declarations(&header);
+        dst.merge_struct_declarations(&header);
+
+        assert!(dst.is_integer_enum("ns::E"));
+        assert!(dst.is_integer_enumerator("ns::A"));
+        assert!(dst.is_integer_enumerator("ns::E::A"));
+        assert!(!dst.is_integer_enumerator("ns::B"));
+        assert!(dst.integer_enumerators.own.is_empty());
+        assert_eq!(dst.integer_enumerators.imported.len(), 1);
+        assert!(Arc::ptr_eq(
+            &dst.integer_enumerators.imported[0],
+            &header.integer_enumerators.own
+        ));
+
+        // A table importing the importer shares the same layer too.
+        let mut unit = TypeTable::new();
+        unit.merge_struct_declarations(&dst);
+        unit.merge_struct_declarations(&header);
+        assert_eq!(unit.integer_enumerators.imported.len(), 1);
+        assert!(unit.is_integer_enumerator("ns::E::A"));
+    }
+
+    /// Lowering skips a scope walk when no alias name ends in the spelling's
+    /// last segment, so every registration, merged ones included, must index
+    /// the alias, and any scope's spelling of it must hit.
+    #[test]
+    fn alias_leaves_cover_every_scope_spelling() {
+        let mut header = TypeTable::new();
+        header.register_alias("ns::Callback", TypeDesc::Ptr(Box::new(TypeDesc::Int)));
+        assert!(header.may_name_alias("Callback"));
+        assert!(header.may_name_alias("ns::Callback"));
+        assert!(header.may_name_alias("other::Callback"));
+        assert!(!header.may_name_alias("Handler"));
+        assert!(!header.may_name_alias("ns::Handler"));
+
+        // A cached header is compacted before units merge it; the importing
+        // table indexes the names it receives.
+        header.compact_for_header_merge();
+        let mut unit = TypeTable::new();
+        assert!(!unit.may_name_alias("Callback"));
+        for (alias, desc) in header.all_aliases() {
+            if unit.resolve_alias(alias).is_none() {
+                unit.register_alias_ref(alias, desc);
+            }
+        }
+        assert!(unit.may_name_alias("Callback"));
+    }
+
+    /// Debug output is the sorted union of a table's names, whatever its
+    /// layers and their addresses.
+    #[test]
+    fn enum_name_debug_lists_the_sorted_union() {
+        let mut header = TypeTable::new();
+        header.note_integer_enumerator("B".to_owned());
+        let mut merged = TypeTable::new();
+        merged.note_integer_enumerator("A".to_owned());
+        merged.merge_struct_declarations(&header);
+        let mut flat = TypeTable::new();
+        for name in ["B", "A"] {
+            flat.note_integer_enumerator(name.to_owned());
+        }
+        assert_eq!(
+            format!("{:?}", merged.integer_enumerators),
+            format!("{:?}", flat.integer_enumerators)
+        );
+        assert_eq!(format!("{:?}", merged.integer_enumerators), r#"{"A", "B"}"#);
+    }
+
+    /// A layer is a snapshot: names the source notes after an import are not
+    /// visible to the importer, and noting one never disturbs the importer.
+    #[test]
+    fn enum_name_layers_are_snapshots() {
+        let mut header = TypeTable::new();
+        header.note_integer_enumerator("A".to_owned());
+        let mut dst = TypeTable::new();
+        dst.merge_struct_declarations(&header);
+        header.note_integer_enumerator("B".to_owned());
+        assert!(header.is_integer_enumerator("A") && header.is_integer_enumerator("B"));
+        assert!(dst.is_integer_enumerator("A"));
+        assert!(!dst.is_integer_enumerator("B"));
+        dst.note_integer_enumerator("C".to_owned());
+        assert!(dst.is_integer_enumerator("C"));
+        assert!(!header.is_integer_enumerator("C"));
     }
 
     /// Tags compare by name, and an anonymous tag has none -- so every

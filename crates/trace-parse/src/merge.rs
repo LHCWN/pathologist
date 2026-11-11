@@ -2406,6 +2406,11 @@ mod tests {
             compact.resolve_alias("OuterAlias"),
             full.resolve_alias("OuterAlias")
         );
+        // Alias lookups skip names no alias can end in; the merge must index
+        // a compacted header's aliases in the importing table.
+        assert!(compact.may_name_alias("OuterAlias"));
+        assert!(compact.may_name_alias("ns::OuterAlias"));
+        assert!(!compact.may_name_alias("Outer"));
         assert_eq!(
             compact.get(remap_type(outer, &compact_map)).desc.as_ref(),
             &tag(

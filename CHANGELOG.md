@@ -4,6 +4,19 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Reduce the indexing cost of conditional lowering (#280)
+
+Conditional lowering (#256) slowed indexing and raised peak memory. Every unit
+merge copied the new enum-name sets into the importing table, so each table
+held its own copy; tables now share them. Each member prototype, signature and
+free function prototype looked its return type up several times; it now does so
+once, and reference and callable-reference lookups are skipped when no such
+alias exists. Every alias-only scope lookup, including alias-cast recognition on
+each C++ call, first checks a hash of alias names' last segments. Exported data
+is unchanged. Type import is back to its time before #256, and most of the
+lowering time and memory is recovered; see `docs/EVAL_REPORT.md` ("Indexing
+cost of conditional lowering").
+
 ### Lambda-free publication follow-ups (#272)
 
 `locations` in a full export no longer publishes generated lambda names: a

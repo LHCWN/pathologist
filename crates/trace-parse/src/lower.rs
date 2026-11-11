@@ -363,6 +363,21 @@ struct ClassCtx {
 }
 
 impl LowerContext {
+    /// Whether an enclosing block declares a reference alias.
+    fn has_local_reference_alias(&self) -> bool {
+        self.local_aliases
+            .iter()
+            .any(|(_, _, reference, _, _)| reference.is_some())
+    }
+
+    /// Whether an enclosing block declares a callable alias whose function
+    /// returns a reference.
+    fn has_local_callable_reference_alias(&self) -> bool {
+        self.local_aliases
+            .iter()
+            .any(|(_, _, _, _, callable_reference)| *callable_reference)
+    }
+
     /// The namespaces `using namespace` directives in scope make visible:
     /// the innermost directive first, and within one directive the enclosing
     /// namespace's entry before the global one (docs/ANALYSIS.md, "Canonical
@@ -4638,7 +4653,7 @@ fn resolve_alias_cv(
     {
         return Some((*cv, ref_kind.is_some()));
     }
-    find_in_scope(program, ctx, &name, |candidate, _| {
+    find_alias_in_scope(program, ctx, &name, |candidate, _| {
         program.types.resolve_alias(candidate).map(|_| {
             (
                 program
@@ -4652,6 +4667,11 @@ fn resolve_alias_cv(
 }
 
 fn resolve_alias_reference_kind(program: &Program, ctx: &LowerContext, name: &str) -> Option<bool> {
+    // Only a reference alias answers; with none in the table or the
+    // enclosing blocks, no candidate can.
+    if !program.types.has_reference_aliases() && !ctx.has_local_reference_alias() {
+        return None;
+    }
     let name = normalize_qualified(name);
     let check = |candidate_name: &str| {
         if let Some((_, _, ref_kind, _, _)) = ctx
@@ -4664,7 +4684,7 @@ fn resolve_alias_reference_kind(program: &Program, ctx: &LowerContext, name: &st
         }
         // The innermost alias of the name answers, reference or not: an
         // outer reference alias it shadows must not leak through.
-        find_in_scope(program, ctx, candidate_name, |candidate, _| {
+        find_alias_in_scope(program, ctx, candidate_name, |candidate, _| {
             reference_alias_identity(program, candidate).map(|reference| {
                 reference.then(|| program.types.alias_is_rvalue_reference(candidate))
             })
@@ -4805,6 +4825,12 @@ fn type_callable_returns_reference(
     source: &str,
     ty: Node,
 ) -> bool {
+    // Only a callable alias returning a reference answers yes; with none in
+    // the table or the enclosing blocks, the answer is no.
+    if !program.types.has_callable_reference_aliases() && !ctx.has_local_callable_reference_alias()
+    {
+        return false;
+    }
     let name = normalize_qualified(node_text(source, &ty));
     if let Some((_, _, _, _, reference)) = ctx
         .local_aliases
@@ -4814,7 +4840,7 @@ fn type_callable_returns_reference(
     {
         return *reference;
     }
-    find_in_scope(program, ctx, &name, |candidate, _| {
+    find_alias_in_scope(program, ctx, &name, |candidate, _| {
         if program.types.is_struct_declared(candidate)
             || program.types.class_type_id(candidate).is_some()
         {
@@ -5901,6 +5927,18 @@ fn function_return_reference_kind(
     source: &str,
     function: Node,
 ) -> Option<bool> {
+    function_return_reference_kind_with(program, ctx, source, function, &ReturnTypeKind::default())
+}
+
+/// [`function_return_reference_kind`], sharing the return type's lookup with
+/// the other return questions asked of the same declaration.
+fn function_return_reference_kind_with<'t>(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    function: Node<'t>,
+    return_kind: &ReturnTypeKind<'t>,
+) -> Option<bool> {
     if let Some(ref_node) = return_reference_node(function) {
         return Some(is_rvalue_reference_node(source, ref_node));
     }
@@ -5932,18 +5970,76 @@ fn function_return_reference_kind(
     if let Some(ty) = ty {
         let ptr_depth = declarator_pointer_depth(decl);
         if ptr_depth == 0 {
-            if let Some(kind) = type_reference_kind(program, ctx, source, ty) {
+            if let Some(kind) = return_kind.of(program, ctx, source, ty) {
                 return Some(kind);
             }
         }
     }
-    returns_reference(program, ctx, source, function).then_some(false)
+    returns_reference_with(program, ctx, source, function, return_kind).then_some(false)
+}
+
+/// The [`type_reference_kind`] of a declaration's return type, looked up once
+/// for the several questions lowering asks about one declaration (its return
+/// category, its cv qualification). Each lookup walks the enclosing classes,
+/// their bases and the namespaces. Create one per declaration, after its
+/// parameters are lowered, and drop it before anything registers an alias or
+/// class or changes the scope: a cached answer is never refreshed.
+#[derive(Default)]
+struct ReturnTypeKind<'t> {
+    kind: Cell<Option<(Node<'t>, Option<bool>)>>,
+    returns: Cell<Option<(Node<'t>, bool)>>,
+}
+
+impl<'t> ReturnTypeKind<'t> {
+    fn of(
+        &self,
+        program: &Program,
+        ctx: &LowerContext,
+        source: &str,
+        ty: Node<'t>,
+    ) -> Option<bool> {
+        if let Some((node, kind)) = self.kind.get() {
+            if node == ty {
+                return kind;
+            }
+        }
+        let kind = type_reference_kind(program, ctx, source, ty);
+        self.kind.set(Some((ty, kind)));
+        kind
+    }
 }
 
 /// Whether a function definition or a lambda returns a reference: `S &f()`,
 /// or a trailing `-> S &`. Deduced returns are classified at each return
 /// expression by [`deduces_reference_return`].
 fn returns_reference(program: &Program, ctx: &LowerContext, source: &str, function: Node) -> bool {
+    returns_reference_with(program, ctx, source, function, &ReturnTypeKind::default())
+}
+
+fn returns_reference_with<'t>(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    function: Node<'t>,
+    return_kind: &ReturnTypeKind<'t>,
+) -> bool {
+    if let Some((node, returns)) = return_kind.returns.get() {
+        if node == function {
+            return returns;
+        }
+    }
+    let returns = returns_reference_uncached(program, ctx, source, function, return_kind);
+    return_kind.returns.set(Some((function, returns)));
+    returns
+}
+
+fn returns_reference_uncached<'t>(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    function: Node<'t>,
+    return_kind: &ReturnTypeKind<'t>,
+) -> bool {
     let is_declarator = function.cached_kind().ends_with("_declarator");
     let declarator = if is_declarator {
         Some(function)
@@ -5962,7 +6058,7 @@ fn returns_reference(program: &Program, ctx: &LowerContext, source: &str, functi
                         .flatten()
                         .and_then(|declaration| declaration.cached_field("type"))
                 })
-                .is_some_and(|ty| type_is_reference_alias(program, ctx, source, ty))
+                .is_some_and(|ty| return_kind.of(program, ctx, source, ty).is_some())
                 && function_return_binding(decl).0.is_none()
     })
 }
@@ -7220,12 +7316,13 @@ fn outermost_declarator(mut node: Node) -> Node {
     node
 }
 
-fn function_return_cv(
+fn function_return_cv<'t>(
     program: &Program,
     ctx: &LowerContext,
     source: &str,
-    node: Node,
-    decl_override: Option<Node>,
+    node: Node<'t>,
+    decl_override: Option<Node<'t>>,
+    return_kind: &ReturnTypeKind<'t>,
 ) -> trace_ir::CvQualification {
     if !ctx.is_cpp {
         return trace_ir::CvQualification::default();
@@ -7261,7 +7358,7 @@ fn function_return_cv(
     {
         return spelled_type_cv(program, ctx, node_text(source, &trailing));
     }
-    let is_ref = returns_reference(program, ctx, source, node);
+    let is_ref = returns_reference_with(program, ctx, source, node, return_kind);
     declaration_cv_qualification(program, ctx, source, node, decl, None, is_ref, false)
 }
 
@@ -7338,6 +7435,7 @@ fn register_member_prototype(
         &full_name,
         FactParams::Known(&param_type_ids),
     );
+    let return_kind = ReturnTypeKind::default();
     let fn_id = program.symbols.add_function_with_param_types(
         Function {
             is_weak: false,
@@ -7367,7 +7465,7 @@ fn register_member_prototype(
             is_member_template: is_member_function_template(source, node),
             is_const_member: function_is_const_qualified(source, node),
             ref_qualifier: function_ref_qualifier(source, node),
-            return_cv: function_return_cv(program, ctx, source, node, None),
+            return_cv: function_return_cv(program, ctx, source, node, None, &return_kind),
             is_static_member: declaration_is_static(node),
             is_virtual: flags.is_virtual,
             is_final: flags.is_final,
@@ -7389,7 +7487,9 @@ fn register_member_prototype(
             note_parameter_default(program, ctx, source, parameter, fn_id, index as u32);
         }
     }
-    if let Some(is_rval) = function_return_reference_kind(program, ctx, source, node) {
+    if let Some(is_rval) =
+        function_return_reference_kind_with(program, ctx, source, node, &return_kind)
+    {
         ctx.reference_returns.insert(fn_id);
         if is_rval {
             ctx.rvalue_reference_returns.insert(fn_id);
@@ -7673,6 +7773,7 @@ fn lower_function_signature(
     } else {
         node_end_line(program, ctx, node, span)
     };
+    let return_kind = ReturnTypeKind::default();
     let fn_id = program.symbols.add_function_with_param_types(
         Function {
             // Only an external symbol has linkage to weaken; GCC ignores the
@@ -7716,7 +7817,7 @@ fn lower_function_signature(
                 .is_cpp
                 .then(|| function_ref_qualifier(source, node))
                 .flatten(),
-            return_cv: function_return_cv(program, ctx, source, node, None),
+            return_cv: function_return_cv(program, ctx, source, node, None, &return_kind),
             is_static_member: ctx.class_ctx.is_some() && declaration_is_static(node),
             is_virtual: flags.is_virtual,
             is_final: flags.is_final,
@@ -7730,7 +7831,9 @@ fn lower_function_signature(
         Some(&program.types),
     );
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
-    if let Some(is_rval) = function_return_reference_kind(program, ctx, source, node) {
+    if let Some(is_rval) =
+        function_return_reference_kind_with(program, ctx, source, node, &return_kind)
+    {
         ctx.reference_returns.insert(fn_id);
         if is_rval {
             ctx.rvalue_reference_returns.insert(fn_id);
@@ -11954,7 +12057,7 @@ fn aliased_instantiation(program: &Program, ctx: &LowerContext, name: &str) -> O
             return Some(name.clone());
         }
     }
-    find_in_scope(program, ctx, name, |candidate, _| {
+    find_alias_in_scope(program, ctx, name, |candidate, _| {
         match program.types.resolve_alias(candidate)? {
             TypeDesc::Struct { name, .. } if name.contains('<') => Some(name.clone()),
             _ => None,
@@ -14617,6 +14720,8 @@ fn lower_function_decl(
     });
     let span = node_span(program, ctx, decl);
     let explicit_arity = Some(params.len() as u32);
+    // Shared by the return cv and the return category read after the parameters.
+    let return_kind = ReturnTypeKind::default();
     let fn_id = program.symbols.add_function(Function {
         is_weak: !is_static && ctx.has_weak && declaration_is_weak(source, decl),
         target: None,
@@ -14655,6 +14760,7 @@ fn lower_function_decl(
             source,
             object_declaration(decl).unwrap_or(decl),
             Some(outermost_declarator(decl)),
+            &return_kind,
         ),
         is_static_member: false,
         is_virtual: false,
@@ -14674,7 +14780,8 @@ fn lower_function_decl(
             }
         }
     }
-    let ref_kind = function_return_reference_kind(program, ctx, source, decl).or(ref_kind);
+    let ref_kind =
+        function_return_reference_kind_with(program, ctx, source, decl, &return_kind).or(ref_kind);
     if let Some(is_rval) = ref_kind {
         ctx.reference_returns.insert(fn_id);
         if is_rval {
@@ -20901,9 +21008,14 @@ fn functional_alias_cast<'t>(
         return None;
     }
     let callee = peel_expression(written);
-    if !is_name(callee)
-        || lookup_var_node(program, ctx, source, callee).is_some()
-        || implicit_this(program, ctx, source, callee).is_some()
+    if !is_name(callee) {
+        return None;
+    }
+    // Most calls name a function: reject a plain name no alias can match
+    // before normalizing its spelling.
+    if callee.cached_kind() == "identifier"
+        && ctx.local_aliases.is_empty()
+        && !program.types.may_name_alias(node_text(source, &callee))
     {
         return None;
     }
@@ -20914,7 +21026,7 @@ fn functional_alias_cast<'t>(
             type_is_reference_alias(program, ctx, source, callee),
         )
     } else {
-        find_in_scope(program, ctx, &name, |candidate, _| {
+        find_alias_in_scope(program, ctx, &name, |candidate, _| {
             if program
                 .symbols
                 .resolve_function_in_scope(candidate, Some(ctx.current_file))
@@ -20932,6 +21044,13 @@ fn functional_alias_cast<'t>(
         })??
     };
     if !reference && !matches!(desc, TypeDesc::Ptr(_) | TypeDesc::FnPtr { .. }) {
+        return None;
+    }
+    // A nearer value hides the alias. Asked only once an alias is found: most
+    // calls name a function, and these lookups are as costly as the alias's.
+    if lookup_var_node(program, ctx, source, callee).is_some()
+        || implicit_this(program, ctx, source, callee).is_some()
+    {
         return None;
     }
     let args = call_arg_nodes(node);
@@ -22055,6 +22174,22 @@ fn find_in_scope<T>(
 ) -> Option<T> {
     find_in_enclosing_scopes(program, ctx, name, &mut probe)
         .or_else(|| probe(global_lookup_name(name), true))
+}
+
+/// [`find_in_scope`] for a probe that answers only from the alias table: any
+/// other answer (a class or function that hides the name) must mean what no
+/// answer does. Every candidate ends in `name`, so when no alias name ends in
+/// its last segment the walk is skipped.
+fn find_alias_in_scope<T>(
+    program: &Program,
+    ctx: &LowerContext,
+    name: &str,
+    probe: impl FnMut(&str, bool) -> Option<T>,
+) -> Option<T> {
+    if !program.types.may_name_alias(name) {
+        return None;
+    }
+    find_in_scope(program, ctx, name, probe)
 }
 
 /// [`find_in_scope`] short of its last, global, candidate: for a lookup
