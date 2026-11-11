@@ -4,6 +4,25 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Keep callables passed through `std::bind` and `std::packaged_task` reachable (#250)
+
+A thread pool that wraps a submitted callable in `std::bind` or
+`std::packaged_task` had no call edge from the code that wraps it, since
+nothing followed the callable through either. Two built-in `invoke` models,
+`std::bind` and `std::packaged_task::packaged_task`, now give the wrapping
+function an indirect edge to the callable at the wrapping site, the same way
+`std::thread` and `std::async` do. The edge over-approximates: no value carries
+the callable on, so the later call through the stored task is not tied back to
+it, and each bind site is an `unknown`-kind `execution_contexts` row. Arguments
+passed through a variadic parameter pack are not followed (#282); a named bound
+argument and a member function's receiver are. `UnifiedPipelineThreadpool::Submit`
+reaches the lambdas it runs again on camera, the edges #249 removed with the
+`decltype` operand. Pinned `edges_indirect` moves by each corpus's `std::bind`
+sites: HDF 5139 to 5153, HiView 246 to 262, camera 443 to 459 and
+ability_runtime 1848 to 1849. The models and their imprecision are in
+`docs/ANALYSIS.md` ("Callable wrappers"), the measurements in
+`docs/EVAL_REPORT.md`.
+
 ### Reduce the indexing cost of conditional lowering (#280)
 
 Conditional lowering (#256) slowed indexing and raised peak memory. Every unit

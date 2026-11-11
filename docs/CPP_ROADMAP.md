@@ -129,7 +129,8 @@ Eval **H7**. Three stacked gaps; fixing only intern-as-`FnPtr` is not enough.
 
 Hiview’s second dispatch axis: **do this later on a work loop / ffrt
 queue**. Lambdas exist as `$lambda` but creators have **0 incoming
-edges**; `std::bind` is opaque.
+edges**; `std::bind` reaches its callable at the bind site (#250), but the
+later call through the stored task is not tied back to it.
 
 | Site | Pattern |
 |------|---------|
@@ -164,10 +165,16 @@ Lambda captures bind the enclosing scope (`docs/ANALYSIS.md`, "C++ support
 (first step)"), and `[callback = shared_from_this()]` captures the object
 itself, typed as its `shared_ptr` (`docs/ANALYSIS.md`, "`shared_from_this`"),
 so `uc_telemetry_callback.cpp:187` reaches `RunTraceOnTimeTask`.
-`std::bind` (e.g. `base/plugin.cpp:93`) and `packaged_task` remain.
+`std::bind` and `std::packaged_task` (#250) keep the wrapped callable's edge
+from the wrapping site (`base/plugin.cpp:93`, `base/event_loop.cpp:191`), as
+`docs/ANALYSIS.md`, "Callable wrappers", states; calling the stored task
+(`event.packagedTask->operator()()`) is not tied back to it, and arguments
+through a variadic parameter pack are not followed (#282).
 
-**Eval when done:** `Plugin::DelayProcessEvent` reaches `OnEventProxy`;
-`EventLoop::ProcessEvent` packaged path reaches `EventHandler::OnEventProxy`.
+**Eval when done:** `Plugin::DelayProcessEvent` reaches `OnEventProxy` (met by
+#250); `EventLoop::ProcessEvent` packaged path reaches
+`EventHandler::OnEventProxy` (`EventLoop::AddEventForResult`, which builds the
+task, reaches it; the call in `ProcessEvent` is not tied to the task).
 
 ---
 
@@ -610,7 +617,7 @@ plugins without `dlsym` is C3 (static `REGISTER` ctors).
 | C1 | `auto p = wp.lock(); p->OnEventProxy();` + `auto l = p->GetWorkLoop(); l->AddEvent(...)` — done, see `tests/fixtures/cpp_auto_return` |
 | C2 | `Event::DownCastTo<SysEvent>(e); sys->SetEventValue(...)` |
 | C3 | `REGISTER`-like static `PluginRegistInfo(MakeFoo)` + `info->getPluginObject()` |
-| C4 | `std::bind(&Plugin::OnEventProxy, this, e)` stored and invoked; `ffrt::submit` summary done, see `tests/fixtures/task_primitives` |
+| C4 | `std::bind(&Plugin::OnEventProxy, this, e)` stored and invoked; `ffrt::submit` summary done, see `tests/fixtures/task_primitives`; `std::bind` / `packaged_task` edge from the wrapping site done (#250, `tests/fixtures/cpp_bind_packaged_task`), the call through the stored task not |
 | C5 | `map<string, shared_ptr<Plugin>>` + `find("Foo")->second->OnEventProxy()` |
 | C6 | Proxy field filled by factory, then `proxy->OnEvent()` |
 | C7 | `map<int, int(*)(Msg*)>` + `parser(msg)` |

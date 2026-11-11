@@ -3007,7 +3007,43 @@ image as an indirect call's targets are.
   section); the call graph is the same whatever the kind.
 - **Not modeled.** No ordering or scheduling (the callback is simply
   reachable from the starting site), no return value, and no bound state:
-  `std::bind` results and `std::function` objects are not looked into.
+  a `std::bind` result, a `std::packaged_task` and a `std::function` object
+  are not looked into. What the first two do keep reachable is
+  [Callable wrappers](#callable-wrappers).
+
+#### Callable wrappers
+
+`std::bind(f, args...)` and `std::packaged_task<R(A...)>(f)` only wrap a
+callable that something runs later, usually a thread pool's worker. No value in the analysis carries a
+callable on, so the later call, `task()` or `(*task)()`, cannot be tied back
+to `f`. Both are therefore `invoke` models, with the context `unknown`
+([Built-in models](#built-in-models)): `std::bind` with `param = 0, rest = 1`
+and `std::packaged_task::packaged_task` with `param = 0, rest = 1`: the
+constructor forwards no argument, and `rest` (not an empty `args`) lets the
+stored callable take any number of parameters, as the task's signature, not the
+constructor, says what it is called with. This is what keeps a
+`Submit`-style pool's `Submit -> f` edge, from `std::bind(std::forward<F>(f),
+...)` inside `Submit`, where `f` is the callable the pool's caller passed.
+
+- **The edge is the wrapping site's.** It runs from the function that builds
+  the bind or the task, at that site, not from the caller of `operator()`.
+  It is an over-approximation: it exists whether or not the task ever runs,
+  and a bind that is built and then dropped has it too.
+- **Bound arguments.** `rest = 1` wires the arguments after the callable into
+  the callable's formals as for `std::thread`, so a named bound argument
+  reaches the callable's formal. The model does not read `std::placeholders`:
+  nothing supplies the later caller's arguments.
+- **A parameter pack is not followed.** An argument passed through a
+  variadic template's `Args&&... args` reaches no formal, because a pack is
+  not a formal and `std::forward<Args>(args)...` has no positions. So
+  `Submit(f, a)` with `Args&&... args` reaches `f` but not `a` into `f`'s
+  formals; with a named parameter it does (following packs is #282).
+- **Execution contexts.** Each match is an `invoke`, so it is exported as one
+  `execution_contexts` row of kind `unknown` and, in call sequencing, an
+  `async_start` boundary, though nothing starts at a bind. The row says "the
+  callback may run on the caller's own thread".
+- **`std::function`.** No model: a callable stored in one flows through the
+  ordinary copy and points-to handling, and calling it is an indirect call.
 
 ### Execution contexts
 
@@ -3144,6 +3180,8 @@ entries:
 | `std::thread::thread` | `invoke param=0 rest=1 context=thread` (callable and everything after it); covers a temporary recorded as `std::thread` |
 | `std::jthread::jthread` | `invoke param=0 rest=1 supplies=std::stop_token context=thread` (as `std::thread`, with the thread's stop token first to a callable that takes one); covers a temporary recorded as `std::jthread` |
 | `std::async` | `invoke param=0 rest=1 unless_arg={param=0, type=std::launch} context=thread` and `invoke param=1 rest=2 if_arg={param=0, type=std::launch} context=thread` (the callable first, or after a launch policy) |
+| `std::bind` | `invoke param=0 rest=1 context=unknown` (the callable and the arguments bound after it; [Callable wrappers](#callable-wrappers)) |
+| `std::packaged_task::packaged_task` | `invoke param=0 rest=1 context=unknown` (the callable the task stores, of any arity; the constructor forwards no argument; a bind result is not a function, so the bind site makes the edge) |
 | `OHOS::Thread::Run` | `entry context=thread` (c_utils runs it on the thread `Start` creates) |
 | `OHOS::AppExecFwk::EventHandler::ProcessEvent` | `entry context=serial_task` (the handler's event runner calls it) |
 | `OHOS::IRemoteObject::DeathRecipient::OnRemoteDied` | `entry context=ipc_handler` (an IPC thread calls it when the remote dies) |

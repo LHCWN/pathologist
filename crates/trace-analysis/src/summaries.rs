@@ -345,6 +345,17 @@ impl FnModelSet {
                 })
                 .collect(),
         );
+        // Wrappers that keep a callable reachable without running it where
+        // they are built: the edge is the wrapping site's, since no value
+        // carries the callable on (`docs/ANALYSIS.md`, "Callable wrappers").
+        reg(
+            "std::bind",
+            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown),
+        );
+        reg(
+            "std::packaged_task::packaged_task",
+            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown),
+        );
         // Virtual members a framework runs on its own thread, queue or pool.
         for (name, context) in [
             ("OHOS::Thread::Run", Thread),
@@ -1376,6 +1387,16 @@ effects = [{ kind = "invoke", param = 0, rest = 1 }]
                 supplies: Some("std::stop_token".into()),
                 when: None,
             }]
+        );
+        assert_eq!(
+            effects("std::bind"),
+            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown),
+            "the callable and the arguments bound after it"
+        );
+        assert_eq!(
+            effects("std::packaged_task::packaged_task"),
+            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown),
+            "the callable the task stores, of any arity: the signature is the task's"
         );
         for (name, context) in [
             ("OHOS::Thread::Run", ContextKind::Thread),

@@ -1,5 +1,42 @@
 # Evaluation Report
 
+## Callable wrappers: #250 — 2026-11-11
+
+`std::bind` and `std::packaged_task::packaged_task` are `invoke` models
+([Callable wrappers](ANALYSIS.md#callable-wrappers)), so a callable wrapped
+by either keeps a call edge from the code that wraps it. Measured with
+`scripts/eval_check.py` on the four pinned corpora.
+
+| Corpus | Count | Before | After |
+|--------|-------|-------:|------:|
+| HDF | `edges_indirect` | 5139 | 5153 |
+| HiView | `edges_indirect` | 246 | 262 |
+| Camera | `edges_indirect` | 443 | 459 |
+| ability_runtime | `edges_indirect` | 1848 | 1849 |
+
+Every other check passes on all four, and each increase equals the corpus's
+indirect edges from `std::bind` sites (14, 16, 16 and 1). No
+`std::packaged_task::packaged_task` edge or context appears on any of them.
+
+- Camera: 7 of the 16 are `UnifiedPipelineThreadpool::Submit` to the lambdas
+  handed to it, now from the `std::bind(std::forward<F>(f), ...)` site
+  (`unified_pipeline_threadpool.h:72`), the edges #249 removed with the
+  `decltype` operand. A probe pins them. The other 9 are member-function binds
+  no model covered before, for example
+  `std::bind(&HCameraService::OnReceiveEvent, this, ...)` in
+  `HCameraService::OnAddSystemAbility`.
+- The edges are real and as over-approximate as the rest: each is the bind
+  site's, not the later call's.
+- `execution_contexts` gains rows of model `std::bind` and kind `unknown`:
+  14 in HDF, 16 in HiView, 34 in Camera and 1 in ability_runtime (a callback
+  that reaches a declaration and its definition is two rows). Letting a
+  wrapper add edges without one is tracked in #283.
+- Arguments passed through a variadic parameter pack are not followed
+  ([Callable wrappers](ANALYSIS.md#callable-wrappers), #282); whether the
+  `packaged_task` constructor model fires through a factory is #284.
+- No baseline binary was run, so movement of the other global counts from
+  this change is not separated out; they stay inside their existing bands.
+
 ## Indexing cost of conditional lowering — 2026-11-10
 
 Conditional lowering (#256, `07a7935`) made Camera indexing 5.5 s slower
