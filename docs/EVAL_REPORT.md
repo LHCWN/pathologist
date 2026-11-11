@@ -23,6 +23,63 @@ on each corpus pins that no `execution_contexts` row has the model `std::bind`
 or `std::packaged_task::packaged_task`. Every other model's rows are as they
 were.
 
+## Standard classes built by a factory: #284 — 2026-11-11
+
+`std::make_shared<T>(args)` and `std::make_unique<T>(args)` record a
+constructor site only for a class the unit declares, so a standard class
+(`std::packaged_task<void()>`, `std::thread`) built through one reached no
+constructor model, though `new std::thread(f)` and a local `std::thread t(f)`
+did. A factory now names an undeclared `std::` class as it is spelled
+([Factory construction](ANALYSIS.md#factory-construction),
+[Callable wrappers](ANALYSIS.md#callable-wrappers)). Measured with
+`scripts/eval_check.py` on the four pinned corpora.
+
+| Corpus | Count | Before | After |
+|--------|-------|-------:|------:|
+| HiView | `edges_indirect` | 262 | 265 |
+| Camera | `edges_indirect` | 459 | 462 |
+
+Every check passes on all four, the two above after their re-capture. Each
+corpus gains the three indirect edges of its factory-built threads, and no
+other: HiView's `std::make_unique<std::thread>` in `EventLoop::StartLoop`
+(`event_loop.cpp:136`) and the two in `event_publish.cpp` (lines 601 and 625),
+Camera's in `audio_capturer_session.cpp:134`,
+`audio_capturer_session_adapter.cpp:120` and
+`unified_pipeline_worker_thread.cpp:28`. They are `std::thread::thread` starts
+that the existing model already covers; only the factory hid them. No corpus
+builds a `std::packaged_task` from a callable through a factory: its two uses
+(`event_loop.cpp:192`, with a local that holds a bind result, and
+`unified_pipeline_threadpool.h:72`, with `std::bind(...)` itself) pass a bind
+result, which is no function, so the `std::bind` site still makes the only
+indirect edge.
+
+The change is not limited to classes a model names: a factory building any
+undeclared standard class records its constructor site, as `new` does, so the
+external call edges rise too. The counts below are the complete graph's
+(`raw_call_edges`), which is what `scripts/eval_check.py` checks, and all stay
+inside their bands (HDF 23909 ± 200, HiView 15693 ± 160, Camera 46085 ± 420),
+so the check does not flag them:
+
+| Corpus | `external` edges before | after | Added constructors (most) |
+|--------|-------:|------:|---------------------------|
+| HDF | 23887 | 23888 | `std::string` |
+| HiView | 15714 | 15724 | `std::thread` 3, `std::map` 2, `std::unordered_map` 2 |
+| Camera | 46165 | 46173 | `std::thread` 3, `std::mutex` 2, `std::condition_variable` 2 |
+| ability_runtime | 128232 | 128278 | `std::vector` 18, `std::shared_ptr` 10, `std::string` 7, `std::promise` 4 |
+
+(An earlier version of this table counted the lambda-free `call_edges` view, so
+its totals were lower; the increases are the same.)
+
+A standard type that is no class (`std::size_t`, `std::nullptr_t`,
+`std::uint8_t[]`, a pointer such as `std::thread *`) records no site, and a
+globally qualified `::std::` class is the same class as `std::`; each has a
+test. (A reference cannot be a factory's argument, so the guard against one has
+none.) A class that names an enclosing
+template's parameter in its arguments (`std::packaged_task<R()>`) is still a
+standard class and records its site, as `new` does; no corpus count moves for
+it. A narrower rule, naming only the classes a model covers, would keep these
+edges out but cannot be written in the parser, which does not read the models.
+
 ## Callable wrappers: #250 — 2026-11-11
 
 `std::bind` and `std::packaged_task::packaged_task` are `invoke` models

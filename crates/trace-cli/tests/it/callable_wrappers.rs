@@ -169,3 +169,82 @@ fn a_model_stating_a_context_still_starts_it() {
         "the control: the same model with a context"
     );
 }
+
+/// Whether `caller` has an indirect edge to the lambda it contains.
+fn reaches_its_lambda(program: &Program, analysis: &AnalysisResult, caller: &str) -> bool {
+    let lambda = lambda_in(program, caller).name.clone();
+    indirect(program, analysis, caller, &lambda)
+}
+
+#[test]
+fn a_make_shared_packaged_task_built_from_a_named_function_reaches_it() {
+    let (p, a) = cpp_bind_packaged_task();
+    assert!(
+        indirect(p, a, "MakeSharedFromNamed", "SharedNamed"),
+        "the factory's constructor site passes `SharedNamed` to the `invoke` model"
+    );
+}
+
+#[test]
+fn a_make_shared_packaged_task_built_from_a_lambda_reaches_it() {
+    let (p, a) = cpp_bind_packaged_task();
+    assert!(reaches_its_lambda(p, a, "MakeSharedFromLambda"));
+}
+
+#[test]
+fn a_make_unique_packaged_task_built_from_a_named_function_reaches_it() {
+    let (p, a) = cpp_bind_packaged_task();
+    assert!(indirect(p, a, "MakeUniqueFromNamed", "UniqueNamed"));
+}
+
+#[test]
+fn a_make_unique_packaged_task_built_from_a_lambda_reaches_it() {
+    let (p, a) = cpp_bind_packaged_task();
+    assert!(reaches_its_lambda(p, a, "MakeUniqueFromLambda"));
+}
+
+#[test]
+fn a_globally_qualified_standard_class_is_the_same_class() {
+    let (p, a) = cpp_bind_packaged_task();
+    assert!(indirect(p, a, "MakeSharedGlobal", "GlobalQualified"));
+}
+
+#[test]
+fn a_standard_type_that_is_no_class_gets_no_constructor_site() {
+    let (p, a) = cpp_bind_packaged_task();
+    for caller in [
+        "MakeCounter",
+        "MakeBuffer",
+        "MakePointer",
+        "MakeSpacedPointer",
+        "MakeNothing",
+    ] {
+        let constructors: Vec<_> = callees_of(p, a, caller)
+            .into_iter()
+            .map(|(callee, _)| callee)
+            .filter(|callee| {
+                [
+                    "std::size_t",
+                    "std::uint8_t",
+                    "std::thread",
+                    "std::nullptr_t",
+                ]
+                .iter()
+                .any(|name| callee.starts_with(name))
+            })
+            .collect();
+        assert!(
+            constructors.is_empty(),
+            "`{caller}` builds a number, not a class: {constructors:?}"
+        );
+    }
+}
+
+#[test]
+fn a_task_naming_a_template_parameter_still_reaches_its_callable() {
+    let (p, a) = cpp_bind_packaged_task();
+    assert!(
+        indirect(p, a, "MakeTyped", "TypedTarget"),
+        "`std::packaged_task<R()>` is a standard class whatever `R` is, as for `new`"
+    );
+}

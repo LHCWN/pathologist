@@ -3051,6 +3051,18 @@ constructor, says what it is called with. This is what keeps a
   is for whatever later calls the task, which the analysis does not follow.
   A `--models` entry for another wrapper (a task-making helper, an
   `emplace`-style forwarder) states `context = "none"` the same way.
+- **Built through a factory.** `std::make_shared<std::packaged_task<void()>>(f)`
+  and `std::make_unique<...>(f)` take the constructor model too, from a named
+  function or a lambda: the factory's constructor site
+  ([Factory construction](#factory-construction)) is the one the model
+  matches, with `f` as its first argument, so the edge runs from the function
+  holding the factory call. Pinned by `tests/fixtures/cpp_bind_packaged_task`.
+  A task whose signature names an enclosing template's parameter
+  (`std::packaged_task<R()>` in `template <typename R>`) is the same class,
+  so it reaches its callable too, as `new std::packaged_task<R()>(f)` does.
+  `Submit`'s `std::packaged_task<ReturnType()>` records the site as well, but
+  its argument is a bind result, not a function, so the site adds an external
+  edge and the edge to the callable still comes from the `std::bind`.
 - **`std::function`.** No model: a callable stored in one flows through the
   ordinary copy and points-to handling, and calling it is an indirect call.
 
@@ -5002,7 +5014,21 @@ authoritative statement of the rule; lowering (`factory_constructed_class`,
   name a class the call site can name through its scopes or a `using`
   directive (`const` and `volatile` dropped, `strip_cv`), and not mention a parameter of an
   enclosing template. Anything else records nothing beyond the factory's
-  own site.
+  own site. One exception: a class of the standard library the unit never
+  sees declared (`std::packaged_task<void()>`, whose body is not in the tree)
+  is named as it is spelled, as `new std::packaged_task<void()>(f)` names it
+  (a global qualification, `::std::thread`, is the same class), so the factory
+  records the same unresolved constructor site, which a function model of that
+  constructor then matches ([Callable wrappers](#callable-wrappers)). The head
+  names the class, so a template argument that mentions an enclosing
+  template's parameter (`std::packaged_task<R()>`) does not stop the site, as
+  it does not stop `new`; the rule above is for a class the tree declares. Any such
+  class gets the site, not only those a model names, so a factory building an
+  undeclared standard class (`std::make_shared<std::string>("x")`) adds one
+  external constructor edge, as `new` does. A standard type that is no class
+  (a pointer, a reference, an array as in `std::make_unique<std::uint8_t[]>(n)`,
+  or a fundamental type's standard name such as `std::size_t`) records nothing
+  beyond the factory's own site.
 - **The object is not the call's value.** Unlike `new`'s, a factory's heap
   object is only the constructor's `this`: it is not copied into the smart
   pointer the call yields, and a file-scope factory, which has no
