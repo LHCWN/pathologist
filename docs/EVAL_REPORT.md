@@ -1,5 +1,28 @@
 # Evaluation Report
 
+## Wrapping models start no execution context: #283 — 2026-11-11
+
+`std::bind` and `std::packaged_task::packaged_task` only wrap a callable, but as
+`invoke` models of context `unknown` each match was exported as an
+`execution_contexts` row and drew an `async_start` boundary in call sequencing.
+Both now state `context = "none"`
+([Callable wrappers](ANALYSIS.md#callable-wrappers)): the call edges and the
+argument wiring are unchanged, and nothing is exported as a context. Measured
+with `scripts/eval_check.py` on the four pinned corpora.
+
+| Corpus | `std::bind` / `unknown` rows before | after |
+|--------|-------:|------:|
+| HDF | 14 | 0 |
+| HiView | 16 | 0 |
+| Camera | 34 | 0 |
+| ability_runtime | 1 | 0 |
+
+The before counts are those of the #250 report below. Every existing count
+passes unchanged (call edges and arg-flow edges do not move), and a new probe
+on each corpus pins that no `execution_contexts` row has the model `std::bind`
+or `std::packaged_task::packaged_task`. Every other model's rows are as they
+were.
+
 ## Callable wrappers: #250 — 2026-11-11
 
 `std::bind` and `std::packaged_task::packaged_task` are `invoke` models

@@ -35,13 +35,16 @@ pub enum Effect {
     /// equals a string constant in `param[name_param]` (`dlsym` family).
     Dlsym { name_param: u32 },
     /// The callee may invoke the callback in `param[param]`, passing it
-    /// `args`, in an execution context of kind `context`. Parameter indexes
-    /// count explicit arguments, excluding a member's `this`. Not restricted
-    /// to a bodyless callee, unlike the effects above that introduce a value.
+    /// `args`, in an execution context of kind `context`, or in none when
+    /// `context` is `None`: a model that only wraps the callback
+    /// (`std::bind`) keeps the call edge and the argument wiring but starts
+    /// nothing. Parameter indexes count explicit arguments, excluding a
+    /// member's `this`. Not restricted to a bodyless callee, unlike the
+    /// effects above that introduce a value.
     Invoke {
         param: u32,
         args: InvokeArgs,
-        context: ContextKind,
+        context: Option<ContextKind>,
         /// A value of this class the callee passes ahead of `args` to a
         /// callback whose first parameter is declared of it
         /// (`std::jthread`'s `std::stop_token`).
@@ -184,6 +187,17 @@ pub(crate) fn is_value_of(
 /// The effects of a model that only runs one callback, in a `context`: one
 /// unconditional [`Effect::Invoke`] that supplies no argument of its own.
 fn starts(param: u32, args: InvokeArgs, context: ContextKind) -> Vec<Effect> {
+    invokes(param, args, Some(context))
+}
+
+/// The effects of a model that only wraps one callback: the same
+/// [`Effect::Invoke`], which starts no execution context
+/// (`docs/ANALYSIS.md`, "Callable wrappers").
+fn wraps(param: u32, args: InvokeArgs) -> Vec<Effect> {
+    invokes(param, args, None)
+}
+
+fn invokes(param: u32, args: InvokeArgs, context: Option<ContextKind>) -> Vec<Effect> {
     vec![Effect::Invoke {
         param,
         args,
@@ -306,7 +320,7 @@ impl FnModelSet {
             vec![Effect::Invoke {
                 param: 0,
                 args: InvokeArgs::Rest(1),
-                context: Thread,
+                context: Some(Thread),
                 supplies: Some("std::stop_token".into()),
                 when: None,
             }],
@@ -335,7 +349,7 @@ impl FnModelSet {
                 .map(|(param, rest, policy)| Effect::Invoke {
                     param,
                     args: InvokeArgs::Rest(rest),
-                    context: Thread,
+                    context: Some(Thread),
                     supplies: None,
                     when: Some(ArgType {
                         param: 0,
@@ -348,13 +362,10 @@ impl FnModelSet {
         // Wrappers that keep a callable reachable without running it where
         // they are built: the edge is the wrapping site's, since no value
         // carries the callable on (`docs/ANALYSIS.md`, "Callable wrappers").
-        reg(
-            "std::bind",
-            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown),
-        );
+        reg("std::bind", wraps(0, InvokeArgs::Rest(1)));
         reg(
             "std::packaged_task::packaged_task",
-            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown),
+            wraps(0, InvokeArgs::Rest(1)),
         );
         // Virtual members a framework runs on its own thread, queue or pool.
         for (name, context) in [
@@ -744,10 +755,17 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
     if !matches!(raw.kind.as_str(), "invoke" | "entry") && raw.context.is_some() {
         return Err(format!("effect kind {:?} takes no `context`", raw.kind));
     }
-    let context = || match raw.context.as_deref() {
-        None => Ok(ContextKind::Unknown),
-        Some(spelling) => ContextKind::parse(spelling).ok_or_else(|| {
-            let expected: Vec<&str> = ContextKind::ALL.iter().map(|k| k.as_str()).collect();
+    // `none` is the one spelling that is no kind: the callback is wrapped,
+    // not started ([`Effect::Invoke`]), so only an `invoke` may say it.
+    let context = |wrapping_allowed: bool| match raw.context.as_deref() {
+        None => Ok(Some(ContextKind::Unknown)),
+        Some("none") if wrapping_allowed => Ok(None),
+        Some(spelling) => ContextKind::parse(spelling).map(Some).ok_or_else(|| {
+            let expected: Vec<&str> = ContextKind::ALL
+                .iter()
+                .map(|k| k.as_str())
+                .chain(wrapping_allowed.then_some("none"))
+                .collect();
             format!(
                 "unknown context {spelling:?} (expected {})",
                 expected.join(", ")
@@ -856,7 +874,7 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
             Ok(Effect::Invoke {
                 param,
                 args,
-                context: context()?,
+                context: context(true)?,
                 supplies,
                 when,
             })
@@ -869,7 +887,9 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
                 );
             }
             Ok(Effect::Entry {
-                context: context()?,
+                // `none` is refused for an entry above, so this is a kind
+                // or the `unknown` default.
+                context: context(false)?.unwrap_or(ContextKind::Unknown),
             })
         }
         "clears" => Ok(Effect::Clears {
@@ -1105,6 +1125,37 @@ effects = [ { kind = "dlsym", param = 1 } ]
     }
 
     #[test]
+    fn toml_invoke_may_only_wrap_its_callback() {
+        let load = |effect: &str| {
+            FnModelSet::from_toml_str(&format!("[[model]]\nname = \"x\"\neffects = [{effect}]\n"))
+        };
+        let wrapping =
+            load(r#"{ kind = "invoke", param = 0, rest = 1, context = "none" }"#).unwrap();
+        assert_eq!(
+            wrapping.get("x").unwrap().effects,
+            wraps(0, InvokeArgs::Rest(1)),
+            "`none` states that the callback is wrapped, not started"
+        );
+        assert!(
+            load(r#"{ kind = "entry", context = "none" }"#).is_err(),
+            "an entry is where a context starts, so it has to name one"
+        );
+        assert!(load(r#"{ kind = "alias", dst = 0, src = 1, context = "none" }"#).is_err());
+    }
+
+    #[test]
+    fn builtin_wrappers_start_no_context() {
+        let m = FnModelSet::builtin();
+        for name in ["std::bind", "std::packaged_task::packaged_task"] {
+            assert_eq!(
+                m.get(name).unwrap().effects,
+                wraps(0, InvokeArgs::Rest(1)),
+                "{name} keeps its callable reachable and starts nothing"
+            );
+        }
+    }
+
+    #[test]
     fn toml_invoke_takes_listed_or_rest_arguments() {
         let m = FnModelSet::from_toml_str(
             r#"
@@ -1153,7 +1204,7 @@ effects = [{ kind = "invoke", param = 0, rest = 1 }]
             vec![Effect::Invoke {
                 param: 0,
                 args: InvokeArgs::Rest(1),
-                context: ContextKind::Unknown,
+                context: Some(ContextKind::Unknown),
                 supplies: Some("std::stop_token".into()),
                 when: None,
             }]
@@ -1166,7 +1217,7 @@ effects = [{ kind = "invoke", param = 0, rest = 1 }]
                 vec![Effect::Invoke {
                     param: 1,
                     args: InvokeArgs::Rest(2),
-                    context: ContextKind::Unknown,
+                    context: Some(ContextKind::Unknown),
                     when: Some(ArgType {
                         param: 0,
                         class: "std::launch".into(),
@@ -1364,14 +1415,14 @@ effects = [{ kind = "invoke", param = 0, rest = 1 }]
                 Effect::Invoke {
                     param: 0,
                     args: InvokeArgs::Rest(1),
-                    context: ContextKind::Thread,
+                    context: Some(ContextKind::Thread),
                     when: policy(false),
                     supplies: None,
                 },
                 Effect::Invoke {
                     param: 1,
                     args: InvokeArgs::Rest(2),
-                    context: ContextKind::Thread,
+                    context: Some(ContextKind::Thread),
                     when: policy(true),
                     supplies: None,
                 },
@@ -1383,19 +1434,19 @@ effects = [{ kind = "invoke", param = 0, rest = 1 }]
             vec![Effect::Invoke {
                 param: 0,
                 args: InvokeArgs::Rest(1),
-                context: ContextKind::Thread,
+                context: Some(ContextKind::Thread),
                 supplies: Some("std::stop_token".into()),
                 when: None,
             }]
         );
         assert_eq!(
             effects("std::bind"),
-            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown),
+            wraps(0, InvokeArgs::Rest(1)),
             "the callable and the arguments bound after it"
         );
         assert_eq!(
             effects("std::packaged_task::packaged_task"),
-            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown),
+            wraps(0, InvokeArgs::Rest(1)),
             "the callable the task stores, of any arity: the signature is the task's"
         );
         for (name, context) in [

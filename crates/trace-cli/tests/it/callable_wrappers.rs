@@ -116,3 +116,56 @@ fn a_bound_argument_is_not_called_from_the_bind_site() {
         "`BoundHit` is only an argument; `BoundWork` is what calls it"
     );
 }
+
+#[test]
+fn a_bind_or_a_packaged_task_starts_no_execution_context() {
+    let (_, a) = cpp_bind_packaged_task();
+    assert!(
+        a.execution_contexts.is_empty(),
+        "nothing in the fixture starts a thread or a task, only wraps a callable: {:?}",
+        a.execution_contexts
+    );
+}
+
+const WRAP: &str = "\
+void Target() {}
+void Wrap(void (*f)());
+void Caller() { Wrap(Target); }
+";
+
+fn wrap_with(context: &str) -> (Program, AnalysisResult) {
+    let dir = scratch(&[("wrap.cpp", WRAP)]);
+    let program = trace_parse::build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let analysis = analyze_with_models(
+        &program,
+        &format!(
+            "[[model]]\nname = \"Wrap\"\neffects = [{{ kind = \"invoke\", param = 0, context = \"{context}\" }}]\n"
+        ),
+    );
+    (program, analysis)
+}
+
+#[test]
+fn a_model_stating_no_context_keeps_the_edge_and_starts_nothing() {
+    let (p, a) = wrap_with("none");
+    assert!(
+        indirect(&p, &a, "Caller", "Target"),
+        "the wrapped callable stays reachable from the wrapping site"
+    );
+    assert!(
+        a.execution_contexts.is_empty(),
+        "{:?}",
+        a.execution_contexts
+    );
+}
+
+#[test]
+fn a_model_stating_a_context_still_starts_it() {
+    let (p, a) = wrap_with("thread");
+    assert!(indirect(&p, &a, "Caller", "Target"));
+    assert_eq!(
+        a.execution_contexts.len(),
+        1,
+        "the control: the same model with a context"
+    );
+}

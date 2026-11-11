@@ -2876,7 +2876,7 @@ resolved once per analysis and shared by every lookup.
 | `dlsym { param }` | return value may be the address of the in-tree function named by string constants in `param[param]` | `Dlsym` PAG constraint; unknown names add nothing |
 | `entry { context }` | the named member `Class::method` is one a framework calls: it and every override of it the tree defines is the entry of an [execution context](#execution-contexts) of kind `context`, which no call site starts | none: no edge, no flow |
 | `ipc { target }` | a bodyless callee dispatches to the qualified member `Base::method` or its in-tree implementations; see [OpenHarmony IPC bridges](#openharmony-ipc-bridges) for matching and imprecision | synthetic `ipc` call edges, no value flow |
-| `invoke { param, args / rest, context, supplies, if_arg / unless_arg }` | may invoke the callback passed in `param[param]`, with the arguments `args = [..]` lists (none when omitted: a zero-argument callback) or every argument from position `rest` on, preceded by a value of class `supplies` when the callback takes one, in an execution context of kind `context` (`unknown` when omitted); with `if_arg` / `unless_arg`, only at a call whose argument it names may be / may not be of the class it names | adds an indirect edge from the submitting caller at the submission site, read off the converged points-to sets; callback return values and scheduling are ignored. Forwarded arguments are wired into the callback's formals inside the fixpoint (see [Callback invocation](#callback-invocation-invoke)). Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice. Each resolved callback is also an [execution context](#execution-contexts) |
+| `invoke { param, args / rest, context, supplies, if_arg / unless_arg }` | may invoke the callback passed in `param[param]`, with the arguments `args = [..]` lists (none when omitted: a zero-argument callback) or every argument from position `rest` on, preceded by a value of class `supplies` when the callback takes one, in an execution context of kind `context` (`unknown` when omitted; `none` when the model only wraps the callback and starts nothing, see [Callable wrappers](#callable-wrappers)); with `if_arg` / `unless_arg`, only at a call whose argument it names may be / may not be of the class it names | adds an indirect edge from the submitting caller at the submission site, read off the converged points-to sets; callback return values and scheduling are ignored. Forwarded arguments are wired into the callback's formals inside the fixpoint (see [Callback invocation](#callback-invocation-invoke)). Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice. Each resolved callback is also an [execution context](#execution-contexts), unless the model states `context = "none"` |
 
 Effects attach to parameter positions (0-based) of the *actual arguments* recorded at
 the call site. Arguments that are not IR variables or functions (literals like
@@ -3004,7 +3004,13 @@ image as an indirect call's targets are.
   context the callback runs in (`unknown` when omitted). `context` on an
   effect kind other than `invoke` and `entry` is rejected when the file is
   loaded. Each resolved callback is exported as one execution context (next
-  section); the call graph is the same whatever the kind.
+  section); the call graph is the same whatever the kind. `context = "none"`
+  is the one spelling that is no kind: the model only wraps the callback, so
+  it keeps the call edge, the forwarded arguments and the arg-flow rows
+  above, and the callback is no context, with no `execution_contexts` row
+  and no `async_start` boundary. Only an `invoke` may say it (an `entry` is
+  where a context starts), and the context graph then treats the wrapping
+  site's edge as an ordinary call.
 - **Not modeled.** No ordering or scheduling (the callback is simply
   reachable from the starting site), no return value, and no bound state:
   a `std::bind` result, a `std::packaged_task` and a `std::function` object
@@ -3016,9 +3022,9 @@ image as an indirect call's targets are.
 `std::bind(f, args...)` and `std::packaged_task<R(A...)>(f)` only wrap a
 callable that something runs later, usually a thread pool's worker. No value in the analysis carries a
 callable on, so the later call, `task()` or `(*task)()`, cannot be tied back
-to `f`. Both are therefore `invoke` models, with the context `unknown`
-([Built-in models](#built-in-models)): `std::bind` with `param = 0, rest = 1`
-and `std::packaged_task::packaged_task` with `param = 0, rest = 1`: the
+to `f`. Both are therefore `invoke` models that start no context, `context =
+"none"` ([Built-in models](#built-in-models)): `std::bind` with `param = 0,
+rest = 1` and `std::packaged_task::packaged_task` with `param = 0, rest = 1`: the
 constructor forwards no argument, and `rest` (not an empty `args`) lets the
 stored callable take any number of parameters, as the task's signature, not the
 constructor, says what it is called with. This is what keeps a
@@ -3038,10 +3044,13 @@ constructor, says what it is called with. This is what keeps a
   not a formal and `std::forward<Args>(args)...` has no positions. So
   `Submit(f, a)` with `Args&&... args` reaches `f` but not `a` into `f`'s
   formals; with a named parameter it does (following packs is #282).
-- **Execution contexts.** Each match is an `invoke`, so it is exported as one
-  `execution_contexts` row of kind `unknown` and, in call sequencing, an
-  `async_start` boundary, though nothing starts at a bind. The row says "the
-  callback may run on the caller's own thread".
+- **No execution context.** Both models state `context = "none"`: nothing
+  starts at a bind or at a task's construction, so a match exports no
+  `execution_contexts` row and, in call sequencing, no `async_start`
+  boundary; the wrapping site is an ordinary call. Where the callable runs
+  is for whatever later calls the task, which the analysis does not follow.
+  A `--models` entry for another wrapper (a task-making helper, an
+  `emplace`-style forwarder) states `context = "none"` the same way.
 - **`std::function`.** No model: a callable stored in one flows through the
   ordinary copy and points-to handling, and calling it is an indirect call.
 
@@ -3059,8 +3068,10 @@ still the callee of an `ipc` edge.
 - **Kinds** (`kind`, a model's `context`): `thread` (a new thread),
   `pool_task` (a task on a pool of worker threads), `serial_task` (a task on
   a queue that runs one task at a time), `ipc_handler` (a request handler on
-  the IPC worker pool) or `unknown`.
-- **Which contexts.** One per resolved callback of an `invoke` model:
+  the IPC worker pool) or `unknown`. A model's `context = "none"` is no kind
+  and no context: see [Callable wrappers](#callable-wrappers).
+- **Which contexts.** One per resolved callback of an `invoke` model that
+  states a kind:
   submitting call site, modelled callee (`pthread_create`,
   `std::thread::thread`, `ffrt::submit`, `AppExecFwk::EventHandler::PostTask`),
   invoked parameter, the receiver the callee was called on, callback
@@ -3180,8 +3191,8 @@ entries:
 | `std::thread::thread` | `invoke param=0 rest=1 context=thread` (callable and everything after it); covers a temporary recorded as `std::thread` |
 | `std::jthread::jthread` | `invoke param=0 rest=1 supplies=std::stop_token context=thread` (as `std::thread`, with the thread's stop token first to a callable that takes one); covers a temporary recorded as `std::jthread` |
 | `std::async` | `invoke param=0 rest=1 unless_arg={param=0, type=std::launch} context=thread` and `invoke param=1 rest=2 if_arg={param=0, type=std::launch} context=thread` (the callable first, or after a launch policy) |
-| `std::bind` | `invoke param=0 rest=1 context=unknown` (the callable and the arguments bound after it; [Callable wrappers](#callable-wrappers)) |
-| `std::packaged_task::packaged_task` | `invoke param=0 rest=1 context=unknown` (the callable the task stores, of any arity; the constructor forwards no argument; a bind result is not a function, so the bind site makes the edge) |
+| `std::bind` | `invoke param=0 rest=1 context=none` (the callable and the arguments bound after it; [Callable wrappers](#callable-wrappers)) |
+| `std::packaged_task::packaged_task` | `invoke param=0 rest=1 context=none` (the callable the task stores, of any arity; the constructor forwards no argument; a bind result is not a function, so the bind site makes the edge) |
 | `OHOS::Thread::Run` | `entry context=thread` (c_utils runs it on the thread `Start` creates) |
 | `OHOS::AppExecFwk::EventHandler::ProcessEvent` | `entry context=serial_task` (the handler's event runner calls it) |
 | `OHOS::IRemoteObject::DeathRecipient::OnRemoteDied` | `entry context=ipc_handler` (an IPC thread calls it when the remote dies) |
@@ -3218,6 +3229,12 @@ effects = [ { kind = "dlsym", param = 1 } ]
 [[model]]
 name = "pool_post"
 effects = [ { kind = "invoke", param = 1, args = [2], context = "pool_task" } ]
+
+# A wrapper that keeps its callback reachable but starts nothing: the edge
+# and the forwarded arguments, no execution context, no `async_start`.
+[[model]]
+name = "make_task"
+effects = [ { kind = "invoke", param = 0, rest = 1, context = "none" } ]
 
 # Argument 0 is a launch policy or the callable; a callable that takes a
 # `Token` first gets the runner's own ahead of the forwarded arguments.
