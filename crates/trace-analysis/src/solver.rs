@@ -938,7 +938,9 @@ fn solve(
     }
     for (&fn_id, &loc) in &pag.fn_locations {
         let f = program.symbols.function(fn_id);
-        if !f.params.is_empty() {
+        // A pack function takes any number from its fixed parameters on: its
+        // arity is unknown here, which every slot admits.
+        if !f.params.is_empty() && !f.has_pack_param {
             st.fn_arity.insert(loc, f.params.len());
         }
     }
@@ -1381,10 +1383,17 @@ fn solve(
                         // matches; anything else is wrong-type flow that must
                         // not surface as an indirect-call target.
                         if !passed {
-                            let n = program.symbols.function(fn_id).params.len();
-                            if n > 0
-                                && pag.field_slot_arity(program, loc, effective_field) == Some(n)
-                            {
+                            let callee = program.symbols.function(fn_id);
+                            let n = callee.params.len();
+                            let slot = pag.field_slot_arity(program, loc, effective_field);
+                            // A pack function takes a slot of the parameters
+                            // it declares before the pack, or more.
+                            let fits = if callee.has_pack_param {
+                                slot.is_some_and(|slot| slot + 1 >= n)
+                            } else {
+                                slot == Some(n)
+                            };
+                            if n > 0 && fits {
                                 add_pts(&mut st, dst, loc);
                             }
                         }
@@ -2420,7 +2429,7 @@ fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
         return false;
     };
     let desc = program.types.get(v.type_id).desc.as_ref();
-    match desc {
+    let holds = match desc {
         TD::FnPtr { .. } => true,
         // A pointer to a fn-pointer slot (`cb_t *out`, a table row) reaches
         // callbacks through its pointee just as a struct pointer does.
@@ -2437,7 +2446,11 @@ fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
         // value is its pointee's address): participate conservatively.
         _ if v.is_pointer => true,
         _ => false,
-    }
+    };
+    // A pack stands for arguments of any type, whatever its dependent
+    // element type lowered to (`Args &&...args` is an `int *`): it may hold
+    // any pointee (docs/ANALYSIS.md, "Variadic parameter packs").
+    holds || (!program.pack_vars.is_empty() && program.pack_vars.contains(&var))
 }
 
 fn wire_params(
@@ -2449,16 +2462,61 @@ fn wire_params(
     scratch: &mut Scratch,
     wired: &mut FxHashSet<(CallSiteId, u32, FnId)>,
 ) {
-    wire_actuals(pag, program, cs, callee, st, scratch, Some, |_, idx| {
-        wired.insert((cs.id, idx, callee));
-    });
+    wire_actuals(
+        pag,
+        program,
+        cs,
+        callee,
+        st,
+        scratch,
+        Some,
+        |st, formal, arg| {
+            if formal == arg {
+                wired.insert((cs.id, formal, callee));
+            } else {
+                // A pack formal takes arguments from positions of their own.
+                record_forwarded(st, cs.id, callee, (formal, arg));
+            }
+        },
+    );
 }
 
-/// Wire `cs`'s actuals into `callee`'s formals: formal `i` takes the actual
-/// at position `actual_of(i)`, and `on_wired(st, i)` records each formal that
-/// took one, for the arg-flow rows. An ordinary call passes position `i` to
-/// formal `i`; a callback a model invokes takes the positions the model
-/// forwards.
+/// Record that `callee`'s formal `pair.0` took `cs`'s argument at position
+/// `pair.1`, for the arg-flow rows that are not formal `i` from position `i`.
+fn record_forwarded(st: &mut SolverState, cs: CallSiteId, callee: FnId, pair: (u32, u32)) {
+    let wired = st.forwarded_arg_flow.entry((cs, callee)).or_default();
+    if !wired.contains(&pair) {
+        wired.push(pair);
+    }
+}
+
+/// The position at which `cs` records what it passes at argument position
+/// `idx`: `idx` itself when something is recorded there, else the nearest
+/// pack expansion before it, which stands for every position from its own on
+/// ([`trace_ir::Program::pack_vars`]). Something written at `idx` (a variable
+/// or a function) is never shadowed by an expansion before it.
+fn recorded_position(program: &Program, cs: &trace_ir::CallSite, idx: u32) -> Option<u32> {
+    if cs.var_args.iter().any(|(at, _)| *at == idx) || cs.fn_args().iter().any(|(at, _)| *at == idx)
+    {
+        return Some(idx);
+    }
+    if program.pack_vars.is_empty() {
+        return None;
+    }
+    cs.var_args
+        .iter()
+        .filter(|(at, var)| *at < idx && program.pack_vars.contains(var))
+        .map(|(at, _)| *at)
+        .max()
+}
+
+/// Wire `cs`'s actuals into `callee`'s formals: formal `i` takes what the site
+/// records at position `actual_of(i)`, and `on_wired(st, i, at)` records each
+/// formal that took something and the position it was recorded at, for the
+/// arg-flow rows. An ordinary call passes position `i` to formal `i`; a
+/// callback a model invokes takes the positions the model forwards; a pack
+/// formal takes every position from its own on, and a pack expansion at `at`
+/// serves every formal from `at` on ([`recorded_position`]).
 #[allow(clippy::too_many_arguments)]
 fn wire_actuals(
     pag: &mut Pag,
@@ -2468,52 +2526,125 @@ fn wire_actuals(
     st: &mut SolverState,
     scratch: &mut Scratch,
     actual_of: impl Fn(u32) -> Option<u32>,
-    mut on_wired: impl FnMut(&mut SolverState, u32),
+    mut on_wired: impl FnMut(&mut SolverState, u32, u32),
 ) {
     let callee_fn = program.symbols.function(callee);
+    let packs = callee_fn.variadic && !program.pack_vars.is_empty();
     for (i, formal) in callee_fn.params.iter().enumerate() {
         let formal_idx = i as u32;
-        let Some(idx) = actual_of(formal_idx) else {
-            continue;
-        };
-        if let Some(actual) = cs.var_args.iter().find(|(j, _)| *j == idx).map(|(_, v)| *v) {
-            let formal_node = pag.var_node.get(formal).copied().expect("formal var node");
-            let actual_node = pag.var_node.get(&actual).copied().expect("actual var node");
-            // Persistent copy constraint: the actual's points-to may still be
-            // growing when the edge is first discovered (direct sites are
-            // wired before the first propagation round). A one-shot snapshot
-            // here loses interprocedural flow (observed as missed indirect
-            // targets passed through parameters). Scalars cannot contribute
-            // pointees and are skipped to bound constraint volume.
-            if var_may_hold_pointee(program, actual)
-                && var_may_hold_pointee(program, *formal)
-                && st.wired_copies.insert((actual_node, formal_node))
-            {
-                ensure_param_copy(pag, st, actual_node, formal_node);
-            }
-            if let Some(actual_pts) = st.pts.get(&actual_node) {
-                // Snapshotted rather than cloned: this used to copy the
-                // actual's whole points-to set once per wired argument.
-                scratch.wire_src.clear();
-                scratch.wire_src.extend(actual_pts.iter().copied());
-                propagate_locs(
-                    st,
-                    &mut scratch.fresh,
-                    formal_node,
-                    scratch.wire_src.iter().copied(),
-                );
-            }
-            on_wired(st, formal_idx);
-        } else if cs.fn_args().iter().any(|(j, _)| *j == idx) {
-            // A name with overloads passes each one it may mean.
-            let formal_node = pag.var_node.get(formal).copied().expect("formal var node");
-            for &(_, fn_id) in cs.fn_args().iter().filter(|(j, _)| *j == idx) {
-                if let Some(&fn_loc) = pag.fn_locations.get(&fn_id) {
-                    add_pts(st, formal_node, fn_loc);
+        if packs && program.pack_vars.contains(formal) {
+            // A pack formal takes every argument from its position on: the
+            // positions the site passes, mapped as the callee takes them,
+            // each wired once however many positions an expansion covers.
+            let reach = (cs.var_args.iter().map(|(at, _)| *at))
+                .chain(cs.fn_args().iter().map(|(at, _)| *at))
+                .max()
+                .map_or(1, |last| last + 1);
+            let mut taken: Vec<u32> = Vec::new();
+            for slot in formal_idx..formal_idx.saturating_add(reach) {
+                let Some(idx) = actual_of(slot) else {
+                    continue;
+                };
+                if let Some(at) = recorded_position(program, cs, idx) {
+                    if !taken.contains(&at) {
+                        taken.push(at);
+                    }
+                }
+                // Past the last position recorded, nothing new is passed.
+                if idx >= reach {
+                    break;
                 }
             }
-            on_wired(st, formal_idx);
+            for at in taken {
+                wire_one(
+                    pag,
+                    program,
+                    cs,
+                    st,
+                    scratch,
+                    *formal,
+                    formal_idx,
+                    at,
+                    &mut on_wired,
+                );
+            }
+        } else if let Some(at) =
+            actual_of(formal_idx).and_then(|idx| recorded_position(program, cs, idx))
+        {
+            wire_one(
+                pag,
+                program,
+                cs,
+                st,
+                scratch,
+                *formal,
+                formal_idx,
+                at,
+                &mut on_wired,
+            );
         }
+    }
+}
+
+/// Wire what `cs` records at position `at` into `formal`, the callee's
+/// parameter `formal_idx`: the variables and the functions written there;
+/// `on_wired` is told the formal and the position.
+#[allow(clippy::too_many_arguments)]
+fn wire_one(
+    pag: &mut Pag,
+    program: &Program,
+    cs: &trace_ir::CallSite,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    formal: VarId,
+    formal_idx: u32,
+    at: u32,
+    on_wired: &mut impl FnMut(&mut SolverState, u32, u32),
+) {
+    let mut wired = false;
+    for &(_, actual) in cs.var_args.iter().filter(|(j, _)| *j == at) {
+        let formal_node = pag.var_node.get(&formal).copied().expect("formal var node");
+        let actual_node = pag.var_node.get(&actual).copied().expect("actual var node");
+        // Persistent copy constraint: the actual's points-to may still be
+        // growing when the edge is first discovered (direct sites are
+        // wired before the first propagation round). A one-shot snapshot
+        // here loses interprocedural flow (observed as missed indirect
+        // targets passed through parameters). Scalars cannot contribute
+        // pointees and are skipped to bound constraint volume.
+        if var_may_hold_pointee(program, actual)
+            && var_may_hold_pointee(program, formal)
+            && st.wired_copies.insert((actual_node, formal_node))
+        {
+            ensure_param_copy(pag, st, actual_node, formal_node);
+        }
+        if let Some(actual_pts) = st.pts.get(&actual_node) {
+            // Snapshotted rather than cloned: this used to copy the
+            // actual's whole points-to set once per wired argument.
+            scratch.wire_src.clear();
+            scratch.wire_src.extend(actual_pts.iter().copied());
+            propagate_locs(
+                st,
+                &mut scratch.fresh,
+                formal_node,
+                scratch.wire_src.iter().copied(),
+            );
+        }
+        wired = true;
+    }
+    // A name with overloads passes each one it may mean; an expansion's
+    // position may hold names after it too.
+    let mut named = cs.fn_args().iter().filter(|(j, _)| *j == at).peekable();
+    if named.peek().is_some() {
+        let formal_node = pag.var_node.get(&formal).copied().expect("formal var node");
+        for &(_, fn_id) in named {
+            if let Some(&fn_loc) = pag.fn_locations.get(&fn_id) {
+                add_pts(st, formal_node, fn_loc);
+            }
+        }
+        wired = true;
+    }
+    if wired {
+        on_wired(st, formal_idx, at);
     }
 }
 
@@ -2785,9 +2916,22 @@ fn invoke_alignments(
         // how many there are: the last one recorded is a lower bound.
         InvokeArgs::Rest(from) => {
             let first = invoke_site_index(cs, *from);
-            let last = (cs.var_args.iter().map(|(i, _)| *i))
-                .chain(cs.fn_args().iter().map(|(i, _)| *i))
-                .max();
+            // A pack expansion passes any number, none included: only the
+            // positions before it are known to be passed. Each argument,
+            // written or not (a literal records no variable), takes its
+            // syntactic position, so the one before an expansion at `i` is
+            // `i - 1` and is passed. An argument after an expansion (recorded
+            // at the expansion's position) is passed at that position or later,
+            // so counting its position is a lower bound too.
+            let last = (cs.var_args.iter().filter_map(|(i, var)| {
+                if program.pack_vars.contains(var) {
+                    i.checked_sub(1)
+                } else {
+                    Some(*i)
+                }
+            }))
+            .chain(cs.fn_args().iter().map(|(i, _)| *i))
+            .max();
             let passed = match (first, last) {
                 (Some(first), Some(last)) if last >= first => last - first + 1,
                 _ => 0,
@@ -2906,16 +3050,7 @@ fn wire_callback(
                 st,
                 scratch,
                 actual_of,
-                |st, formal| {
-                    let pair = (
-                        formal,
-                        actual_of(formal).expect("wired formal has an actual"),
-                    );
-                    let wired = st.forwarded_arg_flow.entry((cs.id, target)).or_default();
-                    if !wired.contains(&pair) {
-                        wired.push(pair);
-                    }
-                },
+                |st, formal, arg| record_forwarded(st, cs.id, target, (formal, arg)),
             );
         }
     }
@@ -3794,6 +3929,7 @@ mod tests {
                 reference_params: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
+                has_pack_param: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
                 is_member_template: false,

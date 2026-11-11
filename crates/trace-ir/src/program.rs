@@ -600,6 +600,12 @@ pub struct Program {
     pub reference_returns: FxHashSet<FnId>,
     /// Functions declared to return an rvalue reference (`&&`), for value-category determination.
     pub rvalue_reference_returns: FxHashSet<FnId>,
+    /// Variables that stand for a whole parameter pack: a function's pack
+    /// formal (`Args &&...args`) and the value a pack expansion passes
+    /// (`std::forward<Args>(args)...`). A formal takes every actual from its
+    /// position on, and an actual serves every formal from its position on
+    /// (docs/ANALYSIS.md, "Variadic parameter packs"). Kept for analysis.
+    pub pack_vars: FxHashSet<crate::VarId>,
     pub flow: Vec<crate::FlowConstraint>,
     /// Source operation sites, independent of solver constraints.
     pub flow_origins: FxHashMap<crate::FlowConstraint, Vec<(crate::Span, Arc<str>)>>,

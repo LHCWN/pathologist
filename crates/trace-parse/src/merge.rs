@@ -34,6 +34,8 @@ pub struct UnitIndex {
     /// C++ reference semantics retained for subsequent header consumers.
     pub reference_bindings: FxHashSet<VarId>,
     pub reference_vars: FxHashSet<VarId>,
+    /// Variables standing for a parameter pack ([`Program::pack_vars`]).
+    pub pack_vars: FxHashSet<VarId>,
     pub address_references: FxHashSet<VarId>,
     pub var_qualifications: FxHashMap<VarId, trace_ir::CvQualification>,
     pub reference_returns: FxHashSet<FnId>,
@@ -1245,6 +1247,11 @@ fn merge_unit(
     );
     program.reference_vars.extend(
         unit.reference_vars
+            .iter()
+            .filter_map(|id| var_map.get(id).copied()),
+    );
+    program.pack_vars.extend(
+        unit.pack_vars
             .iter()
             .filter_map(|id| var_map.get(id).copied()),
     );
@@ -2668,6 +2675,7 @@ mod tests {
                 reference_params: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
+                has_pack_param: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
                 is_member_template: false,
@@ -2730,6 +2738,7 @@ mod tests {
             reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
+            has_pack_param: false,
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
@@ -2862,6 +2871,7 @@ mod tests {
             reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
+            has_pack_param: false,
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
@@ -2975,6 +2985,7 @@ mod tests {
                 reference_params: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
+                has_pack_param: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
                 is_member_template: false,
@@ -3050,6 +3061,7 @@ mod tests {
             reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
+            has_pack_param: false,
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
@@ -3293,6 +3305,7 @@ mod tests {
             reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
+            has_pack_param: false,
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
@@ -3546,6 +3559,7 @@ mod tests {
                 reference_params: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
+                has_pack_param: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
                 is_member_template: false,

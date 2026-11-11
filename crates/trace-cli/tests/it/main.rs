@@ -44,4 +44,5 @@ mod system_header_units;
 mod task_primitives;
 mod thread_entry;
 mod value_slice;
+mod variadic_packs;
 mod weak_targets;

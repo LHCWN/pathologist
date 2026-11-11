@@ -2384,6 +2384,7 @@ fn finalize_extern_callees(program: &mut Program) {
             reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
+            has_pack_param: false,
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
@@ -2493,6 +2494,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             explicit_arity: None,
             owner_unresolved: false,
             variadic: false,
+            has_pack_param: false,
             defaulted_in_class: false,
             declared_in_class: false,
             is_member_template: false,
@@ -4370,6 +4372,7 @@ fn program_into_unit(
         variables: program.symbols.variables,
         reference_bindings: program.reference_bindings,
         reference_vars: program.reference_vars,
+        pack_vars: program.pack_vars,
         var_qualifications: program.var_qualifications,
         address_references: program.address_references,
         reference_returns: program.reference_returns,
@@ -7460,6 +7463,7 @@ fn register_member_prototype(
             reference_params: shape.references,
             owner_unresolved: false,
             variadic: shape.variadic,
+            has_pack_param: shape.declares_pack,
             defaulted_in_class: false,
             declared_in_class: true,
             is_member_template: is_member_function_template(source, node),
@@ -7795,11 +7799,17 @@ fn lower_function_signature(
             file: ctx.current_file,
             is_defined: !is_dep,
             param_type_ids,
-            explicit_arity: Some((params.len() - usize::from(eff_class.is_some())) as u32),
+            explicit_arity: Some(
+                params
+                    .len()
+                    .saturating_sub(usize::from(eff_class.is_some()) + usize::from(shape.pack))
+                    as u32,
+            ),
             default_args: shape.defaults,
             reference_params: shape.references,
             owner_unresolved,
             variadic: shape.variadic,
+            has_pack_param: shape.pack,
             // `A() = default;` in its class: not user-provided (C++17 aggregates).
             defaulted_in_class: ctx.class_ctx.is_some()
                 && node.children(&mut node.walk()).any(|c| {
@@ -8112,6 +8122,12 @@ struct ParamListShape {
     references: Vec<bool>,
     defaults: u32,
     variadic: bool,
+    /// A parameter pack was lowered as the last formal: `explicit_arity`
+    /// does not count it ([`trace_ir::Function::has_pack_param`]).
+    pack: bool,
+    /// The list declares a parameter pack, lowered or not (a prototype lowers
+    /// none).
+    declares_pack: bool,
 }
 
 impl ParamListShape {
@@ -8122,6 +8138,8 @@ impl ParamListShape {
             // C's `...` parses as `variadic_parameter`. A pack followed by
             // `...` is one tail, the pack's.
             "..." | "variadic_parameter" | "variadic_parameter_declaration" => {
+                self.declares_pack |=
+                    ctx.is_cpp && param.cached_kind() == "variadic_parameter_declaration";
                 !std::mem::replace(&mut self.variadic, true)
             }
             kind => {
@@ -8174,12 +8192,21 @@ fn lower_parameters(
     let first = params.len() as u32;
     for param in params_node.children(&mut params_node.walk()) {
         shape.record(program, ctx, source, param);
-        if !is_parameter_node(param.cached_kind()) {
+        // A C++ parameter pack (`Args &&...args`) is a formal of its own:
+        // the last one, taking every argument from its position on. C's `...`
+        // names nothing and stays out (docs/ANALYSIS.md, "Variadic parameter
+        // packs").
+        let pack = ctx.is_cpp && param.cached_kind() == "variadic_parameter_declaration";
+        if !is_parameter_node(param.cached_kind()) && !pack {
             continue;
         }
         let index = params.len() as u32;
         note_parameter_default(program, ctx, source, param, fn_id, index - first);
         if let Some(var) = lower_parameter(program, ctx, source, param, fn_id, index) {
+            if pack {
+                program.pack_vars.insert(var);
+                shape.pack = true;
+            }
             params.push(var);
         }
     }
@@ -8362,7 +8389,12 @@ fn definition_signature(
         .children(&mut params_node.walk())
         .filter(|param| is_parameter_node(param.cached_kind()))
         .collect();
-    let Some(skip) = params.len().checked_sub(declared.len()) else {
+    // A pack is the last of `params` and none of `declared`.
+    let packs = params
+        .iter()
+        .filter(|v| program.pack_vars.contains(v))
+        .count();
+    let Some(skip) = params.len().checked_sub(declared.len() + packs) else {
         return Vec::new();
     };
     // Built only once a parameter turns out to be a stand-in, which most
@@ -14751,7 +14783,7 @@ fn lower_function_decl(
             .unwrap_or_default()
     });
     let span = node_span(program, ctx, decl);
-    let explicit_arity = Some(params.len() as u32);
+    let explicit_arity = Some(params.len().saturating_sub(usize::from(shape.pack)) as u32);
     // Shared by the return cv and the return category read after the parameters.
     let return_kind = ReturnTypeKind::default();
     let fn_id = program.symbols.add_function(Function {
@@ -14778,6 +14810,7 @@ fn lower_function_decl(
         reference_params: shape.references,
         owner_unresolved: false,
         variadic: shape.variadic,
+        has_pack_param: shape.pack,
         defaulted_in_class: false,
         declared_in_class: false,
         is_member_template: false,
@@ -16288,8 +16321,34 @@ fn collect_call_arg_nodes<'t>(
     let mut address_reference_args = Vec::new();
     let mut null_constants = Vec::new();
     let mut arg_index = 0u32;
+    // Where the first pack expansion is. It and every argument after it are
+    // recorded there: what follows an expansion starts at no known position
+    // (docs/ANALYSIS.md, "Variadic parameter packs").
+    let mut pack_at: Option<u32> = None;
+    // The argument being lowered that stands for the pack, as the position
+    // it is recorded at and where its values begin in `var_args`: marked once
+    // the argument is done, as the paths through the body are many.
+    let mut expansion: Option<(usize, u32)> = None;
     for arg in args {
+        if let Some((first, index)) = expansion.take() {
+            mark_pack_actuals(program, &var_args[first..], index);
+        }
         if !matches!(arg.cached_kind(), "(" | ")" | "{" | "}" | ",") {
+            // `args...` and `std::forward<Args>(args)...` pass the pack's
+            // values; the pattern is what is lowered.
+            let expands = arg.cached_kind() == "parameter_pack_expansion";
+            if expands {
+                pack_at.get_or_insert(arg_index);
+            }
+            let position = pack_at.unwrap_or(arg_index);
+            if pack_at.is_some() {
+                expansion = Some((var_args.len(), position));
+            }
+            let arg = if expands {
+                arg.cached_field("pattern").unwrap_or(arg)
+            } else {
+                arg
+            };
             let adesc = arg_expr_type(program, ctx, source, arg);
             let value = peel_expression(arg);
             if matches!(adesc, TypeDesc::Ptr(_))
@@ -16298,7 +16357,7 @@ fn collect_call_arg_nodes<'t>(
                 && resolve_expr_var(program, ctx, source, value)
                     .is_some_and(|v| ctx.address_references.contains(&v))
             {
-                address_reference_args.push(arg_index);
+                address_reference_args.push(position);
             }
             null_constants.push(is_null_constant(source, arg));
             // Parameter positions are syntactic: every argument slot
@@ -16313,8 +16372,8 @@ fn collect_call_arg_nodes<'t>(
             // flow"): the formal must point to `x`, not receive x's own
             // pointees.
             if let Some(v) = addr_of_plain_var(program, ctx, source, arg) {
-                var_args.push((arg_index, addr_of_temp(program, ctx, arg, v)));
-                addr_of_args.push(arg_index);
+                var_args.push((position, addr_of_temp(program, ctx, arg, v)));
+                addr_of_args.push(position);
                 arg_desc.push(adesc);
                 arg_index += 1;
                 continue;
@@ -16338,8 +16397,8 @@ fn collect_call_arg_nodes<'t>(
                     address
                 } else if ctx.is_cpp {
                     deref_args.push(DerefArg {
-                        index: arg_index,
-                        param: arg_index as usize,
+                        index: position,
+                        param: position as usize,
                         owner: ctx.current_fn,
                         span: node_span(program, ctx, arg),
                         read: Default::default(),
@@ -16354,7 +16413,7 @@ fn collect_call_arg_nodes<'t>(
                     });
                     read
                 };
-                var_args.push((arg_index, passed));
+                var_args.push((position, passed));
                 arg_desc.push(adesc);
                 arg_index += 1;
                 continue;
@@ -16372,7 +16431,7 @@ fn collect_call_arg_nodes<'t>(
                             array_decay_flow(program, ctx, source, value, &dst)
                         });
                         if let Some(temp) = dst.allocated() {
-                            var_args.push((arg_index, temp));
+                            var_args.push((position, temp));
                         }
                         arg_desc.push(adesc);
                         arg_index += 1;
@@ -16389,7 +16448,7 @@ fn collect_call_arg_nodes<'t>(
                 let member = addr_of_field_path(program, ctx, source, peel_casts(source, arg));
                 record_argument_origins(program, ctx, source, arg, first_flow, first_pending);
                 if let Some(member) = member {
-                    var_args.push((arg_index, member));
+                    var_args.push((position, member));
                     arg_desc.push(adesc);
                     arg_index += 1;
                     continue;
@@ -16417,29 +16476,29 @@ fn collect_call_arg_nodes<'t>(
                             first_flow,
                             first_pending,
                         );
-                        var_args.push((arg_index, temp));
+                        var_args.push((position, temp));
                         arg_desc.push(adesc);
                         arg_index += 1;
                         continue;
                     }
                 }
-                var_args.push((arg_index, v));
+                var_args.push((position, v));
                 // `&base.member` / `&arr[i]` resolve to the base
                 // variable; flag the position so function-model alias
                 // effects can refuse to copy the whole container.
                 if is_addr_of_member(source, arg) {
-                    addr_of_member_args.push(arg_index);
+                    addr_of_member_args.push(position);
                 }
             } else if materialized_expression(program, ctx, source, value) {
                 if let Some(temp) = expression_value(program, ctx, source, value) {
-                    var_args.push((arg_index, temp));
+                    var_args.push((position, temp));
                     if compound_address(program, ctx, source, value) {
-                        addr_of_args.push(arg_index);
+                        addr_of_args.push(position);
                     }
                 }
             } else if value.cached_kind() == "call_expression" {
                 if let Some(temp) = lower_nested_call_arg(program, ctx, source, value) {
-                    var_args.push((arg_index, temp));
+                    var_args.push((position, temp));
                 }
             } else if is_nullptr(source, value) {
                 let temp = alloc_ret_temp(program, ctx, arg);
@@ -16452,7 +16511,7 @@ fn collect_call_arg_nodes<'t>(
                     // copying the enclosing argument list per null value.
                     let span = node_span(program, ctx, arg);
                     record_flow_origins(program, ctx, first_flow, span, node_text(source, &arg));
-                    var_args.push((arg_index, temp));
+                    var_args.push((position, temp));
                 }
             } else if let Some(s) = string_literal_value(source, arg) {
                 let temp = alloc_ret_temp(program, ctx, arg);
@@ -16460,13 +16519,16 @@ fn collect_call_arg_nodes<'t>(
                     dst: temp,
                     value: s,
                 });
-                var_args.push((arg_index, temp));
+                var_args.push((position, temp));
             } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
-                fn_args.push((arg_index, fn_id));
+                fn_args.push((position, fn_id));
             }
             arg_desc.push(adesc);
             arg_index += 1;
         }
+    }
+    if let Some((first, index)) = expansion {
+        mark_pack_actuals(program, &var_args[first..], index);
     }
     CallArgs {
         var_args,
@@ -16480,6 +16542,18 @@ fn collect_call_arg_nodes<'t>(
         ctor_set_complete: !ctx.header_unit,
         null_constants,
     }
+}
+
+/// Mark the values a pack expansion at argument position `index` passed
+/// (`actuals`, the arguments recorded since it began) as standing for the
+/// whole pack ([`Program::pack_vars`]).
+fn mark_pack_actuals(program: &mut Program, actuals: &[(u32, VarId)], index: u32) {
+    program.pack_vars.extend(
+        actuals
+            .iter()
+            .filter(|(position, _)| *position == index)
+            .map(|&(_, var)| var),
+    );
 }
 
 /// Best-effort static type of a call argument expression, for overload
@@ -20057,7 +20131,11 @@ fn method_explicit_arity(program: &Program, fid: FnId) -> Option<usize> {
     if f.params.is_empty() {
         return f.explicit_arity.map(|n| n as usize);
     }
-    Some(f.params.len() - usize::from(has_this_param(program, fid)))
+    Some(
+        f.params.len().saturating_sub(
+            usize::from(has_this_param(program, fid)) + usize::from(f.has_pack_param),
+        ),
+    )
 }
 
 /// Whether `fid` can take arguments of these static types, and the types say
@@ -20328,6 +20406,7 @@ fn lower_lambda_expression(
         reference_params: shape.references,
         owner_unresolved: false,
         variadic: shape.variadic,
+        has_pack_param: false,
         defaulted_in_class: false,
         declared_in_class: false,
         is_member_template: false,
@@ -29303,6 +29382,14 @@ fn parse_declarator_name(source: &str, node: Node) -> (String, bool) {
         // expansion output; collapse it so protos and defs share one name.
         "destructor_name" => (normalize_qualified(node_text(source, &node)), false),
         "operator_name" => (normalize_qualified(node_text(source, &node)), false),
+        // A parameter pack's `...args` names `args`; an unnamed pack names
+        // nothing.
+        "variadic_declarator" => (
+            node.named_child(0)
+                .map(|name| node_text(source, &name).to_string())
+                .unwrap_or_default(),
+            false,
+        ),
         "operator_cast" => (conversion_operator_name(source, node), false),
         "function_declarator" => {
             if let Some(inner) = node.cached_field("declarator") {

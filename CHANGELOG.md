@@ -33,6 +33,22 @@ ability_runtime. `none` is not a `kind` value, so the schema is unchanged. See
 `docs/ANALYSIS.md` ("Function models", "Callable wrappers") and
 `docs/EVAL_REPORT.md`.
 
+### Follow arguments through variadic parameter packs (#282)
+
+A parameter pack was not a formal and a pack expansion had no argument
+positions, so an argument passed through `Args &&...args` reached no formal:
+`Submit(Work, Hit, 1)` never gave `Work`'s `cb` the `Hit`. A C++ pack is now the
+last formal of its function and takes every argument from its position on; an
+expansion (`args...`, `std::forward<Args>(args)...`) serves every formal from
+its position on, and an argument written after one is recorded at the
+expansion's position. The pack is no declared parameter
+(`Function::has_pack_param`), so a call that passes nothing for it still
+resolves. The analysis stays flow-insensitive: the pack is one variable for all
+its elements, so every element may reach every formal it is forwarded to. On
+the pinned corpora only camera moves, `arg_flow_edges` 58694 to 59919, almost
+all rows into pack formals; indirect edges are unchanged. See
+`docs/ANALYSIS.md` ("Variadic parameter packs") and `docs/EVAL_REPORT.md`.
+
 ### Keep callables passed through `std::bind` and `std::packaged_task` reachable (#250)
 
 A thread pool that wraps a submitted callable in `std::bind` or
@@ -43,7 +59,7 @@ function an indirect edge to the callable at the wrapping site, the same way
 `std::thread` and `std::async` do. The edge over-approximates: no value carries
 the callable on, so the later call through the stored task is not tied back to
 it (a bind site was first an `unknown`-kind `execution_contexts` row; #283 removes that). Arguments
-passed through a variadic parameter pack are not followed (#282); a named bound
+passed through a variadic parameter pack were not followed until #282; a named bound
 argument and a member function's receiver are. `UnifiedPipelineThreadpool::Submit`
 reaches the lambdas it runs again on camera, the edges #249 removed with the
 `decltype` operand. Pinned `edges_indirect` moves by each corpus's `std::bind`
