@@ -640,7 +640,9 @@ pool. Semantics, evidence rules and row order:
 [Execution contexts](ANALYSIS.md#execution-contexts). An additive v7 table: a
 v7 export written before it existed has no `execution_contexts` table, so a
 reader checks for the table (and the columns it reads) instead of the schema
-version; in an ordinary analysis an empty table means no context was found.
+version; in an ordinary analysis an empty table means no context was found. A
+callable only wrapped (`std::bind`, `std::packaged_task`) starts nothing and
+has no row: a model states that with `context = "none"`, which is no `kind`.
 
 | Column | Type | Description |
 |--------|------|-------------|

@@ -158,8 +158,9 @@ fn overrides_declared(program: &Program, f: &trace_ir::Function, member: &str) -
     })
 }
 
-/// One context per resolved callback invocation, in start-site order, then
-/// one per entry no call site starts, by function. Within each, rows are
+/// One context per resolved callback invocation that starts one (`invocations`
+/// holds none for a model that only wraps its callback), in start-site order,
+/// then one per entry no call site starts, by function. Within each, rows are
 /// ordered by kind spelling and model as `trace-merge` orders them.
 pub(crate) fn execution_contexts(
     program: &Program,

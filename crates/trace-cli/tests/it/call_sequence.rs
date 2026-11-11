@@ -1170,6 +1170,39 @@ int IFooProxy::GetInfo(int key) {\n\
     return key;\n\
 }\n";
 
+/// A bind only wraps a callable: nothing starts there.
+const BIND_SITE: &str = "\
+void step();
+void after();
+void target() { step(); }
+void wrapper() {
+    auto bound = std::bind(target);
+    after();
+}
+";
+
+#[test]
+fn a_wrapping_model_is_not_an_async_start() {
+    let dir = scratch(&[("bind_site.cpp", BIND_SITE)]);
+    let db = sequenced_db(dir.path(), default_opts(dir.path()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let graph = function_sequence(&conn, "wrapper", None, &Default::default());
+    assert!(
+        graph.events.iter().any(|e| e.callee == "std::bind"),
+        "the bind site is an event: {:?}",
+        graph.events
+    );
+    assert!(
+        graph.events.iter().all(|e| e.context_start.is_none()),
+        "nothing starts at a bind"
+    );
+    assert!(
+        !graph.boundaries.iter().any(|b| b.kind == "async_start"),
+        "{:?}",
+        graph.boundaries
+    );
+}
+
 #[test]
 fn thread_starts_and_ipc_are_boundaries() {
     use trace_db::Relation::*;

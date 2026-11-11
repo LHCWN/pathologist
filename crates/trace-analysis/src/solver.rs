@@ -2541,7 +2541,9 @@ struct Invoked<'m> {
     supplies: Option<&'m str>,
     /// The test a call's argument must pass for the effect to apply.
     when: Option<&'m ArgType>,
-    context: ContextKind,
+    /// The kind of context the callback runs in; `None` when the model only
+    /// wraps it, so nothing starts.
+    context: Option<ContextKind>,
     /// The model's name.
     model: &'m str,
 }
@@ -2976,7 +2978,9 @@ fn callback_edges<'m>(
             let pointed = args_at(&cs.var_args, index).flat_map(|var| held_functions(pag, st, var));
             for callee in named.chain(pointed) {
                 for (target, _) in invoke_targets(program, cs, callee, invoked) {
-                    invocations.push((start, target, context, model));
+                    if let Some(context) = context {
+                        invocations.push((start, target, context, model));
+                    }
                     if seen.insert((cs.id, target)) {
                         edges.push(CallGraphEdge {
                             call_site: cs.id,
