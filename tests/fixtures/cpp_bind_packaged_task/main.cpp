@@ -82,3 +82,53 @@ void CallHeld() {
     std::function<void()> fn = Held;
     fn();
 }
+
+// A `std::packaged_task` built by a smart-pointer factory straight from a
+// callable, rather than from a bind result: the factory's constructor site is
+// the one that names the callable.
+void SharedNamed() {}
+void MakeSharedFromNamed() {
+    auto task = std::make_shared<std::packaged_task<void()>>(SharedNamed);
+    (*task)();
+}
+void SharedLambdaTarget() {}
+void MakeSharedFromLambda() {
+    auto task = std::make_shared<std::packaged_task<void()>>(
+        []() { SharedLambdaTarget(); });
+    (*task)();
+}
+void UniqueNamed() {}
+void MakeUniqueFromNamed() {
+    auto task = std::make_unique<std::packaged_task<void()>>(UniqueNamed);
+    (*task)();
+}
+void UniqueLambdaTarget() {}
+void MakeUniqueFromLambda() {
+    auto task = std::make_unique<std::packaged_task<void()>>(
+        []() { UniqueLambdaTarget(); });
+    (*task)();
+}
+
+// A global qualification names the same class.
+void GlobalQualified() {}
+void MakeSharedGlobal() {
+    auto task = std::make_shared<::std::packaged_task<void()>>(GlobalQualified);
+    (*task)();
+}
+
+// A standard type that is no class constructs nothing: a counter, a buffer.
+void MakeCounter() { auto count = std::make_shared<std::size_t>(0); }
+void MakeBuffer() { auto buffer = std::make_unique<std::uint8_t[]>(16); }
+void MakePointer() { auto slot = std::make_shared<std::thread *>(); }
+void MakeSpacedPointer() { auto slot = std::make_shared<const std::thread *const>(); }
+void MakeNothing() { auto none = std::make_shared<std::nullptr_t>(nullptr); }
+
+// A task whose signature names the enclosing template's parameter is still a
+// `std::packaged_task`: the head names the class, so the constructor site is
+// recorded, as `new std::packaged_task<R()>(f)` records it.
+void TypedTarget() {}
+template <typename R>
+void MakeTyped(R (*f)()) {
+    auto task = std::make_shared<std::packaged_task<R()>>(f);
+}
+void UseTyped() { MakeTyped(TypedTarget); }

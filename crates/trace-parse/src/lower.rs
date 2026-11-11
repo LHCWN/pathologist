@@ -11535,8 +11535,40 @@ fn factory_constructed_class(
     }
     let raw = normalize_spacing(text);
     let factory = smart_ptr_factory(program, ctx, call, &strip_template_args(&raw))?;
-    let class = smart_ptr_held_class(program, ctx, source, call, &raw, Spelling::Source)?;
+    let class = smart_ptr_held_class(program, ctx, source, call, &raw, Spelling::Source)
+        .or_else(|| standard_library_class(&raw))?;
     Some((class, factory.leading))
+}
+
+/// The one template argument of a factory spelling when it names a class of
+/// the standard library the unit never sees declared (`std::packaged_task<void()>`
+/// of `std::make_shared<std::packaged_task<void()>>(f)`): its body is not in
+/// the tree, so [`held_class`] cannot name it, but `new std::packaged_task<void()>(f)`
+/// is a constructor call of it all the same and so is the factory's. A global
+/// qualification (`::std::thread`) names the same class. The head names the
+/// class, so a template argument that mentions an enclosing template's
+/// parameter (`std::packaged_task<R()>`) does not stop it, as it does not stop
+/// `new`. `None` for any other class and for a standard type that is no class
+/// (a pointer, a reference, an array as in `std::make_unique<std::uint8_t[]>(n)`,
+/// or a fundamental type's standard name such as `std::size_t`)
+/// (docs/ANALYSIS.md, "Factory construction").
+fn standard_library_class(spelled: &str) -> Option<String> {
+    let [arg]: [String; 1] = template_arguments(spelled).try_into().ok()?;
+    let class = strip_cv(&arg);
+    let class = class.strip_prefix("::").unwrap_or(class).trim_start();
+    let named = receiver_lookup_name(class);
+    let bare = named.strip_prefix("std::")?;
+    // A pointer or reference, with its own qualifiers after it
+    // (`const std::thread *const`), is no class either.
+    let (_, indirection) = split_pointer_suffix(class);
+    if !indirection.is_empty()
+        || class.ends_with(']')
+        || is_fundamental_type_name(last_type_segment(bare))
+        || last_type_segment(bare) == "nullptr_t"
+    {
+        return None;
+    }
+    Some(class.to_owned())
 }
 
 /// Static-member factories, by the last segment of the wrapper template

@@ -4,6 +4,35 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Let a smart-pointer factory build a standard class through its constructor models (#284)
+
+`std::make_shared<T>(args)` and `std::make_unique<T>(args)` recorded a
+constructor site only for a class the unit declares, so a standard class such as
+`std::packaged_task` or `std::thread` built through one reached no constructor
+model, though `new` and a local variable did. A factory now names an undeclared
+`std::` class as it is spelled (`::std::` too, and a class whose template
+arguments mention an enclosing template's parameter), and records the same
+constructor site. A pointer, a reference, an array and the standard names of
+fundamental types (`std::size_t`) record nothing. Pinned `edges_indirect`
+moves by the factory-built `std::thread` starts: HiView 262 to 265 and camera
+459 to 462. The rule is not limited to classes a model names, so external edges
+rise too, inside their bands: HDF +1, HiView +10, camera +8 and ability_runtime
++46. See `docs/ANALYSIS.md` ("Factory construction", "Callable wrappers") and
+`docs/EVAL_REPORT.md`.
+
+### Let an `invoke` model wrap a callable without starting an execution context (#283)
+
+`std::bind` and `std::packaged_task::packaged_task` only wrap a callable, but
+every match was exported as an `unknown`-kind `execution_contexts` row and drew
+an `async_start` boundary in `inspect sequence`. An `invoke` model can now state
+`context = "none"`: it keeps its call edges, forwarded arguments and arg-flow
+rows and starts no context, so no row is exported and no boundary is drawn; the
+wrapping site is an ordinary call in the sequence graph. Both built-in wrappers
+state it, which removes their 14, 16, 34 and 1 rows on HDF, HiView, camera and
+ability_runtime. `none` is not a `kind` value, so the schema is unchanged. See
+`docs/ANALYSIS.md` ("Function models", "Callable wrappers") and
+`docs/EVAL_REPORT.md`.
+
 ### Keep callables passed through `std::bind` and `std::packaged_task` reachable (#250)
 
 A thread pool that wraps a submitted callable in `std::bind` or
@@ -13,7 +42,7 @@ nothing followed the callable through either. Two built-in `invoke` models,
 function an indirect edge to the callable at the wrapping site, the same way
 `std::thread` and `std::async` do. The edge over-approximates: no value carries
 the callable on, so the later call through the stored task is not tied back to
-it, and each bind site is an `unknown`-kind `execution_contexts` row. Arguments
+it (a bind site was first an `unknown`-kind `execution_contexts` row; #283 removes that). Arguments
 passed through a variadic parameter pack are not followed (#282); a named bound
 argument and a member function's receiver are. `UnifiedPipelineThreadpool::Submit`
 reaches the lambdas it runs again on camera, the edges #249 removed with the
