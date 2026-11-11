@@ -5,6 +5,7 @@ mod adversarial_cases;
 mod analysis_tests;
 mod call_sequence;
 mod call_sites;
+mod callable_wrappers;
 mod callback_declarations;
 mod callback_models;
 mod compile_commands_tests;
