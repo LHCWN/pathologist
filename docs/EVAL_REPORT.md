@@ -1,5 +1,48 @@
 # Evaluation Report
 
+## Call-site lookup by ID — 2026-11-12
+
+Conditional lowering (#256, `07a7935`) added two loops in
+`export_flow_provenance` that walk every analysis call edge. Each asked
+`SymbolTable::call_site_by_id` for the record, and that lookup fell back to a
+linear scan on any position miss. IPC bridge edges carry the synthetic
+`CallSiteId(u32::MAX)`, which is never a record, so each of ability_runtime's
+1,923 IPC edges rescanned the 658,901-call-site vector; over 723,191 edges the
+fallback, not the scan of real records, dominated the loop. The second loop
+(lifting reference-return provenance) is new in #256; the same fallback also
+slowed the pre-existing return-site loop, which is why #280 (`dae2487`) did not
+recover it.
+
+Call records stay sorted by ID: allocation hands out increasing IDs, every
+append path pushes in that order (`merge_unit`, per-unit lowering, the linking
+view), and target scoping only retains records in place. Synthetic IPC sites
+answer `None` before the search, and other missing IDs binary-search.
+Header-dedup merge tests pin the order; the sparse-ID test covers the fast-path
+hit, an in-range slot holding another record's ID, the out-of-range miss, and an
+absent in-range ID. Exported data is unchanged: `compare_analysis_databases.py`
+reports every relation equal except `analysis_run`'s timestamp, and
+`raw_analysis_run` differs only in `created_at`.
+
+Measured on Windows 11 x86_64, AMD Ryzen 7 8845HS (8 cores, 16 logical CPUs),
+32 GiB, release build, `--jobs 8`, default minimal export. Parent is
+`5555e9a`, the commit before #256. The before-fix rows are the current tree
+before this change (single runs, hence the range); parent and after-fix are the
+median of three interleaved runs with an untimed warm-up.
+
+| ability_runtime | Parent `5555e9a` | #256 `07a7935` | Before fix | After fix |
+|---|---:|---:|---:|---:|
+| Index phase, s | 77.6 | 79.5–83.2 | 75.0–82.1 | 76.9 |
+| Analyze phase, s | 7.5 | 7.5–9.1 | 7.6–8.1 | 8.1 |
+| Export phase, s | 25.3 | 34.6–36.1 | 43.0–45.2 | 27.1 |
+| Export provenance, s | 10.5 | 19.7 | 19.2–19.8 | 1.75 |
+| Whole run, s | 112.9 | 126.9–131.0 | 129.3–144.5 | 114.9 |
+
+The whole run is back within 2 s of the pre-#256 parent; indexing is at parent
+time, and the remaining difference is the analyze phase (+0.6 s) and export
+(+1.8 s, largely the lambda-free publication and identity work that landed after
+#256). The reference-origin lookup now takes 0.017 s and the return-site lookup
+0.083 s, instead of 9.1 s each.
+
 ## Wrapping models start no execution context: #283 — 2026-11-11
 
 `std::bind` and `std::packaged_task::packaged_task` only wrap a callable, but as
