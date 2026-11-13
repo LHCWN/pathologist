@@ -425,7 +425,7 @@ mod tests {
             assert_eq!(positions.len(), 2);
             assert_eq!((positions[0].1, positions[0].2), (3, 3));
             assert_eq!((positions[1].1, positions[1].2), (6, 3));
-            assert_eq!(positions[0].0, header.canonicalize().unwrap());
+            assert_eq!(positions[0].0, trace_ir::canonicalize(&header));
             let snapshot = (parsed.source, parsed.tree.root_node().to_sexp(), positions);
             if let Some(expected) = &expected {
                 assert_eq!(&snapshot, expected);

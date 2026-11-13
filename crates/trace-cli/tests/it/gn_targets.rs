@@ -181,7 +181,7 @@ fn inferred_include_dirs_are_recorded_on_the_configured_path() {
             .query_row("SELECT options_json FROM analysis_run", [], |r| r.get(0))
             .unwrap();
         let options: serde_json::Value = serde_json::from_str(&options).unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = trace_ir::canonicalize(dir.path());
         options["include_paths"]
             .as_array()
             .unwrap()

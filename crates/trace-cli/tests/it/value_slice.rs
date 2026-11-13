@@ -212,7 +212,11 @@ fn a_field_access_starts_at_the_cells_it_designates() {
     let start = resolve_slice_start(&conn, FILE, line, col, None).unwrap();
     assert_eq!(start.kind, "field");
     assert_eq!(start.name, "callback_");
-    assert!(start.at.path.ends_with(FILE), "{:?}", start.at);
+    assert!(
+        std::path::Path::new(&start.at.path).ends_with(FILE),
+        "{:?}",
+        start.at
+    );
     let labels: Vec<String> = start
         .nodes
         .iter()
@@ -830,7 +834,10 @@ fn json_output_carries_spans_contexts_and_flags() {
     assert!(!flagged.is_empty());
     for e in flagged {
         assert!(e["site"]["line"].as_i64().unwrap() > 0, "{e}");
-        assert!(e["site"]["path"].as_str().unwrap().ends_with(FILE), "{e}");
+        assert!(
+            std::path::Path::new(e["site"]["path"].as_str().unwrap()).ends_with(FILE),
+            "{e}"
+        );
     }
     assert!(doc["contexts"]
         .as_array()

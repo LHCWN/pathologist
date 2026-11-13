@@ -2,6 +2,11 @@ use crate::common::fixture;
 use std::path::Path;
 use std::process::Command;
 
+/// CLI output prints host paths; assertions spell them with `/`.
+fn unix_paths(text: &str) -> String {
+    text.replace('\\', "/")
+}
+
 fn analyze(root: &Path, output: &Path, options: &[&str]) -> String {
     let result = Command::new(env!("CARGO_BIN_EXE_trace"))
         .arg("analyze")
@@ -154,7 +159,10 @@ fn indexed_header_is_evidence_of_a_search_configuration_problem() {
     let output = root.join("out.db");
     let stderr = analyze(root, &output, &[]);
     assert!(stderr.contains("matching indexed file:"), "{stderr}");
-    assert!(stderr.contains("headers/vendor/api.h"), "{stderr}");
+    assert!(
+        unix_paths(&stderr).contains("headers/vendor/api.h"),
+        "{stderr}"
+    );
     assert!(stderr.contains("search restrictions"), "{stderr}");
     assert_eq!(missing_count(&output), 1);
     let stderr = analyze(
@@ -271,7 +279,10 @@ fn applying_candidates_uses_the_proposed_file_and_preserves_explicit_include_pri
     let baseline = root.join("baseline.db");
     let stderr = analyze(root, &baseline, &["--include", explicit]);
     assert_eq!(missing_count(&baseline), 2);
-    assert!(stderr.contains("a-sdk/vendor/api.h"), "{stderr}");
+    assert!(
+        unix_paths(&stderr).contains("a-sdk/vendor/api.h"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("include-candidates: applying"));
 
     for options in [
@@ -305,7 +316,7 @@ fn applying_candidates_uses_the_proposed_file_and_preserves_explicit_include_pri
             "SELECT f.path FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id JOIN functions callee ON callee.id=e.callee_fn_id JOIN files f ON f.id=callee.file_id WHERE caller.name='entry' AND callee.name='chosen' AND callee.is_defined=1",
             [], |row| row.get(0),
         ).unwrap();
-        assert!(path.ends_with("a-sdk/vendor/api.h"), "{path}");
+        assert!(Path::new(&path).ends_with("a-sdk/vendor/api.h"), "{path}");
     }
 }
 
@@ -352,7 +363,10 @@ fn applying_candidates_rejects_roots_that_shadow_selected_headers_across_retries
             if !nested {
                 assert!(stderr.contains("skipping conflicting root"), "{stderr}");
                 assert!(stderr.contains("foo.h would resolve to"), "{stderr}");
-                assert!(stderr.contains("a/foo.h, selected"), "{stderr}");
+                assert!(
+                    unix_paths(&stderr).contains("a/foo.h, selected"),
+                    "{stderr}"
+                );
                 assert!(stderr.contains("skipped candidate: b/bar.h ->"), "{stderr}");
             }
             assert!(
@@ -376,7 +390,10 @@ fn applying_candidates_rejects_roots_that_shadow_selected_headers_across_retries
                 .collect();
             assert_eq!(callees.len(), 1, "{callees:?}");
             assert_eq!(callees[0].0, "chosen");
-            assert!(callees[0].1.ends_with("a/b/foo.h"), "{callees:?}");
+            assert!(
+                Path::new(&callees[0].1).ends_with("a/b/foo.h"),
+                "{callees:?}"
+            );
         }
     }
 }
@@ -490,7 +507,7 @@ fn applying_candidates_respects_per_tu_system_and_after_search_classes() {
                     callee, "chosen",
                     "{search_class}: {caller}: {callees:?}\n{stderr}"
                 );
-                assert!(path.ends_with("a/b/foo.h"), "{path}");
+                assert!(Path::new(path).ends_with("a/b/foo.h"), "{path}");
             }
             assert_eq!(missing_count(&output), 1);
             assert!(stderr.contains("skipped candidate: b/bar.h ->"), "{stderr}");
@@ -554,7 +571,7 @@ fn applying_candidates_normalizes_dot_components_and_preserves_the_requested_spe
             stderr.contains(&format!("{spelling}: 1 location(s)")),
             "{stderr}"
         );
-        assert!(stderr.contains("sdk/vendor/api.h"), "{stderr}");
+        assert!(unix_paths(&stderr).contains("sdk/vendor/api.h"), "{stderr}");
         assert!(
             stderr.contains(&format!(
                 "candidate include root: {}",
@@ -574,7 +591,7 @@ fn applying_candidates_normalizes_dot_components_and_preserves_the_requested_spe
             "SELECT f.path FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id JOIN functions callee ON callee.id=e.callee_fn_id JOIN files f ON f.id=callee.file_id WHERE caller.name='entry' AND callee.name='chosen' AND callee.is_defined=1",
             [], |row| row.get(0),
         ).unwrap();
-        assert!(path.ends_with("sdk/vendor/api.h"), "{path}");
+        assert!(Path::new(&path).ends_with("sdk/vendor/api.h"), "{path}");
     }
 }
 
@@ -775,7 +792,8 @@ fn local_input_guard_stops_before_any_further_candidate_retry() {
             stderr.contains("external analysis input cannot be verified"),
             "{stderr}"
         );
-        assert!(stderr.contains(external.to_str().unwrap()), "{stderr}");
+        let reported = trace_ir::canonicalize(&external);
+        assert!(stderr.contains(reported.to_str().unwrap()), "{stderr}");
         assert!(!output.exists());
     }
 }

@@ -749,8 +749,13 @@ mod tests {
         start_file_probe_epoch();
         release_thread_path_caches();
         let missing = dir.path().join("missing");
-        let escaping = missing.join("../a.h");
-        assert!(!escaping.is_file(), "{}", escaping.display());
+        // Windows resolves `..` lexically even when `missing` is absent,
+        // unlike POSIX; `is_file_in` keeps the kernel-walk answer everywhere.
+        #[cfg(not(windows))]
+        {
+            let escaping = missing.join("../a.h");
+            assert!(!escaping.is_file(), "{}", escaping.display());
+        }
         assert!(!is_file_in(&missing, Path::new("../a.h")));
         // Under a search directory that exists, the same spelling is found.
         let present = dir.path().join("present");

@@ -1095,7 +1095,7 @@ mod tests {
     #[test]
     fn spilled_source_preserves_origins_and_metadata_without_reprocessing() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = trace_ir::canonicalize(dir.path());
         let path = root.join("main.cpp");
         let header = root.join("header.h");
         std::fs::write(&header, "#define VALUE 7\nvoid header_fn();\n").unwrap();

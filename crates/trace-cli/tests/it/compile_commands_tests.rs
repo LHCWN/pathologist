@@ -76,7 +76,7 @@ void entry(void) { system_header(); }
         assert_eq!(warnings, 1, "{mode}");
         let dependency: i64 = conn
             .query_row(
-                "SELECT count(*) FROM files WHERE path LIKE '%/probe.h' AND is_dep=1",
+                "SELECT count(*) FROM files WHERE replace(path, char(92), '/') LIKE '%/probe.h' AND is_dep=1",
                 [],
                 |row| row.get(0),
             )
@@ -666,7 +666,7 @@ fn partial_database_fallback_uses_compiler_system_headers() {
     assert_eq!(missing, 0, "fallback TU lost compiler default headers");
     let found: i64 = conn
         .query_row(
-            "SELECT count(*) FROM files WHERE path LIKE '%/stddef.h' AND is_dep=1",
+            "SELECT count(*) FROM files WHERE replace(path, char(92), '/') LIKE '%/stddef.h' AND is_dep=1",
             [],
             |row| row.get(0),
         )
@@ -1466,7 +1466,7 @@ fn a_command_string_keeps_backslashes_that_are_not_shell_escapes() {
     // define is a genuine shell escape and must still be honoured.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    std::fs::create_dir(root.join("in\\c")).unwrap();
+    std::fs::create_dir_all(root.join("in\\c")).unwrap();
     std::fs::write(root.join("in\\c/dep.h"), "#define DEP_OK 1\n").unwrap();
     std::fs::write(
         root.join("main.c"),

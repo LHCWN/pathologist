@@ -335,7 +335,7 @@ pub fn find_functions_at(
     let sql = format!(
         "SELECT f.id, f.name, p.path, f.line_start, f.line_end, f.is_defined \
          FROM functions f JOIN files p ON p.id = f.file_id \
-         WHERE p.path LIKE ?1 ESCAPE '!' AND {} AND f.line_start <= ?2 AND f.line_end >= ?2",
+         WHERE replace(p.path, char(92), '/') LIKE ?1 ESCAPE '!' AND {} AND f.line_start <= ?2 AND f.line_end >= ?2",
         has_source_location_sql("f")
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -638,10 +638,10 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
         // A synthesized external's stored file is an arbitrary call site, so
         // it must not match a `--file` filter as if it were the callee's own.
         sql.push_str(&format!(
-            " AND (csf.path LIKE ?{n} ESCAPE '!' OR \
-             cse.path LIKE ?{n} ESCAPE '!' OR \
-             ({} AND callee_f.path LIKE ?{n} ESCAPE '!') OR \
-             (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))",
+            " AND (replace(csf.path, char(92), '/') LIKE ?{n} ESCAPE '!' OR \
+             replace(cse.path, char(92), '/') LIKE ?{n} ESCAPE '!' OR \
+             ({} AND replace(callee_f.path, char(92), '/') LIKE ?{n} ESCAPE '!') OR \
+             (ce.call_site_id IS NULL AND replace(caller_f.path, char(92), '/') LIKE ?{n} ESCAPE '!'))",
             has_source_location_sql("callee")
         ));
     }
@@ -697,7 +697,22 @@ fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str,
 /// A `LIKE ... ESCAPE '!'` pattern matching text that contains `s`
 /// literally: a path filter is a substring, not a pattern.
 pub(crate) fn contains_pattern(s: &str) -> String {
-    format!("%{}%", like_escape(s))
+    // A database may have been produced on another platform, so path columns
+    // are compared through `replace(column, char(92), '/')` against a filter
+    // normalized the same way rather than against the host separator. An
+    // absolute existing spelling is canonicalized too: Windows can spell the
+    // same temporary directory with an 8.3 short name, while the database
+    // holds the long path.
+    let path = std::path::Path::new(s);
+    let normalized = if path.is_absolute() && path.exists() {
+        trace_ir::canonicalize(path)
+    } else {
+        path.to_path_buf()
+    };
+    format!(
+        "%{}%",
+        like_escape(&normalized.to_string_lossy().replace('\\', "/"))
+    )
 }
 
 fn like_escape(s: &str) -> String {
@@ -1247,7 +1262,7 @@ pub fn find_symbols_at(
          FROM variables v \
          JOIN files p ON p.id = v.file_id \
          LEFT JOIN functions f ON f.id = v.fn_id \
-         WHERE p.path LIKE ?1 ESCAPE '!' AND v.line BETWEEN ?2 - 2 AND ?2 + 2 \
+         WHERE replace(p.path, char(92), '/') LIKE ?1 ESCAPE '!' AND v.line BETWEEN ?2 - 2 AND ?2 + 2 \
            AND v.is_synthetic = 0",
     )?;
     let pattern = contains_pattern(file_substring);
@@ -1609,7 +1624,7 @@ fn nearest_functions(
     let mut stmt = conn.prepare(
         "SELECT f.id, f.name, p.path, f.line_start, f.line_end, f.is_defined \
          FROM functions f JOIN files p ON p.id = f.file_id \
-         WHERE p.path LIKE ?1 ESCAPE '!' AND f.is_defined != 0 \
+         WHERE replace(p.path, char(92), '/') LIKE ?1 ESCAPE '!' AND f.is_defined != 0 \
          ORDER BY min(abs(f.line_start - ?2), abs(f.line_end - ?2)), f.line_start LIMIT ?3",
     )?;
     let rows = stmt.query_map(rusqlite::params![pattern, line, limit as i64], |row| {
@@ -1654,7 +1669,7 @@ pub fn find_functions_by_name(
         // is an arbitrary call-site fallback), so file filters must not match
         // it — otherwise which file "contains" it depends on FileId ordering.
         sql.push_str(&format!(
-            " AND {} AND p.path LIKE ?{idx} ESCAPE '!'",
+            " AND {} AND replace(p.path, char(92), '/') LIKE ?{idx} ESCAPE '!'",
             has_source_location_sql("f")
         ));
     }
