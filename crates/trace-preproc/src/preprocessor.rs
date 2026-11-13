@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 
+mod consumer_context;
+pub use consumer_context::ConsumerContext;
+
 /// Nested macro-expansion cap (C11 hide-set is the primary recursion brake;
 /// this is a backstop for pathological `##` / hide-set edge cases).
 const MAX_MACRO_EXPANSION_DEPTH: u32 = 256;
@@ -28,6 +31,11 @@ pub enum PreprocessError {
 
 #[derive(Debug, Clone)]
 pub struct PreprocessResult {
+    /// False if a preprocessing resource limit truncated this result.
+    pub complete: bool,
+    /// Executed directives, excluding initial predefined/command macros.
+    /// Empty unless `PreprocessOptions::record_macro_ops` is enabled.
+    pub macro_ops: Arc<[MacroOp]>,
     pub output: String,
     pub line_map: LineMap,
     pub diagnostics: Vec<crate::SharedDiagnostic>,
@@ -153,8 +161,11 @@ struct PreprocessorState {
     /// An inline implementation fragment's separately cached system bundle.
     system_owners: FxHashMap<PathBuf, PathBuf>,
     system_signatures: FxHashMap<PathBuf, u64>,
-    project_preamble: bool,
     system_roots: Vec<PathBuf>,
+    /// Compiler-default roots whose standard headers may be shared after a
+    /// project preamble; explicit system roots are not listed here.
+    standard_system_roots: Vec<PathBuf>,
+    project_preamble: bool,
     current_file_is_project: bool,
     line_map: LineMap,
     diagnostics: Vec<crate::SharedDiagnostic>,
@@ -234,6 +245,7 @@ struct PreprocessorState {
     /// Under `defer_expansion_publish`, where this run's cache reads and
     /// writes go.
     journal: Option<crate::ExpansionJournal>,
+    canonical_prelude_applied: bool,
 }
 
 /// One level of `#if`/`#elif`/`#else` nesting. A per-level bool is not
@@ -269,9 +281,17 @@ struct OutputScope {
     extern_pending: bool,
     linkage_pending: bool,
     root_block: bool,
+    /// One bit per delimiter, marking proven class bodies. Member imports
+    /// are carried by class IR rather than changing the includer's lookup.
+    class_scopes: u64,
+    class_pending: Option<u32>,
+    /// Delimiters already open when this file began. A member fragment
+    /// included inside someone else's class has no standalone class IR.
+    member_base: u32,
     // A using-declaration changes consumer lookup; an alias is already in IR.
-    using_declaration: Option<(u32, bool)>,
+    using_declaration: Option<(u32, bool, bool)>,
     context_effects: u64,
+    weak_effects: u64,
 }
 
 impl Default for OutputScope {
@@ -286,8 +306,12 @@ impl Default for OutputScope {
             extern_pending: false,
             linkage_pending: false,
             root_block: false,
+            class_scopes: 0,
+            class_pending: None,
+            member_base: 0,
             using_declaration: None,
             context_effects: 0,
+            weak_effects: 0,
         }
     }
 }
@@ -302,17 +326,36 @@ impl OutputScope {
             return;
         }
         if matches!(kind, TokenKind::Identifier(name) if name == "using") {
-            self.using_declaration = Some((self.depth, true));
+            let local_depth = self.depth.saturating_sub(self.member_base);
+            let local_mask = if local_depth == 64 {
+                u64::MAX
+            } else {
+                (1u64 << local_depth) - 1
+            };
+            self.using_declaration = Some((
+                self.depth,
+                true,
+                self.valid && self.class_scopes & local_mask != 0,
+            ));
         }
-        if let (Some((depth, alias_possible)), TokenKind::Punct(punct)) =
+        if let TokenKind::Identifier(name) = kind {
+            match name.as_str() {
+                "class" | "struct" | "union" => self.class_pending = Some(self.depth),
+                "namespace" | "extern" => self.class_pending = None,
+                _ => {}
+            }
+        }
+        if let (Some((depth, alias_possible, member)), TokenKind::Punct(punct)) =
             (self.using_declaration, kind)
         {
             if self.depth == depth {
                 match *punct {
-                    "::" => self.using_declaration = Some((depth, false)),
+                    "::" => self.using_declaration = Some((depth, false, member)),
                     "=" if alias_possible => self.using_declaration = None,
                     ";" => {
-                        self.context_effects += 1;
+                        if !member {
+                            self.context_effects += 1;
+                        }
                         self.using_declaration = None;
                     }
                     _ => {}
@@ -341,6 +384,12 @@ impl OutputScope {
         if !self.valid {
             return;
         }
+        // An elaborated type or a template parameter is not evidence that
+        // the next brace opens a class. Ambiguous template bases stay on the
+        // conservative path; a subsequent real class introducer starts anew.
+        if matches!(punct, ";" | "=" | "," | ">" | ">>") && self.class_pending == Some(self.depth) {
+            self.class_pending = None;
+        }
         match punct {
             "{" | "<%" | "(" | "[" | "<:" => {
                 if self.depth == 0 && matches!(punct, "{" | "<%") {
@@ -356,6 +405,11 @@ impl OutputScope {
                     "(" => 2,
                     _ => 3,
                 };
+                let class = code == 1 && self.class_pending == Some(self.depth);
+                self.class_scopes = (self.class_scopes << 1) | u64::from(class);
+                if class {
+                    self.class_pending = None;
+                }
                 self.stack = (self.stack << 2) | code;
                 self.depth += 1;
             }
@@ -370,7 +424,11 @@ impl OutputScope {
                     return;
                 }
                 self.stack >>= 2;
+                self.class_scopes >>= 1;
                 self.depth -= 1;
+                if self.class_pending.is_some_and(|depth| depth > self.depth) {
+                    self.class_pending = None;
+                }
             }
             _ => {}
         }
@@ -391,6 +449,8 @@ enum Placed {
     /// Not in the includer's output: the file was skipped or replayed, or
     /// its expansion is stored as a variant of its own.
     Apart,
+    /// A cache hit already emitted its file-local consumer lookup syntax.
+    Replayed,
     /// In the includer's output: the file was expanded here and the
     /// expansion could not be stored (its variant list is full, or its
     /// fingerprint serves no consumer), so no unit of its own holds it.
@@ -400,6 +460,8 @@ enum Placed {
 /// One cached header being constructed.
 #[derive(Debug)]
 struct CacheFrame {
+    provides_canonical_prelude: bool,
+    has_static_data: bool,
     cpp_standard: u32,
     /// Guard-skipped includes at the live-output offset of the `#include`.
     skips: Vec<(usize, PathBuf)>,
@@ -452,7 +514,16 @@ impl PreprocessorState {
         let system_roots = if opts.separate_system_headers {
             opts.system_include_paths
                 .iter()
+                .chain(&opts.compiler_system_include_paths)
                 .chain(&opts.after_include_paths)
+                .map(|root| trace_ir::canonicalize(root))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let standard_system_roots = if opts.separate_system_headers {
+            opts.compiler_system_include_paths
+                .iter()
                 .map(|root| trace_ir::canonicalize(root))
                 .collect()
         } else {
@@ -485,8 +556,9 @@ impl PreprocessorState {
             output_scope: OutputScope::default(),
             system_owners: FxHashMap::default(),
             system_signatures: FxHashMap::default(),
-            project_preamble: false,
             system_roots,
+            standard_system_roots,
+            project_preamble: false,
             current_file_is_project,
             line_map: LineMap::new(),
             diagnostics: Vec::new(),
@@ -512,6 +584,7 @@ impl PreprocessorState {
             shared_directory_results,
             forced_include_depth: 0,
             journal: None,
+            canonical_prelude_applied: false,
         };
         let file = std::mem::take(&mut state.current_file);
         state.set_current_file(file);
@@ -519,10 +592,18 @@ impl PreprocessorState {
             && !state.opts.frozen_expansion_cache
             && state.opts.include_expansion_cache.is_some()
         {
-            state.journal = Some(crate::ExpansionJournal::new(
-                state.opts.max_expansion_variants,
-                language,
-            ));
+            let base_cap = if state.opts.canonical_system_headers {
+                1
+            } else {
+                state.opts.max_expansion_variants
+            };
+            state.journal = Some(
+                crate::ExpansionJournal::new(base_cap, language).with_project_cap(
+                    state.opts.separate_header_paths.clone(),
+                    state.opts.max_expansion_variants,
+                    state.standard_system_roots.clone().into(),
+                ),
+            );
         }
         let warm = state.opts.shared_macros.is_some();
         if let Some(shared) = &state.opts.shared_macros {
@@ -609,6 +690,7 @@ impl PreprocessorState {
             .unwrap_or(201703);
         // Seeding the environment is the constructor's job; a caller that
         // forgot this step would silently drop every `-include`.
+        state.macro_ops.clear();
         state.process_forced_includes();
         state
     }
@@ -655,6 +737,7 @@ impl PreprocessorState {
 
     fn env(&mut self) -> MacroEnv<'_> {
         MacroEnv {
+            canonical_prelude: self.canonical_prelude_applied,
             macros: &self.macros,
             headers: &self.system_signatures,
             fallbacks: &self.fallback_macros,
@@ -887,7 +970,7 @@ impl PreprocessorState {
     }
 
     fn insert_macro_arc(&mut self, name: Arc<str>, def: Arc<MacroDef>) {
-        if !self.cache_frames.is_empty() {
+        if self.opts.record_macro_ops || !self.cache_frames.is_empty() {
             self.macro_ops
                 .push(MacroOp::Define(Arc::clone(&name), Arc::clone(&def)));
         }
@@ -897,7 +980,7 @@ impl PreprocessorState {
     fn insert_macro(&mut self, name: impl Into<Arc<str>>, def: MacroDef) {
         let name_arc: Arc<str> = name.into();
         let def_arc = Arc::new(def);
-        if !self.cache_frames.is_empty() {
+        if self.opts.record_macro_ops || !self.cache_frames.is_empty() {
             self.macro_ops
                 .push(MacroOp::Define(Arc::clone(&name_arc), Arc::clone(&def_arc)));
         }
@@ -922,14 +1005,14 @@ impl PreprocessorState {
     }
 
     fn remove_macro_arc(&mut self, name: &Arc<str>) {
-        if !self.cache_frames.is_empty() {
+        if self.opts.record_macro_ops || !self.cache_frames.is_empty() {
             self.macro_ops.push(MacroOp::Undef(Arc::clone(name)));
         }
         self.remove_macro_internal(name.as_ref());
     }
 
     fn remove_macro(&mut self, name: &str) {
-        if !self.cache_frames.is_empty() {
+        if self.opts.record_macro_ops || !self.cache_frames.is_empty() {
             let name_arc: Arc<str> = Arc::from(name);
             self.macro_ops.push(MacroOp::Undef(name_arc));
         }
@@ -1549,6 +1632,14 @@ impl PreprocessorState {
         let Some((at, entry)) = self.matching_variant(canonical) else {
             return false;
         };
+        if entry.provides_canonical_prelude {
+            self.install_canonical_prelude(false);
+        }
+        if entry.has_static_data {
+            for frame in &mut self.cache_frames {
+                frame.has_static_data = true;
+            }
+        }
         self.note_project_preamble(canonical, &entry);
         self.note_system_ownership(canonical, &entry.inlined);
         self.entry_used
@@ -1643,6 +1734,9 @@ impl PreprocessorState {
             self.provide_system_header(canonical, entry.declaration_signature);
             self.included_files.insert(canonical.to_path_buf());
             self.included_files.extend(entry.files.iter().cloned());
+            if let Some(context) = &entry.consumer_context {
+                self.splice_consumer_context(context);
+            }
             return true;
         }
         if self.output.len().saturating_add(entry.text.len()) > self.opts.max_output_bytes {
@@ -1687,13 +1781,63 @@ impl PreprocessorState {
     /// table under `accumulate_macros`, and the op log feeding an enclosing
     /// cached header's own entry.
     fn replay_macro_delta(&mut self, entry: &crate::IncludeExpansion) {
-        for op in entry.ops.iter() {
+        self.replay_macro_ops(&entry.ops);
+    }
+
+    fn splice_consumer_context(&mut self, context: &ConsumerContext) {
+        if self.output.len().saturating_add(context.text.len()) > self.opts.max_output_bytes {
+            self.limit_warn(1, "skipping cached consumer context (output cap)");
+            return;
+        }
+        for token in Lexer::new(&context.text, self.language).tokenize() {
+            self.output_scope.token(&token.kind);
+        }
+        let at = self.output.len();
+        self.output.push_str(&context.text);
+        if self.opts.track_line_map {
+            let remap: Vec<_> = context
+                .line_map
+                .files
+                .iter()
+                .map(|p| self.lm_intern(p))
+                .collect();
+            self.line_map.splice(&context.line_map, at, &remap);
+        }
+    }
+
+    fn replay_macro_ops(&mut self, ops: &[MacroOp]) {
+        for op in ops {
             match op {
                 MacroOp::Undef(name) => self.remove_macro_arc(name),
                 MacroOp::Define(name, def) => {
                     self.insert_macro_arc(Arc::clone(name), Arc::clone(def))
                 }
             }
+        }
+    }
+
+    fn install_canonical_prelude(&mut self, replay_ops: bool) {
+        if self.canonical_prelude_applied {
+            return;
+        }
+        let Some(prelude) = self
+            .opts
+            .canonical_system_preludes
+            .as_ref()
+            .and_then(|by_language| by_language.get(&self.language))
+            .cloned()
+        else {
+            return;
+        };
+        self.canonical_prelude_applied = true;
+        if let Some(journal) = self.journal.as_mut() {
+            journal.record_canonical_prelude();
+        }
+        for frame in &mut self.cache_frames {
+            frame.provides_canonical_prelude = true;
+        }
+        if replay_ops {
+            self.replay_macro_ops(&prelude.ops);
         }
     }
 
@@ -1721,7 +1865,24 @@ impl PreprocessorState {
             return None;
         }
         let cache = self.opts.include_expansion_cache.as_ref()?;
+        let canonical_header = self.canonical_system(&canonical);
         let key = (canonical, self.language);
+        if canonical_header {
+            if let Some(journal) = self.journal.as_mut() {
+                if let Some(handle) =
+                    journal.publish(key, cache, &self.opts.expansion_journals_ahead, entry)
+                {
+                    return Some(handle);
+                }
+                return Some(0);
+            }
+            let mut guard = cache.write().ok()?;
+            let variants = guard.entry(key).or_default();
+            if variants.is_empty() {
+                variants.push(entry);
+            }
+            return Some(0);
+        }
         if let Some(journal) = self.journal.as_mut() {
             return journal.publish(key, cache, &self.opts.expansion_journals_ahead, entry);
         }
@@ -1748,7 +1909,22 @@ impl PreprocessorState {
     fn matching_variant(&mut self, canonical: &Path) -> Option<(usize, crate::IncludeExpansion)> {
         let key = (canonical.to_path_buf(), self.language);
         let cache = self.opts.include_expansion_cache.as_ref()?;
+        if self.canonical_system(canonical) {
+            let primed = self.canonical_prelude_applied;
+            let matches = |deps: &crate::MacroFingerprint| {
+                deps.canonical_prelude.is_none_or(|was| was == primed)
+            };
+            if let Some(journal) = self.journal.as_mut() {
+                let ahead = &self.opts.expansion_journals_ahead;
+                return journal.lookup(&key, cache, ahead, matches);
+            }
+            let guard = cache.read().ok()?;
+            let variants = guard.get(&key)?;
+            let at = variants.iter().position(|entry| matches(&entry.deps))?;
+            return Some((at, variants[at].clone()));
+        }
         let mut env = MacroEnv {
+            canonical_prelude: self.canonical_prelude_applied,
             macros: &self.macros,
             headers: &self.system_signatures,
             fallbacks: &self.fallback_macros,
@@ -1775,13 +1951,16 @@ impl PreprocessorState {
                     || e.eq_ignore_ascii_case("h")
             });
         if ordinary {
-            return true;
+            // Even a standalone-warmed fragment must be lowered inside the
+            // includer's class. Its member imports have no standalone owner.
+            return !self.opts.separate_system_headers || self.output_scope.at_boundary();
         }
+        let canonical = self.canonical_system(path);
         if !self.opts.separate_system_headers
             || self.opts.record_conditionals
             || self.opts.inline_include_bodies
-            || !self.current_file_is_project
-            || self.system_signatures.contains_key(path)
+            || (!canonical && !self.current_file_is_project)
+            || (!canonical && self.system_signatures.contains_key(path))
             || self
                 .opts
                 .separate_header_paths
@@ -1791,21 +1970,53 @@ impl PreprocessorState {
         {
             return false;
         }
+        let standard = canonical || self.is_standard_system_path(path);
         let reason = if !self.output_scope.at_boundary() {
+            // A separate declaration unit cannot start inside a scope or an
+            // unfinished declaration.
             Some(crate::options::SystemBundleRefusal::NotAtBoundary)
-        } else if self.project_preamble {
+        } else if canonical {
+            None
+        } else if !standard && self.project_preamble {
             Some(crate::options::SystemBundleRefusal::ProjectPreamble)
-        } else if self.output_scope.declarations {
+        } else if !standard && self.output_scope.declarations {
             Some(crate::options::SystemBundleRefusal::Declarations)
         } else {
             None
         };
         if let Some(reason) = reason {
             self.refuse_system_bundle(reason);
-            false
-        } else {
-            true
+            return false;
         }
+        // Compiler-default standard headers are shareable even after project
+        // declarations: they are written against reserved names, and macro
+        // dependence is still captured by the expansion fingerprint. Explicit
+        // `-isystem` roots keep the declaration/preamble gate because a
+        // project can interpose its own aliases there. Completion still
+        // refuses project text inside any bundle and context effects.
+        true
+    }
+
+    fn is_standard_system_path(&self, path: &Path) -> bool {
+        self.standard_system_roots
+            .iter()
+            .any(|root| path.starts_with(root))
+    }
+
+    /// In canonical mode compiler-default system headers share one expansion,
+    /// including nested headers and headers reached after project code.
+    fn canonical_system(&self, path: &Path) -> bool {
+        self.opts.canonical_system_headers
+            && self.opts.separate_system_headers
+            && self
+                .opts
+                .separate_header_paths
+                .as_ref()
+                .is_none_or(|paths| !paths.contains(path))
+            && self
+                .standard_system_roots
+                .iter()
+                .any(|root| path.starts_with(root))
     }
 
     fn refuse_system_bundle(&self, reason: crate::options::SystemBundleRefusal) {
@@ -1901,6 +2112,29 @@ impl PreprocessorState {
         if let Some(boundary) = &self.opts.input_boundary {
             boundary.record(&canonical);
         }
+        if !self.canonical_prelude_applied
+            && self.canonical_system(&canonical)
+            && self.output_scope.at_boundary()
+            && self
+                .opts
+                .canonical_system_preludes
+                .as_ref()
+                .is_some_and(|by_language| by_language.contains_key(&self.language))
+        {
+            self.install_canonical_prelude(true);
+        }
+        if self.canonical_prelude_applied
+            && self.output_scope.at_boundary()
+            && self
+                .opts
+                .canonical_system_preludes
+                .as_ref()
+                .and_then(|p| p.get(&self.language))
+                .is_some_and(|p| p.files.contains(&canonical))
+        {
+            self.included_files.insert(canonical);
+            return Ok(Placed::Apart);
+        }
         // A repeated `#include` is skipped only on a reason the file itself
         // stated — its `#pragma once`, or its include guard while that guard
         // is defined. Membership in `included_files` is not one: suppressing
@@ -1909,6 +2143,15 @@ impl PreprocessorState {
         if self.guard_suppresses(&canonical) {
             let owner = self.system_owners.get(&canonical).cloned();
             let owner = owner.as_ref().unwrap_or(&canonical);
+            if self
+                .entry_used
+                .get(owner)
+                .is_some_and(|entry| entry.has_static_data)
+            {
+                for frame in &mut self.cache_frames {
+                    frame.has_static_data = true;
+                }
+            }
             // Re-splicing the cached subtree into *live* output exponentiates
             // on diamond include graphs (each skip copies a self-contained
             // blob that already contains previous copies). Record the skip on
@@ -2049,7 +2292,7 @@ impl PreprocessorState {
         let is_root = self.include_stack.len() == 1 && self.forced_include_depth == 0;
         let cacheable = cacheable.unwrap_or_else(|| self.is_cacheable_header(&canonical));
         if !is_root && cacheable && self.splice_cached(&canonical) {
-            return Ok(Placed::Apart);
+            return Ok(Placed::Replayed);
         }
 
         if !is_root {
@@ -2084,6 +2327,8 @@ impl PreprocessorState {
         self.included_files.insert(canonical.clone());
         let output_start = self.output.len();
         let context_start = self.output_scope.context_effects;
+        let weak_start = self.output_scope.weak_effects;
+        let context_boundary = self.output_scope.at_boundary();
         let pushing_frame = cache_header && !self.opts.frozen_expansion_cache;
 
         let content: Arc<str> = if let Some(cache) = &self.opts.source_cache {
@@ -2116,6 +2361,9 @@ impl PreprocessorState {
             // that complete input context, including its absence, and import
             // the units supplying it when this expansion is lowered.
             let mut deps = crate::MacroFingerprint::default();
+            if self.opts.canonical_system_preludes.is_some() {
+                deps.canonical_prelude = Some(self.canonical_prelude_applied);
+            }
             let mut replayed = Vec::new();
             if system_bundle {
                 deps.header_context_size = Some(self.system_signatures.len());
@@ -2132,6 +2380,8 @@ impl PreprocessorState {
                 replayed.sort();
             }
             self.cache_frames.push(CacheFrame {
+                provides_canonical_prelude: false,
+                has_static_data: false,
                 cpp_standard: self.cpp_standard,
                 skips: Vec::new(),
                 replayed,
@@ -2168,6 +2418,9 @@ impl PreprocessorState {
             uncached_tokens = Lexer::new(&content, self.language).tokenize();
             &uncached_tokens
         };
+        let member_base = self.output_scope.member_base;
+        self.output_scope.member_base = self.output_scope.depth;
+        self.output_scope.class_pending = None;
         if let Err(e) = self.process_file_tokens(tokens) {
             // Attribute the stop to the file being processed when it failed,
             // not the including TU — downstream consumers key fallback and
@@ -2177,6 +2430,7 @@ impl PreprocessorState {
                 format!("preprocess stopped in {}: {e}", self.current_file.display()),
             );
         }
+        self.output_scope.member_base = member_base;
 
         self.include_stack.pop();
         self.set_current_file(prev_file);
@@ -2248,9 +2502,51 @@ impl PreprocessorState {
             // These effects live in the consumer's lowering context, not in
             // declaration IR. Keep nested project entries inline too, so an
             // enclosing system bundle cannot hide an import or weak pragma.
-            let context_sensitive = self.opts.separate_system_headers
-                && self.output_scope.context_effects != context_start;
-            let refusal = if frame.uncovered {
+            let canonical_bundle = self.canonical_system(&canonical);
+            let header_context = (self.opts.canonical_system_headers
+                && !system_bundle
+                && self.language == Language::Cpp
+                && (self.output_scope.context_effects != context_start
+                    || self.output[output_start..].contains("static")))
+            .then(|| {
+                consumer_context::scan(
+                    &self.output[output_start..],
+                    &self.line_map.slice_from(output_start),
+                )
+            });
+            frame.has_static_data |= header_context
+                .as_ref()
+                .is_some_and(|context| context.static_data);
+            if frame.has_static_data {
+                for parent in &mut self.cache_frames {
+                    parent.has_static_data = true;
+                }
+            }
+            let mut context_sensitive = self.opts.separate_system_headers
+                && self.output_scope.context_effects != context_start
+                && !canonical_bundle;
+            let consumer_context = if context_sensitive
+                && self.opts.canonical_system_headers
+                && !system_bundle
+                && !frame.has_static_data
+                && self.language == Language::Cpp
+                && context_boundary
+                && self.output_scope.weak_effects == weak_start
+                && self.output_scope.at_boundary()
+            {
+                header_context
+                    .and_then(|context| context.context)
+                    .map(Arc::new)
+            } else {
+                None
+            };
+            context_sensitive &= consumer_context.is_none();
+            // Only explicit `-isystem` roots keep the project-preamble gate;
+            // compiler-default standard headers may follow project code.
+            let conservative_preamble = !canonical_bundle
+                && !self.is_standard_system_path(&canonical)
+                && self.project_preamble;
+            let refusal = if frame.uncovered && !canonical_bundle {
                 Some(crate::options::SystemBundleRefusal::Uncovered)
             } else if self.expansion_incomplete {
                 Some(crate::options::SystemBundleRefusal::Incomplete)
@@ -2258,7 +2554,7 @@ impl PreprocessorState {
                 Some(crate::options::SystemBundleRefusal::ContextSensitive)
             } else if !self.output_scope.at_boundary() {
                 Some(crate::options::SystemBundleRefusal::NotAtBoundary)
-            } else if self.project_preamble || project_content {
+            } else if project_content || conservative_preamble {
                 Some(crate::options::SystemBundleRefusal::ProjectPreamble)
             } else {
                 None
@@ -2266,12 +2562,12 @@ impl PreprocessorState {
             if let Some(reason) = refusal.filter(|_| system_bundle) {
                 self.refuse_system_bundle(reason);
             }
-            if frame.uncovered
+            if (frame.uncovered && !canonical_bundle)
                 || context_sensitive
                 || (system_bundle
                     && (!self.output_scope.at_boundary()
-                        || self.project_preamble
-                        || project_content))
+                        || project_content
+                        || conservative_preamble))
             {
                 records = frame.replayed.into();
             } else if !self.expansion_incomplete && self.opts.include_expansion_cache.is_some() {
@@ -2358,6 +2654,9 @@ impl PreprocessorState {
                         0
                     };
                     let entry = crate::IncludeExpansion {
+                        consumer_context,
+                        provides_canonical_prelude: frame.provides_canonical_prelude,
+                        has_static_data: frame.has_static_data,
                         text: composed.into(),
                         declaration_signature,
                         cpp_standard: frame.cpp_standard,
@@ -2415,7 +2714,7 @@ impl PreprocessorState {
             }
             // The log only feeds open frames; once the outermost cached
             // header closes, nothing references these entries any more.
-            if self.cache_frames.is_empty() {
+            if self.cache_frames.is_empty() && !self.opts.record_macro_ops {
                 self.macro_ops.clear();
                 self.macro_ops.shrink_to(256);
             }
@@ -2800,6 +3099,7 @@ impl PreprocessorState {
                 self.emit_str("\n", token.line, token.col);
                 self.output_scope = scope;
                 self.output_scope.context_effects += 1;
+                self.output_scope.weak_effects += 1;
             }
             _ => {}
         }
@@ -3088,9 +3388,27 @@ impl PreprocessorState {
             && separate
             && placed == Placed::Apart
         {
+            let context = (self.output.len() > live_at)
+                .then(|| {
+                    self.entry_used
+                        .get(&canonical_include)
+                        .and_then(|entry| entry.consumer_context.clone())
+                })
+                .flatten();
             self.output.truncate(live_at);
             self.output_scope = scope_at;
             self.line_map.truncate_at(live_at);
+            if let Some(context) = context {
+                self.splice_consumer_context(&context);
+            }
+            if let Some(frame) = self.cache_frames.last_mut() {
+                frame.skips.push((live_at, canonical_include));
+            }
+        } else if !self.opts.inline_include_bodies
+            && !self.opts.frozen_expansion_cache
+            && separate
+            && placed == Placed::Replayed
+        {
             if let Some(frame) = self.cache_frames.last_mut() {
                 frame.skips.push((live_at, canonical_include));
             }
@@ -3297,6 +3615,7 @@ impl PreprocessorState {
             let found = quote_dirs
                 .chain(&self.opts.include_paths)
                 .chain(&self.opts.system_include_paths)
+                .chain(&self.opts.compiler_system_include_paths)
                 .chain(&self.opts.after_include_paths)
                 .find(|inc| self.include_exists_in(inc, path))
                 .map(|inc| inc.join(path))
@@ -3780,6 +4099,12 @@ impl PreprocessorState {
             journal.finish(self.macros, self.fallback_macros);
         }
         PreprocessResult {
+            complete: !self.expansion_incomplete,
+            macro_ops: if self.opts.record_macro_ops {
+                self.macro_ops.into()
+            } else {
+                Arc::default()
+            },
             output: self.output,
             line_map: self.line_map,
             diagnostics: self.diagnostics,
@@ -5537,6 +5862,7 @@ fn defined_operand(toks: &[Token], i: usize) -> (Option<&str>, usize) {
 /// A run's macro table, for reading bindings and testing fingerprints
 /// against it, with the run's memo of binding hashes.
 struct MacroEnv<'a> {
+    canonical_prelude: bool,
     macros: &'a MacroTable,
     headers: &'a FxHashMap<PathBuf, u64>,
     fallbacks: &'a FxHashSet<String>,
@@ -5562,6 +5888,7 @@ impl MacroEnv<'_> {
     fn satisfies(&mut self, deps: &crate::MacroFingerprint) -> bool {
         let macros = self.macros;
         let headers = self.headers;
+        let canonical_prelude = self.canonical_prelude;
         deps.satisfied_by(
             |name| self.binding_hash(name),
             // Whichever side is smaller: an entry can depend on thousands of
@@ -5578,6 +5905,7 @@ impl MacroEnv<'_> {
             },
             |path| headers.get(path).copied(),
             || headers.len(),
+            || canonical_prelude,
         )
     }
 }
@@ -6473,7 +6801,9 @@ mod tests {
             trace_ir::canonicalize(&own),
         ]));
         for (text, cap, expected) in [
+            // An explicit `-isystem` root keeps the declaration gate.
             ("int value;\n#include <api>\n", 8, [1, 0, 0, 0]),
+            // ... and the project-preamble gate.
             ("#include \"own.h\"\n#include <api>\n", 8, [0, 1, 0, 0]),
             ("namespace N {\n#include <api>\n}\n", 8, [0, 0, 1, 0]),
             ("#include <api>\n", 0, [0, 0, 0, 1]),
@@ -6501,6 +6831,343 @@ mod tests {
                 expected,
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn project_lookup_projection_replays_at_the_include_with_original_locations() {
+        let fixture = trace_ir::canonicalize(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/preproc/lookup_context"),
+        );
+        let root = fixture.join("project");
+        let source = root.join("main.cpp");
+        let imports = root.join("imports.h");
+        let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.track_line_map = true;
+        opts.separate_system_headers = true;
+        opts.canonical_system_headers = true;
+        opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter([
+            source.clone(),
+            imports.clone(),
+            root.join("decls.h"),
+        ])));
+        for frozen in [false, false, true] {
+            opts.frozen_expansion_cache = frozen;
+            let result = preprocess_file(&source, &opts).unwrap();
+            assert!(!result.output.contains("struct Obj"));
+            assert!(!result.output.contains("HeaderRun"));
+            let before = result.output.find("Before").unwrap();
+            let context = result.output.find("using ").unwrap();
+            let after = result.output.find("After").unwrap();
+            assert!(before < context && context < after, "{}", result.output);
+            let at = result.output.find("GoodSDK").unwrap();
+            let span = result.line_map.lookup(at).unwrap();
+            assert_eq!(result.line_map.path_of(span), source.as_path());
+            assert_eq!(span.line, 5);
+            let stored = cache.read().unwrap();
+            let entry = &stored[&(imports.clone(), Language::Cpp)][0];
+            assert!(entry.consumer_context.is_some());
+            assert!(entry.text.contains("HeaderRun"));
+        }
+    }
+
+    #[test]
+    fn canonical_mode_keeps_explicit_system_headers_configuration_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.cpp");
+        let system = dir.path().join("system");
+        std::fs::create_dir(&system).unwrap();
+        std::fs::write(&source, "#include <api>\n").unwrap();
+        std::fs::write(
+            system.join("api"),
+            "#if MODE\nint One();\n#else\nint Zero();\n#endif\n",
+        )
+        .unwrap();
+        for deferred in [false, true] {
+            let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+            let mut opts = PreprocessOptions::new()
+                .with_language(Language::Cpp)
+                .with_system_include(&system)
+                .with_include_expansion_cache(Arc::clone(&cache))
+                .with_inline_include_bodies(false);
+            opts.separate_system_headers = true;
+            opts.canonical_system_headers = true;
+            opts.defer_expansion_publish = deferred;
+            opts.separate_header_paths =
+                Some(Arc::new(FxHashSet::from_iter([trace_ir::canonicalize(
+                    &source,
+                )])));
+            for mode in ["0", "1"] {
+                opts.defines.insert("MODE".into(), mode.into());
+                let result = preprocess_file(&source, &opts).unwrap();
+                assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+                if let Some(journal) = result.expansion_journal {
+                    let mut records = result.replayed_variants;
+                    assert!(journal.commit(&cache, &mut records));
+                }
+            }
+            let entries = cache.read().unwrap();
+            let variants = &entries[&(trace_ir::canonicalize(&system.join("api")), Language::Cpp)];
+            assert_eq!(variants.len(), 2);
+            assert!(variants[0].text.contains("Zero"));
+            assert!(variants[1].text.contains("One"));
+        }
+    }
+
+    #[test]
+    fn lazy_canonical_macro_closure_survives_project_replay_without_reapplying() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("system");
+        std::fs::create_dir(&system).unwrap();
+        let prime = dir.path().join("prime.cpp");
+        let own = dir.path().join("own.h");
+        let other = dir.path().join("other.h");
+        let source = dir.path().join("main.cpp");
+        let only = dir.path().join("include_only.h");
+        let primed = dir.path().join("primed.cpp");
+        let cold = dir.path().join("cold.cpp");
+        std::fs::write(&only, "#pragma once\n#include <first>\nstruct Marker {};\n").unwrap();
+        std::fs::write(&primed, "#include <first>\n#include \"include_only.h\"\n").unwrap();
+        std::fs::write(
+            &cold,
+            "#include \"include_only.h\"\nint seeded = SECOND_MODE;\n",
+        )
+        .unwrap();
+        std::fs::write(system.join("first"), "#ifndef FIRST_H\n#define FIRST_H\n#define STD_MODE 1\n#undef RESET_ME\nint First();\n#endif\n").unwrap();
+        std::fs::write(
+            system.join("second"),
+            "#pragma once\n#define SECOND_MODE 2\nint Second();\n",
+        )
+        .unwrap();
+        std::fs::write(&prime, "#include <first>\n#include <second>\n").unwrap();
+        // Not included by the primer, and reached later through a macro.
+        std::fs::write(system.join("outer"), "#include <first>\nint Outer();\n").unwrap();
+        std::fs::write(
+            &own,
+            "#pragma once\n#include <first>\nint in_header = SECOND_MODE;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &other,
+            "#pragma once\n#include <first>\nint other_mode = STD_MODE;\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "#ifdef STD_MODE\nint leaked_before_include;\n#endif\n#define RESET_ME 9\n#include \"own.h\"\n#ifdef RESET_ME\n#error missing undef\n#endif\n#undef STD_MODE\n#define STD_MODE 7\n#include \"other.h\"\n#define OUTER_HEADER <outer>\n#include OUTER_HEADER\n#include <first>\nint final_mode = STD_MODE;\n").unwrap();
+        let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_compiler_system_include(&system)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.separate_system_headers = true;
+        opts.canonical_system_headers = true;
+        opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter(
+            [&prime, &own, &other, &source, &only, &primed, &cold]
+                .into_iter()
+                .map(|p| trace_ir::canonicalize(p)),
+        )));
+        opts.defines.insert("SEED_ONLY".into(), "123".into());
+        opts.record_macro_ops = true;
+        let prepared = preprocess_file(&prime, &opts).unwrap();
+        assert!(!prepared.macro_ops.iter().any(|op| matches!(op,
+            MacroOp::Define(name, _) | MacroOp::Undef(name) if &**name == "SEED_ONLY")));
+        let prelude = Arc::new(crate::CanonicalSystemPrelude::new(
+            prepared.macro_ops,
+            prepared
+                .included_headers
+                .into_iter()
+                .filter(|p| p != &prime)
+                .collect(),
+        ));
+        opts.record_macro_ops = false;
+        opts.canonical_system_preludes =
+            Some(Arc::new(FxHashMap::from_iter([(Language::Cpp, prelude)])));
+        preprocess_file(&primed, &opts).unwrap();
+        assert_eq!(
+            cache.read().unwrap()[&(trace_ir::canonicalize(&only), Language::Cpp)][0]
+                .deps
+                .canonical_prelude,
+            Some(true)
+        );
+        let result = preprocess_file(&cold, &opts).unwrap();
+        assert!(
+            result
+                .output
+                .split_whitespace()
+                .collect::<String>()
+                .contains("seeded=2;"),
+            "{}",
+            result.output
+        );
+        preprocess_file(&system.join("outer"), &opts).unwrap();
+        preprocess_file(&own, &opts).unwrap();
+        preprocess_file(&other, &opts).unwrap();
+        let own_key = (trace_ir::canonicalize(&own), Language::Cpp);
+        assert!(cache.read().unwrap()[&own_key][0].provides_canonical_prelude);
+        for (frozen, deferred) in [(false, false), (true, false), (false, true)] {
+            opts.frozen_expansion_cache = frozen;
+            opts.defer_expansion_publish = deferred;
+            let result = preprocess_file(&source, &opts).unwrap();
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            let compact = result.output.split_whitespace().collect::<String>();
+            assert!(!compact.contains("leaked_before_include"));
+            assert!(!compact.contains("in_header"));
+            assert!(compact.contains("final_mode=7;"), "{}", result.output);
+            assert_eq!(
+                cache.read().unwrap()[&(trace_ir::canonicalize(&other), Language::Cpp)].len(),
+                2
+            );
+            if let Some(journal) = result.expansion_journal {
+                let mut records = result.replayed_variants;
+                assert!(journal.commit(&cache, &mut records));
+            }
+        }
+    }
+
+    #[test]
+    fn class_member_imports_keep_project_headers_shareable() {
+        let fixture = trace_ir::canonicalize(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/preproc/member_imports"),
+        );
+        let source = fixture.join("main.cpp");
+        let header = fixture.join("own.h");
+        let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.separate_system_headers = true;
+        opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter([
+            source.clone(),
+            header.clone(),
+        ])));
+        for frozen in [false, true] {
+            opts.frozen_expansion_cache = frozen;
+            let result = preprocess_file(&source, &opts).unwrap();
+            assert!(!result.output.contains("struct Derived"));
+            let entries = cache.read().unwrap();
+            let entries = &entries[&(header.clone(), Language::Cpp)];
+            assert_eq!(entries.len(), 1);
+            let compact = entries[0].text.split_whitespace().collect::<String>();
+            assert!(
+                compact.contains("usingBase::Select;"),
+                "{}",
+                entries[0].text
+            );
+        }
+    }
+
+    #[test]
+    fn member_import_fragments_inside_the_includers_class_stay_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.cpp");
+        let member = dir.path().join("member.h");
+        std::fs::write(
+            &source,
+            "struct Base { void f(); };\nstruct Derived : Base {\n#include \"member.h\"\n};\n",
+        )
+        .unwrap();
+        let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.separate_system_headers = true;
+        opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter([
+            trace_ir::canonicalize(&source),
+            trace_ir::canonicalize(&member),
+        ])));
+        for text in [
+            "using Base::f;\n",
+            "struct Inner : Base { using Base::f; };\n",
+        ] {
+            std::fs::write(&member, text).unwrap();
+            for warmed in [false, true] {
+                cache.write().unwrap().clear();
+                if warmed {
+                    preprocess_file(&member, &opts).unwrap();
+                }
+                let before = cache.read().unwrap().len();
+                for _ in 0..2 {
+                    let result = preprocess_file(&source, &opts).unwrap();
+                    let compact = result.output.split_whitespace().collect::<String>();
+                    assert!(compact.contains("usingBase::f;"));
+                    if text.contains("Inner") {
+                        assert!(compact.contains("structInner"));
+                    }
+                    assert_eq!(cache.read().unwrap().len(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn class_scope_tracking_keeps_nonmember_imports_sensitive() {
+        for (source, sensitive) in [
+            ("struct C { using Base::f; };", false),
+            ("namespace N { class C { using Base::f; }; }", false),
+            ("class C { struct D { using Base::f; }; };", false),
+            ("template<class T> class C { using Base::f; };", false),
+            ("using Base::f;", true),
+            ("struct C; using Base::f;", true),
+            ("struct C {}; using Base::f;", true),
+            ("namespace N { using Base::f; }", true),
+            ("namespace A { namespace B { using Base::f; } }", true),
+            ("extern \"C++\" { using Base::f; }", true),
+            ("template<class T> void f() {} using Base::f;", true),
+            ("struct C *value = factory(); using Base::f;", true),
+            ("template<class T> namespace N { using Base::f; }", true),
+        ] {
+            let mut scope = OutputScope::default();
+            for token in Lexer::new(source, Language::Cpp).tokenize() {
+                scope.token(&token.kind);
+            }
+            assert_eq!(scope.context_effects > 0, sensitive, "{source}");
+        }
+    }
+
+    #[test]
+    fn compiler_default_system_headers_share_after_project_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.cpp");
+        let own = dir.path().join("own.h");
+        let system = dir.path().join("system");
+        std::fs::create_dir(&system).unwrap();
+        std::fs::write(&source, "").unwrap();
+        std::fs::write(&own, "int own;\n").unwrap();
+        std::fs::write(system.join("api"), "#pragma once\nvoid Api();\n").unwrap();
+        let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_system_include(&system)
+            .with_compiler_system_include(&system)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.separate_system_headers = true;
+        opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter([
+            trace_ir::canonicalize(&source),
+            trace_ir::canonicalize(&own),
+        ])));
+        let key = (trace_ir::canonicalize(&system.join("api")), Language::Cpp);
+        for text in [
+            "int value;\n#include <api>\n",
+            "#include \"own.h\"\n#include <api>\n",
+        ] {
+            cache.write().unwrap().clear();
+            std::fs::write(&source, text).unwrap();
+            let result = preprocess_file(&source, &opts).unwrap();
+            assert!(
+                !result.output.contains("void Api"),
+                "standard header should become its own unit: {}",
+                result.output
+            );
+            assert!(cache.read().unwrap().contains_key(&key), "{text}");
         }
     }
 

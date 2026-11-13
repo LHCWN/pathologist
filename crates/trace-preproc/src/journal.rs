@@ -47,6 +47,10 @@ pub struct ExpansionJournal {
     seen: FxHashMap<ExpansionKey, Seen>,
     pending: FxHashMap<ExpansionKey, ExpansionVariants>,
     cap: usize,
+    /// Only compiler-default system headers use the canonical one-variant cap.
+    project_paths: Option<Arc<FxHashSet<PathBuf>>>,
+    canonical_roots: Arc<[PathBuf]>,
+    project_cap: usize,
     language: Language,
     history: MacroHistory,
 }
@@ -146,6 +150,7 @@ impl Seen {
 enum Change {
     Macro(Arc<str>, Option<Binding>),
     Header(PathBuf, Option<u64>),
+    CanonicalPrelude,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,6 +163,7 @@ struct MacroHistory {
     last_fallbacks: FxHashSet<String>,
     /// Name → its positions in `undo`, built on first need.
     changes: OnceLock<FxHashMap<Arc<str>, Vec<usize>>>,
+    canonical_prelude_at: Option<usize>,
 }
 
 impl MacroHistory {
@@ -180,7 +186,9 @@ impl MacroHistory {
                 Change::Macro(_, before) => before
                     .as_ref()
                     .map(|(def, fallback)| (def.as_ref(), *fallback)),
-                Change::Header(..) => unreachable!("macro history index"),
+                Change::Header(..) | Change::CanonicalPrelude => {
+                    unreachable!("macro history index")
+                }
             },
             None => self
                 .last
@@ -205,7 +213,9 @@ impl MacroHistory {
         {
             Some(at) => match &self.undo[*at] {
                 Change::Header(_, before) => *before,
-                Change::Macro(..) => unreachable!("header history index"),
+                Change::Macro(..) | Change::CanonicalPrelude => {
+                    unreachable!("header history index")
+                }
             },
             None => self.last_headers.get(path).copied(),
         }
@@ -237,18 +247,55 @@ impl MacroHistory {
                     })
                     .partition_point(|at| *at < point)
             },
+            || self.canonical_prelude_at.is_some_and(|at| at < point),
         )
     }
 }
 
 impl ExpansionJournal {
+    pub(crate) fn record_canonical_prelude(&mut self) {
+        debug_assert!(self.history.canonical_prelude_at.is_none());
+        self.history.canonical_prelude_at = Some(self.history.undo.len());
+        self.history.undo.push(Change::CanonicalPrelude);
+    }
     pub(crate) fn new(cap: usize, language: Language) -> Self {
         Self {
             seen: FxHashMap::default(),
             pending: FxHashMap::default(),
             cap,
+            project_paths: None,
+            canonical_roots: Arc::default(),
+            project_cap: cap,
             language,
             history: MacroHistory::default(),
+        }
+    }
+
+    pub(crate) fn with_project_cap(
+        mut self,
+        paths: Option<Arc<FxHashSet<PathBuf>>>,
+        cap: usize,
+        canonical_roots: Arc<[PathBuf]>,
+    ) -> Self {
+        self.project_paths = paths;
+        self.project_cap = cap.max(self.cap);
+        self.canonical_roots = canonical_roots;
+        self
+    }
+
+    fn cap_for(&self, key: &ExpansionKey) -> usize {
+        if self
+            .project_paths
+            .as_ref()
+            .is_some_and(|paths| paths.contains(&key.0))
+            || !self
+                .canonical_roots
+                .iter()
+                .any(|root| key.0.starts_with(root))
+        {
+            self.project_cap
+        } else {
+            self.cap
         }
     }
 
@@ -351,6 +398,7 @@ impl ExpansionJournal {
         ahead: &[Arc<ExpansionJournal>],
         entry: IncludeExpansion,
     ) -> Option<usize> {
+        let cap = self.cap_for(&key);
         let seen = Seen::of(&mut self.seen, &key, cache, ahead);
         let own = self.pending.entry(key).or_default();
         let signatures = seen
@@ -358,7 +406,7 @@ impl ExpansionJournal {
             .iter()
             .map(|v| v.signature)
             .chain(own.iter().map(|e| e.signature));
-        if admits_variant(signatures, self.cap, entry.signature) {
+        if admits_variant(signatures, cap, entry.signature) {
             let handle = provisional(entry.id);
             own.push(entry);
             return Some(handle);
@@ -491,7 +539,9 @@ impl ExpansionJournal {
             let theirs = later.pending.get(key).map_or(&[][..], Vec::as_slice);
             let unseen: Vec<&IncludeExpansion> =
                 entries.iter().filter(|e| !seen.shows(e.id)).collect();
-            if !theirs.is_empty() && seen.view.len() + unseen.len() + theirs.len() > later.cap {
+            if !theirs.is_empty()
+                && seen.view.len() + unseen.len() + theirs.len() > later.cap_for(key)
+            {
                 return true;
             }
             let exposed: Vec<usize> = seen
@@ -519,7 +569,7 @@ impl ExpansionJournal {
         self.seen.iter().all(|(key, seen)| {
             let list = stored.get(key).map_or(&[][..], Vec::as_slice);
             let own = self.pending.get(key).map_or(&[][..], Vec::as_slice);
-            if list.len() + own.len() > self.cap {
+            if list.len() + own.len() > self.cap_for(key) {
                 return false;
             }
             if list.len() == seen.view.len()

@@ -5,6 +5,141 @@ use trace_parse::build_program_with_jobs;
 use trace_preproc::PreprocessOptions;
 
 #[test]
+fn canonical_scratch_names_do_not_change_exported_analysis() {
+    let fixture = crate::common::fixture("preproc/lookup_context");
+    let root = fixture.join("project");
+    let opts = PreprocessOptions::new()
+        .with_compiler_system_include(fixture.join("system"))
+        .with_canonical_system_headers(true);
+    let mut baseline = None;
+    for jobs in [1, 3] {
+        let program = build_program_with_jobs(&root, &opts, jobs).unwrap();
+        let (pag, analysis) = analyze(&program);
+        let db = crate::common::export_program_full(&program, &pag, &analysis);
+        let rows = crate::common::analysis_rows(&db);
+        if let Some(expected) = &baseline {
+            assert_eq!(&rows, expected);
+        }
+        baseline = Some(rows);
+    }
+}
+
+#[test]
+fn project_lookup_context_keeps_include_order_and_header_result_types() {
+    let fixture = crate::common::fixture("preproc/lookup_context");
+    let root = fixture.join("project");
+    for static_context in [false, true] {
+        let mut baseline = None;
+        for variants in [0, 8] {
+            let mut opts = PreprocessOptions::new()
+                .with_compiler_system_include(fixture.join("system"))
+                .with_canonical_system_headers(true)
+                .with_max_expansion_variants(variants);
+            if static_context {
+                opts = opts.with_define("TEST_STATIC_CONTEXT", "1");
+            }
+            for jobs in [1, 3] {
+                let program = build_program_with_jobs(&root, &opts, jobs).unwrap();
+                let (_, analysis) = analyze(&program);
+                let mut edges: Vec<_> = analysis
+                    .call_edges
+                    .iter()
+                    .map(|edge| {
+                        (
+                            program.symbols.function(edge.caller).name.clone(),
+                            program.symbols.function(edge.callee).name.clone(),
+                        )
+                    })
+                    .collect();
+                edges.sort();
+                edges.dedup();
+                for (caller, callee) in [
+                    ("Before", "Global::GoodGlobal"),
+                    ("After", "SDK::Obj::GoodSDK"),
+                    ("Client::HeaderRun", "SDK::Obj::GoodSDK"),
+                    ("Client::HeaderRun", "SDK::Callback"),
+                    ("Another", "SDK::Callback"),
+                    ("Client::DirectCallback", "SDK::Callback"),
+                    ("SDK::Callback", "SDK::Leaf"),
+                    ("Client::GlobalRun", "SDK::Obj::GoodSDK"),
+                    ("Client::InitRun", "SDK::MakeDefault"),
+                    ("Client::InitRun", "SDK::Obj::GoodSDK"),
+                ] {
+                    assert!(edges.contains(&(caller.into(), callee.into())), "{edges:?}");
+                }
+                assert!(
+                    !edges.contains(&("Before".into(), "SDK::Obj::GoodSDK".into())),
+                    "{edges:?}"
+                );
+                for edge in &analysis.call_edges {
+                    let callee = program.symbols.function(edge.callee);
+                    if callee.name == "SDK::Callback" {
+                        assert!(
+                            callee.is_defined,
+                            "static callback resolved to a prototype: {callee:?}"
+                        );
+                    }
+                }
+                if static_context {
+                    assert!(
+                        edges.contains(&("Client::StaticRun".into(), "SDK::Callback".into())),
+                        "{edges:?}"
+                    );
+                }
+                if let Some(expected) = &baseline {
+                    assert_eq!(&edges, expected, "variants={variants}, jobs={jobs}");
+                }
+                baseline = Some(edges);
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_project_class_imports_preserve_overload_result_typing() {
+    let fixture = crate::common::fixture("preproc/member_imports");
+    let mut baseline = None;
+    for variants in [0, 8] {
+        // A system root enables the sharing safety gates, even though this
+        // fixture's declarations all belong to project headers.
+        let opts = PreprocessOptions::new()
+            .with_system_include(&fixture)
+            .with_max_expansion_variants(variants);
+        for jobs in [1, 3] {
+            let program = build_program_with_jobs(&fixture, &opts, jobs).unwrap();
+            let (_, analysis) = analyze(&program);
+            let mut callees: Vec<_> = analysis
+                .call_edges
+                .iter()
+                .filter(|edge| program.symbols.function(edge.caller).name == "Run")
+                .map(|edge| program.symbols.function(edge.callee).name.clone())
+                .collect();
+            callees.sort();
+            assert!(
+                callees.iter().any(|name| name == "Local::Base::Select"),
+                "{callees:?}"
+            );
+            assert!(
+                callees.iter().any(|name| name == "Local::Result::Touch"),
+                "{callees:?}"
+            );
+            assert!(
+                !callees.iter().any(|name| name == "Local::Derived::Select"),
+                "{callees:?}"
+            );
+            assert!(
+                !callees.iter().any(|name| name == "Local::Other::Wrong"),
+                "{callees:?}"
+            );
+            if let Some(expected) = &baseline {
+                assert_eq!(&callees, expected, "variants={variants}, jobs={jobs}");
+            }
+            baseline = Some(callees);
+        }
+    }
+}
+
+#[test]
 fn shared_system_preambles_keep_call_sequencing_enabled() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");

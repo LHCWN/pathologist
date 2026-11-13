@@ -7,6 +7,7 @@ on exit; --output retains measurements and phase logs as JSON.
 
 import argparse
 import collections
+from contextlib import closing
 import itertools
 import json
 from pathlib import Path
@@ -109,7 +110,7 @@ def semantic_rows(path):
     This deliberately excludes unused dependency declarations and metadata.
     Use exact comparison to check determinism of a single implementation.
     """
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
         files = dict(db.execute("SELECT id,path FROM files"))
         functions = {
             row[0]: (row[1], files[row[2]], *row[3:])
@@ -141,9 +142,16 @@ def semantic_rows(path):
                 "SELECT id,name,kind,fn_id,file_id,line,col,is_synthetic FROM variables"
             )
         }
+        synthetic_names = {
+            var: name for var, name in db.execute(
+                "SELECT id,name FROM variables WHERE is_synthetic <> 0"
+            )
+        }
         nodes = {
             node: (kind, variables.get(var), functions.get(fn), sites.get(site),
-                   label if kind != "var" else "", detail)
+                   (label.replace(synthetic_names[var], re.sub(r"\d+$", "", synthetic_names[var]))
+                    if var in synthetic_names and kind == "loc"
+                    else label if kind != "var" else ""), detail)
             for node, kind, label, detail, var, fn, site in db.execute(
                 "SELECT id,kind,label,detail,var_id,fn_id,call_site_id FROM flow_nodes"
             )
@@ -211,6 +219,8 @@ def main():
                         help="benchmark an existing project instead of generated layouts")
     parser.add_argument("--system-includes", action=argparse.BooleanOptionalAction, default=True,
                         help="also supports --no-system-includes for default-mode regressions")
+    parser.add_argument("--canonical-system-headers", action="store_true",
+                        help="benchmark the experimental bare-tree canonical prelude")
     parser.add_argument("--comparison", choices=["exact", "semantic"], default="exact",
                         help="semantic allows reordered IDs and unused dependency metadata")
     parser.add_argument("--layouts", nargs="+",
@@ -242,6 +252,8 @@ def main():
                          "-o", str(database)]
                     if args.system_includes:
                         command.append("--system-includes")
+                    if args.canonical_system_headers:
+                        command.append("--canonical-system-headers")
                     run = subprocess.run(
                         command,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -255,6 +267,7 @@ def main():
                     result = dict(shape=shape, variant=label, repeat=repeat, seconds=seconds,
                                   units=None if args.project else args.units, jobs=args.jobs,
                                   project=str(project), system_includes=args.system_includes,
+                                  canonical_system_headers=args.canonical_system_headers,
                                   comparison=args.comparison,
                                   identical_rows=rows,
                                   phases=run.stdout.splitlines())

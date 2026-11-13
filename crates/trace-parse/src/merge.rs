@@ -146,6 +146,7 @@ pub enum MergeMode {
     Full,
     TypesOnly,
     SymbolsOnly,
+    HeaderDeclarations,
     HeaderPreamble,
     Variant,
 }
@@ -237,11 +238,11 @@ impl VariantDedup {
 /// The scan is a fallback for a caller that built a sparse call table.
 #[inline]
 pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
-    merge_unit(program, unit, MergeMode::Full, None);
+    merge_unit(program, unit, MergeMode::Full, None, None);
 }
 
 pub fn merge_unit_header_preamble(program: &mut Program, unit: &UnitIndex) {
-    merge_unit(program, unit, MergeMode::HeaderPreamble, None);
+    merge_unit(program, unit, MergeMode::HeaderPreamble, None, None);
 }
 
 /// Merge a translation unit together with its configuration variants (#59).
@@ -273,7 +274,7 @@ impl VariantMerge {
     pub(crate) fn start(program: &mut Program, base: &UnitIndex, has_variants: bool) -> Self {
         let flow_start = program.flow.len();
         let var_start = program.symbols.variables.len();
-        merge_unit(program, base, MergeMode::Full, None);
+        merge_unit(program, base, MergeMode::Full, None, None);
         if !has_variants {
             return Self { seen: None };
         }
@@ -314,7 +315,7 @@ impl VariantMerge {
             debug_assert!(false, "variant pushed after start declared none");
             return;
         };
-        merge_unit(program, unit, MergeMode::Variant, Some(seen));
+        merge_unit(program, unit, MergeMode::Variant, Some(seen), None);
         // A later configuration can introduce a definition absent from the
         // first one. Subsequent alternatives must extend that definition too.
         for (file, definitions) in base_definitions(program, unit) {
@@ -394,7 +395,7 @@ fn base_definitions(
 
 /// Nested PCH: types, typedefs, and inheritance only.
 pub fn merge_unit_types(program: &mut Program, unit: &UnitIndex) {
-    merge_unit(program, unit, MergeMode::TypesOnly, None);
+    merge_unit(program, unit, MergeMode::TypesOnly, None, None);
 }
 
 /// TU preamble: types and symbols, with internal C++ body facts replayed for
@@ -404,7 +405,42 @@ pub fn merge_unit_types(program: &mut Program, unit: &UnitIndex) {
 /// Also the mode for a dependency-root header's own unit: its bodies are not
 /// the target's code, so they contribute prototypes and stop there (#60).
 pub fn merge_unit_symbols(program: &mut Program, unit: &UnitIndex) {
-    merge_unit(program, unit, MergeMode::SymbolsOnly, None);
+    merge_unit(program, unit, MergeMode::SymbolsOnly, None, None);
+}
+
+/// A header's own callable declarations, without recursively copying the
+/// prerequisites it imported to lower its bodies.
+pub(crate) fn merge_unit_declarations(program: &mut Program, unit: &UnitIndex, source: &str) {
+    merge_unit(
+        program,
+        unit,
+        MergeMode::HeaderDeclarations,
+        None,
+        Some(source),
+    );
+}
+
+/// A literal name search is deliberately a superset: substring matches only
+/// retain extra declarations. Implicit calls keep every lifecycle/operator
+/// candidate, and default expressions can execute outside the consumer's text.
+fn declaration_may_be_used(unit: &UnitIndex, name: &str, source: &str) -> bool {
+    if name.contains(['<', '>', '~']) || name.contains("operator") {
+        return true;
+    }
+    let (scope, leaf) = name.rsplit_once("::").unwrap_or(("", name));
+    if !scope.is_empty() && scope.rsplit("::").next() == Some(leaf) {
+        return true;
+    }
+    source.contains(leaf)
+        || unit
+            .types
+            .member_initializer_expressions()
+            .any(|text| text.contains(leaf))
+        || unit
+            .default_arguments
+            .values()
+            .flatten()
+            .any(|(_, initializer)| initializer.expression.contains(leaf))
 }
 
 /// Import reports from a unit without importing its bodies. Shared dependency
@@ -442,6 +478,7 @@ fn merge_unit(
     unit: &UnitIndex,
     mode: MergeMode,
     mut variant_dedup: Option<&mut VariantDedup>,
+    declaration_source: Option<&str>,
 ) {
     let _profile = match mode {
         MergeMode::Full | MergeMode::Variant => crate::index_profile::Metric::MergeFull,
@@ -608,6 +645,17 @@ fn merge_unit(
     }
     for func in &unit.functions {
         let old_id = func.id;
+        if matches!(mode, MergeMode::HeaderDeclarations)
+            && (unit
+                .files
+                .get(func.file.0 as usize)
+                .is_none_or(|path| path != &unit.path && !unit.held_headers.contains(path))
+                || declaration_source
+                    .is_some_and(|source| !declaration_may_be_used(unit, &func.name, source)))
+        {
+            dropped_fns.insert(old_id);
+            continue;
+        }
         if respelled.contains_key(&old_id) {
             dropped_fns.insert(old_id);
             continue;
@@ -795,7 +843,7 @@ fn merge_unit(
         f.return_type = remap_type(f.return_type, &type_map);
         // A body written in a dependency header is not the target's code:
         // keep the signature, drop everything the body would contribute (#60).
-        if program.is_dep_file(span_file) {
+        if program.is_dep_file(span_file) || matches!(mode, MergeMode::HeaderDeclarations) {
             f.is_defined = false;
             f.end_line = f.span.line;
             f.locals.clear();
@@ -1001,6 +1049,23 @@ fn merge_unit(
     let mut file_temp_cursor: FxHashMap<FileTempKey, usize> = FxHashMap::default();
 
     for var in &unit.variables {
+        if matches!(mode, MergeMode::HeaderDeclarations)
+            && !((var.storage == trace_ir::StorageClass::Param
+                && var.fn_id.is_some_and(|owner| fn_map.contains_key(&owner)))
+                || (var.fn_id.is_none()
+                    && matches!(
+                        var.storage,
+                        trace_ir::StorageClass::Global | trace_ir::StorageClass::FileStatic
+                    )
+                    && unit
+                        .files
+                        .get(var.span.file.0 as usize)
+                        .is_some_and(|path| {
+                            path == &unit.path || unit.held_headers.contains(path)
+                        })))
+        {
+            continue;
+        }
         if var
             .fn_id
             .map(|id| dropped_fns.contains(&id))
@@ -1276,7 +1341,7 @@ fn merge_unit(
             .filter_map(|id| fn_map.get(id).copied()),
     );
 
-    if program.is_dep_file(primary_file_id) {
+    if program.is_dep_file(primary_file_id) || matches!(mode, MergeMode::HeaderDeclarations) {
         return;
     }
 
@@ -1635,9 +1700,7 @@ fn merge_unit(
     }
 
     for (old_fn, flows) in &unit.fn_returns {
-        if dropped_fns.contains(old_fn) {
-            continue;
-        }
+        let dropped = dropped_fns.contains(old_fn);
         let Some(&new_fn) = fn_map.get(old_fn) else {
             continue;
         };
@@ -1645,11 +1708,24 @@ fn merge_unit(
             Some(f) => merges_body(program, mode, f),
             None => !matches!(mode, MergeMode::SymbolsOnly),
         };
-        if !merges {
-            continue;
-        }
+        // The external header body may already be merged while its static
+        // return target is replayed only in this TU. Retain that binding even
+        // when the duplicate body itself is dropped.
+        let replay_internal = matches!(
+            mode,
+            MergeMode::SymbolsOnly | MergeMode::Full | MergeMode::Variant
+        ) && program
+            .symbols
+            .function_by_id(new_fn)
+            .is_some_and(|f| !program.is_dep_file(f.file));
         let remapped: Vec<ReturnFlow> = flows
             .iter()
+            .filter(|flow| {
+                (!dropped && merges)
+                    || (replay_internal
+                        && return_flow_fns(flow)
+                            .any(|f| fn_map.get(&f).copied().is_some_and(is_internal_fn)))
+            })
             .filter(|f| {
                 f.var().into_iter().all(|v| var_map.contains_key(&v))
                     && return_flow_fns(f).all(|callee| fn_map.contains_key(&callee))
@@ -2043,6 +2119,24 @@ fn remap_return_flow(
 mod tests {
     use super::*;
     use trace_ir::{Diagnostic, DiagnosticSeverity};
+
+    #[test]
+    fn header_declarations_drop_parameters_of_excluded_prerequisite_functions() {
+        let mut unit = unit_declaring_param("/source/child.h", false, vec![], "argument");
+        unit.path = "/source/parent.h".into();
+        let mut program = Program::new("/source".into());
+        merge_unit_declarations(&mut program, &unit, &unit.functions[0].name);
+        assert!(program.symbols.functions.is_empty());
+        assert!(program.symbols.variables.is_empty());
+        unit.path = "/source/child.h".into();
+        merge_unit_declarations(&mut program, &unit, &unit.functions[0].name);
+        assert_eq!(program.symbols.functions.len(), 1);
+        assert_eq!(program.symbols.variables.len(), 1);
+        assert_eq!(
+            program.symbols.variables[0].fn_id,
+            Some(program.symbols.functions[0].id)
+        );
+    }
 
     #[test]
     fn repeated_declarations_reuse_parameters_but_a_definition_keeps_its_binding() {

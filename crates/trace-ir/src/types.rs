@@ -1116,6 +1116,16 @@ impl TypeTable {
         }
     }
 
+    /// Expanded initializer expressions which a consumer can execute implicitly.
+    /// Iteration order is unspecified; use for membership queries only.
+    pub fn member_initializer_expressions(&self) -> impl Iterator<Item = &str> {
+        self.member_initializers
+            .values()
+            .flat_map(|fields| fields.values())
+            .flatten()
+            .map(|initializer| initializer.expression.as_ref())
+    }
+
     pub fn member_initializers(&self, class: &str, field: &str) -> &[Arc<MemberInitializer>] {
         self.member_initializers
             .get(class)

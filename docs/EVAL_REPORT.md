@@ -18166,3 +18166,350 @@ instruments dependencies.
 Validation after these changes: `cargo test --workspace --all-features` passes
 **2,967 tests**, Clippy with warnings denied and `cargo fmt --check` pass, and
 the coverage checker's 12 Python tests pass.
+
+## System-include probe reuse and standard-header sharing - 2026-11-12
+
+`--system-includes` with a compilation database asked the compiler once per
+distinct command directory. The probe answers for the same executable and
+target/sysroot/standard flags are identical when the compiler prints absolute
+search entries and environment include paths are directory-independent, so a large database paid one compiler startup per build
+directory for the same list. This change caches those probes under their
+configuration alone and keeps the directory in the key only for results whose
+compiler printed relative entries. A bare driver name is also located once per
+run, because it is resolved from `PATH`, not from the command directory. The
+search rules are documented in [compiler include discovery](PREPROCESSOR.md#compilation-database-options-62).
+
+Measured on Windows with clang 23 and its MSVC/UCRT search list, release
+builds, one worker, and a synthetic compilation database whose entries differ
+only in `directory` (one tiny C TU per directory):
+
+| Directories | Baseline median | Candidate median | Exact analysis rows |
+|---:|---:|---:|---|
+| 120 | 20.159 s | 0.564 s | identical |
+| 240 | 41.170 s | 0.739 s | identical |
+
+Every underlying analysis table, `database_identity`, and the `analysis_run`
+version/options fields match between the baseline and candidate databases.
+Three alternating pairs produced the 120-directory medians; the 240-directory
+figures are one pair. This host's installed headers are not the Linux GCC
+headers used by the corpus reports above, so the absolute times are not
+comparable with them; the removed per-directory compiler startups are the
+measured change. The tracked synthetic layouts (`direct`, `shared`, `unique`)
+also match exactly across 45,237-45,269 rows with the same release build.
+
+### Standard headers after project declarations
+
+Bare-tree indexing used to keep every system header inline once a project
+declaration or project-header preamble preceded it. No cache entry was made, so
+each TU re-expanded and re-lowered the same standard headers. Compiler-probe
+roots are now recorded in `compiler_system_include_paths` and shared as
+standard headers after project declarations; explicit `-isystem` roots keep the
+old gate, because a project can interpose aliases there. The contract is in
+[Shared system header bundles](PREPROCESSOR.md#shared-system-header-bundles).
+
+Measured with the release `bench_bare_system` example, 20 TUs, one worker, and
+one synthetic system tree. `own_first` puts a project struct before the six
+standard includes; `direct` puts them first; `unique` uses one project header
+per TU:
+
+| Layout | Explicit `-isystem` | Compiler-default roots | Settled TUs |
+|---|---:|---:|---:|
+| `own_first` | 1.044 s | 0.206 s | 20 -> 1 |
+| `direct` | 0.262 s | 0.209 s | 1 -> 1 |
+| `unique` | 0.516 s | 0.398 s | 0 -> 0 |
+
+For `own_first`, `source-lower` falls from 0.428 s to 0.063 s and `ast-lower`
+from 0.379 s to 0.034 s; six system expansions become shared units and the
+settle pass drops from 20 TUs to 1. The function output is unchanged. The
+regression `compiler_default_system_headers_share_after_project_declarations`
+covers declarations and project-header preambles, and
+`system_headers_using_project_aliases_keep_the_consumers_declaration_context`
+keeps explicit system roots inline when a header uses a project alias.
+
+A real-subset check on `services/abilitymgr` (236 TUs, no compilation database)
+with MSYS2 MinGW-w64 GCC 15.2 headers completed both ways. One jobs=8 pair took
+60.123 s on master `2a51d50` and 63.1 s on the candidate; this is not a measured
+speedup, and the direction is within a single-observation spread. The semantic
+comparison is not equivalent: 456 definitions were missing and 459 added, with
+sampled pairs changing type spelling (for example
+`ProcessActiveTimeOut(int)` to `ProcessActiveTimeOut(long long)`), consistent
+with more of the standard headers' type context reaching lowering. The
+candidate was deterministic across two jobs=8 runs (167,041 normalized rows).
+This subset keeps standard includes inside project headers, where the old gate
+already admitted sharing; the synthetic `own_first` gain did not translate.
+Cross-version equality is not established for this workload.
+
+Reproduce with an existing compilation database whose commands share one
+compiler configuration but use many `directory` values, comparing a pre-change
+binary against the current release build. Relative search entries still force
+one probe per directory and retain the existing [probe tests](../crates/trace-parse/src/compiler_includes.rs).
+
+### Canonical system preamble measurements
+
+Design, rejected approaches and the complete measurement record:
+[Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md).
+
+The canonical mode was measured on the same `services/abilitymgr` subset (236
+TUs, no compilation database) with MSYS2 MinGW-w64 GCC 15.2 and `--jobs 8`.
+Ordinary `--system-includes` took 90.8 s and peaked at 580 MiB. Adding
+`--canonical-system-headers` took 21.1-26.7 s across runs and peaked at
+297-315 MiB, with preprocessing at 1.5-2.2 s, 100 project/external header
+units, and parse completion around 6-8 s. The default no-system run remains
+4.5 s. The prelude is merged into the final program once; translation units
+no longer clone it.
+
+The canonical output was deterministic across two runs (154,019 normalized
+semantic rows). It is not semantically identical to ordinary system-header
+indexing: 14,905 functions (9,401 dependency) versus 17,149 (11,644
+dependency), 22,949 project direct call edges versus 18,428, and 5,206 project
+definitions versus 5,203. One shared standard-library configuration replaces
+per-unit variants, and standard declarations are absent while a translation
+unit is lowered, so smart-pointer member typing can move toward the
+no-system-include result. The earlier per-translation-unit prelude variant
+matched ordinary project edges more closely (18,403) but peaked near 410 MiB;
+merging once lowers the per-unit cost and peak at the same preprocessing and
+parse cost.
+
+```bash
+target/release/trace analyze /path/to/ability_ability_runtime/services/abilitymgr \
+  --system-includes --canonical-system-headers --jobs 8 --timeout-secs 900 \
+  -o /tmp/abilitymgr-canonical.db
+```
+
+Canonical mode is ignored when a compilation database or shared command
+configuration selects configured indexing.
+
+#### Full `ability_ability_runtime` tree
+
+The same comparison on the complete tree (3,456 TUs, 3,110 headers) shows that
+the subset result does not generalize. Master `2a51d50` without options took
+114.3 s and peaked at 1,877 MiB. Canonical mode took 440-536 s and peaked near
+2,700 MiB. Preprocessing alone took 61-128 s (master 9.9 s), PCH 76-104 s
+(10.1 s), TU parsing 90-151 s (37.0 s), and indexing 370-489 s (80.6 s).
+Canonical indexing produced 93,579 functions and 765,893 project direct edges,
+against 85,445 and 705,900.
+
+Profiling attributes the regression to project-header preprocessing: canonical
+mode lowers 1,238-1,375 project/external header units in PCH, but those units
+still take 67-104 s, and `source-lower` totals 502 s against master's 118 s.
+Suppressing or skipping the replayed system-header text did not change the
+total, because the cost is project-header lowering and repeated cache misses,
+not the size of the system text. This was the pre-follow-up result; see the
+[finalization measurements](#canonical-header-reuse-finalization-2026-11-15)
+for the retained changes and remaining default-mode gap.
+
+### Canonical project-preamble reuse follow-up (2026-11-13)
+
+Compared `7de568ac` with project-only reusable preambles and deduplicated
+preamble include probes. Both binaries were built with the normal release
+profile. Input: a workspace copy of `services/abilitymgr` (236 TUs), Windows
+x64, MinGW GCC 15.2 headers, `--system-includes --canonical-system-headers
+--jobs 8`. Three alternating runs through `scripts/bench_system_includes.py`
+checked **154,019 identical normalized semantic rows** on every run.
+Candidate runs with one and eight workers also matched all **587,595 exact
+analysis-table rows**, excluding run metadata.
+
+| Metric | Before | After |
+|---|---:|---:|
+| Median total wall time | 21.132 s | 21.235 s |
+| Median reported indexing time | 19.6 s | 19.0 s |
+| Median summed symbol-import time | 0.520 s | 0.304 s |
+| Symbol-import calls (first pair) | 2,310 | 1,116 |
+| PCH units | 100 | 100 |
+| Functions | 14,905 | 14,905 |
+| Peak working set, separate single runs | 302.6 MiB | 301.3 MiB |
+
+The change reduces repeated symbol imports, but does **not** establish an
+end-to-end speedup on this subset. Parsing/lowering dominate, and total-time
+variation exceeds the saved import time. The sixteen-snapshot limit is
+unchanged; it bounds snapshot count, not bytes. Full-tree speed and memory
+were not measured for this isolated planner change. The combined follow-up is
+measured below.
+
+A rejected experiment stopped inheriting canonical system fingerprints into
+project-header cache entries. Although TU settlement fell from 151 to 75 units,
+PCH units rose from 100 to 163, functions changed from 14,905 to 14,902, and
+index time rose from 19.7 to 22.1 s in single observations. That change and
+its test were reverted; fingerprint compatibility is unchanged.
+
+Reproduce the retained comparison with an old release binary:
+
+```bash
+python scripts/bench_system_includes.py --baseline /path/to/old/trace \
+  --candidate target/release/trace --project /path/to/abilitymgr \
+  --canonical-system-headers --jobs 8 --repeats 3 --comparison semantic
+```
+
+### Canonical header reuse finalization (2026-11-15)
+
+The final design is documented in [Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md),
+with authoritative lookup/storage rules in
+[Shared system header bundles](PREPROCESSOR.md#shared-system-header-bundles).
+It retains lazy standard macro replay, project lookup projections where safe,
+bounded project preambles, narrow prerequisite declarations with parameter
+ownership, and linear include-graph membership updates. File-static and
+anonymous-namespace dependencies keep consumer lookup bodies inline.
+
+The complete input was a workspace copy of `ability_ability_runtime`, with
+**3,456 TUs and 3,110 headers**, Windows x64, MinGW GCC 15.2 headers, normal
+release profile, eight workers, and `TRACE_PROFILE_INDEX=1`. These are single
+observations, not repeated medians. Working set is a Windows process peak,
+not Linux RSS or macOS physical footprint. Peak private memory was sampled
+every 500 ms. The default and intermediate runs were sequential without
+concurrent build work; the final run briefly overlapped focused verification
+at startup, so small timing differences should not be treated as significant.
+
+| Metric | Current default | Intermediate lookup projection | Final conservative configuration |
+|---|---:|---:|---:|
+| Total wall | 126.277 s | 250.620 s | **334.229 s** |
+| Index | 86.9 s | 206.5 s | **279.8 s** |
+| Preprocess | 17.1 s | 35.5 s | 51.9 s |
+| PCH | 13.8 s | 67.3 s | 71.6 s |
+| PCH merge | 2.1 s | 1.8 s | 0.5 s |
+| Peak working set | 1,944.3 MiB | 2,110.3 MiB | **2,071.8 MiB** |
+| Functions | 85,445 | 94,259 | 93,576 |
+| All call edges | 723,191 | 779,287 | 772,700 |
+| Flow constraints | 475,539 | 532,705 | 615,151 |
+
+The final configuration is deliberately more conservative than the 250.6 s
+prototype. A regression showed that separately lowered consumer bodies could
+lose a callback through a prerequisite's file-static variable. The final
+storage-context fallback preserves that behavior and gives up some reuse.
+The intermediate timing is **not** the shipped performance claim.
+
+Compared with the historical initial canonical observations above
+(419-536 s total, about 2,700 MiB), this is a substantial reduction in time
+and memory, but **not default-mode parity**: the final run is about 2.65 times
+the current default wall time. The old and new outputs are not semantically
+identical, and these observations are not an isolated paired microbenchmark
+of every individual optimization. No speedup is attributed to prototype
+narrowing alone without a controlled measurement of that change.
+
+The final graph contains 374,356 direct, 1,825 indirect, 394,593 external and
+1,926 IPC call edges, 578,573 argument-flow edges, and 13,283 diagnostics.
+These are raw edge categories, not the project-only direct-edge counts in
+the historical tables. More edges do not by themselves demonstrate greater
+precision; the canonical macro/standard-typing tradeoffs still apply.
+
+Final summed indexing counters (nested scopes must not be added together):
+
+| Counter | Calls | Summed time |
+|---|---:|---:|
+| Preamble build | 3,419 | 49.793 s |
+| Preamble clone | 44 | 0.184 s |
+| Symbol import | 344,431 | 50.635 s |
+| Types-only import | 10,618 | 1.367 s |
+| Type import, nested within merges | 359,079 | 35.009 s |
+| Source/header lowering | 7,034 | 597.227 s |
+| Syntax parse | 7,034 | 182.400 s |
+| AST lowering | 7,034 | 395.416 s |
+
+The remaining cost is mostly repeated project/header syntax and AST lowering.
+Conservative storage fallback increases that work. Snapshot cloning itself
+is small, and no index-window, solver propagation or cache-lifetime redesign
+was retained.
+
+#### Investigation stages and rejected variants
+
+- A fresh earlier default profile reported 119.8 s indexing; an early canonical
+  profile reported 464.1 s. Those diagnostic runs included TU logging/dumps and
+  must not be compared as clean wall-time pairs with the final table.
+- A class-local import exemption alone reported 408.3 s indexing. A lazy macro
+  closure with full standard replay metadata reported 361.6 s indexing. These
+  isolated observations established direction, not a combined final speedup.
+- Full standard metadata replay retained hundreds of standard paths and
+  declaration records per consumer. Eliminating those records for headers
+  actually covered by the aggregate prelude reduced an intermediate preprocess
+  phase from about 64 s to 33 s. The final storage fallback raises it to 51.9 s.
+- An intermediate projection probe on the same fuzzer TU changed approximately
+  391 KiB of TU text to 1.4 KiB, and a repeated debug preprocessing pass from
+  about 1.0 s to 0.16 s. It was not a release or final-fallback measurement.
+- Initial projection prototypes exceeded 20-30 GiB or failed a 27,917,287,424-byte
+  allocation. Disabling preamble snapshots did not cure the failure. A temporary
+  one-million-variable trap located orphaned implicit `this` parameters in the
+  declaration merge. Filtering function ownership without filtering its
+  parameters had multiplied those entries through nested headers. The retained
+  regression prevents that growth; the final full run completed successfully.
+- Profiling 2.26 million ancestor queries attributed only about 2.8 summed
+  seconds to them, against hundreds of seconds of AST lowering. The temporary
+  ancestry metric/eager allocation was removed rather than optimizing the wrong
+  component.
+- Skipping inherited canonical fingerprints changed functions and increased
+  PCH work; it remains rejected as described above. Project guards and incoming
+  macro states remain checked.
+- An intermediate macro-bookkeeping comparison preserved 150,509 normalized
+  semantic rows on the subset after normalizing synthetic location labels.
+  This is evidence for that step, not proof that the final design matches the
+  original canonical graph or ordinary system indexing.
+- A run overlapping broad test compilation and a release build took 357.970 s
+  total / 298.2 s indexing. It was excluded from the clean comparison.
+
+Temporary cache-candidate logs, allocation traps, probe examples and experiment
+environment switches were removed. The supported behavior is reached with the
+ordinary explicit canonical CLI option.
+
+#### Validation and reproduction
+
+Focused validation passes: **314 preprocessor unit tests plus 4 integration
+tests, 27 system-header integration tests, 37 merge tests, 3 include-graph
+tests, and 2 canonical-prelude tests**. Coverage includes class imports,
+before/after-include overload lookup, namespace aliases and inline namespaces,
+original macro locations, implicit member initializer calls, external globals,
+static callback getter returns, TU-static callback storage, warm class
+fragments, explicit system-root configurations, and cold/primed macro replay.
+
+The final 236-TU subset exports **582,342 identical underlying analysis-table
+rows** with one and eight workers, excluding only `analysis_run` metadata.
+It contains 14,901 functions and 35,545 total call edges in both runs. This
+checks exact determinism of the final implementation, not equality to earlier
+macro configurations or to ordinary system indexing.
+
+`cargo test --workspace` stops on a Windows missing-header guidance assertion
+(`dotted_standard_and_kernel_headers_get_guidance_without_folding_parents`).
+The broader CLI integration run reported 1,507 passes and 63 failures, the same
+failure count as the earlier run. Many failures concern Windows separators,
+extended path prefixes, path expectations or text rendering; the workspace is
+not claimed fully green, nor was every failure independently re-proven on a
+clean baseline. Formatting and whitespace checks pass.
+
+Reproduce the final/default comparison with the same rebuilt binary and input:
+
+```bash
+cargo build -p trace-cli --release
+TRACE_PROFILE_INDEX=1 target/release/trace analyze /path/to/ability_ability_runtime \
+  --jobs 8 --timeout-secs 1800 -o /tmp/default.db
+TRACE_PROFILE_INDEX=1 target/release/trace analyze /path/to/ability_ability_runtime \
+  --system-includes --canonical-system-headers --jobs 8 --timeout-secs 1800 \
+  -o /tmp/canonical.db
+```
+
+Use sequential runs, keep compiler roots/input revision fixed, and report
+working-set/RSS terminology appropriate to the host. Compare exact analysis
+rows with `compare_databases` from `scripts/bench_system_includes.py` to check
+worker-count determinism; `analysis_run` metadata is excluded. Use
+`compare_semantics` only when intentional ID/layout differences are allowed,
+and do not interpret canonical/default graph differences as equivalence.
+
+#### Post-review file lifetime and probe-context corrections
+
+Canonical scratch files now use exclusive, uniquely named `NamedTempFile`
+ownership. An existing legacy filename or link is preserved, overlapping runs
+have independent cleanup, and the scratch path is normalized to a stable
+synthetic identity before IR merge. The regression covers a legacy hard link,
+overlapping file lifetimes, unchanged target contents during canonical indexing,
+and exact exported analysis equality across fresh files and worker counts.
+A separate symlink regression is included for Unix.
+
+Compiler probe portability also checks environment include paths. Relative or
+empty entries keep results scoped to the command directory even if the compiler
+omits a nonexistent directory and prints only absolute defaults. An isolated
+subprocess regression exercises `CompilationIncludeSearches` with
+`C_INCLUDE_PATH=relative-include`, absent in the first directory and present in
+the second. Pure path-list cases cover unset, absolute, relative and empty values.
+
+On Windows, the three canonical-preamble tests, two environment tests, 27
+system-header tests and the new exact-export test pass. The broader compiler
+probe suite reports nine passes and two `.EXE` versus `.exe` casing assertion
+failures in executable-lookup tests. No new whole-tree performance measurement
+was made for these review corrections; the table above remains a measurement
+of the preceding finalized configuration.
