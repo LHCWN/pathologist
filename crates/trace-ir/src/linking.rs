@@ -86,6 +86,17 @@ fn shape(t: &TypeDesc) -> TypeDesc {
             fields: vec![],
         },
         TypeDesc::Ptr(t) => TypeDesc::Ptr(Box::new(shape(t))),
+        TypeDesc::MemberPointer {
+            owner_dependent,
+            owner,
+            member,
+            is_function,
+        } => TypeDesc::MemberPointer {
+            owner_dependent: *owner_dependent,
+            owner: owner.clone(),
+            member: Box::new(shape(member)),
+            is_function: *is_function,
+        },
         TypeDesc::Array { elem, size } => TypeDesc::Array {
             elem: Box::new(shape(elem)),
             size: *size,
@@ -105,7 +116,9 @@ fn guessed_names(t: &TypeDesc, types: &TypeTable, legacy: bool, out: &mut Vec<St
         {
             out.push(name.clone());
         }
-        TypeDesc::Ptr(t) | TypeDesc::Array { elem: t, .. } => guessed_names(t, types, legacy, out),
+        TypeDesc::Ptr(t)
+        | TypeDesc::Array { elem: t, .. }
+        | TypeDesc::MemberPointer { member: t, .. } => guessed_names(t, types, legacy, out),
         TypeDesc::FnPtr { ret, params } => {
             guessed_names(ret, types, legacy, out);
             for p in params {
@@ -327,5 +340,61 @@ impl LinkingFacts {
             calls,
             senders,
         }
+    }
+}
+
+#[cfg(test)]
+mod member_pointer_tests {
+    use super::*;
+
+    #[test]
+    fn member_pointer_linking_shapes_drop_nested_tag_completions_and_keep_guesses() {
+        let mut types = TypeTable::default();
+        types.note_guessed_class("Missing");
+        let tagged = |fields| TypeDesc::Struct {
+            name: "anon".into(),
+            fields,
+        };
+        let member = |ty| TypeDesc::MemberPointer {
+            owner_dependent: false,
+            owner: "C".into(),
+            is_function: false,
+            member: Box::new(ty),
+        };
+        let incomplete = member(tagged(vec![]));
+        let complete = member(tagged(vec![("value".into(), TypeDesc::Int)]));
+        assert_eq!(shape(&incomplete), shape(&complete));
+        assert!(
+            matches!(shape(&complete), TypeDesc::MemberPointer { owner, is_function: false, .. } if owner == "C")
+        );
+        let guessed = TypeDesc::MemberPointer {
+            owner_dependent: false,
+            owner: "C".into(),
+            is_function: true,
+            member: Box::new(TypeDesc::FnPtr {
+                ret: Box::new(TypeDesc::Void),
+                params: vec![member(TypeDesc::Array {
+                    elem: Box::new(TypeDesc::Struct {
+                        name: "Missing".into(),
+                        fields: vec![],
+                    }),
+                    size: Some(2),
+                })],
+            }),
+        };
+        let mut names = Vec::new();
+        guessed_names(&guessed, &types, false, &mut names);
+        assert_eq!(names, ["Missing"]);
+        let mut legacy = Vec::new();
+        guessed_names(
+            &member(TypeDesc::Struct {
+                name: "Legacy".into(),
+                fields: vec![],
+            }),
+            &types,
+            true,
+            &mut legacy,
+        );
+        assert_eq!(legacy, ["Legacy"]);
     }
 }

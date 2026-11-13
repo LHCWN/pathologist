@@ -879,10 +879,16 @@ Exported with `--full-export` only.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Type id |
-| `kind` | TEXT | `void`, `int`, `short`, `long`, `long long`, `bool`, `float`, `double`, `struct`, `ptr`, `fnptr`, `array`, `func`, `unknown`, … |
+| `kind` | TEXT | `void`, `int`, `short`, `long`, `long long`, `bool`, `float`, `double`, `struct`, `ptr`, `fnptr`, `array`, `func`, `unknown`, …; `ptr` includes C++ member pointers, whose names retain their owner (data-member pointers use `T C::*`; member-function-pointer variables and parameters use `fn_ptr C::**`, including their IR storage-pointer layer, while fields use `fn_ptr C::*`) |
 | `name` | TEXT | Display name |
 | `size` | INTEGER | Layout size |
 | `layout_json` | TEXT | JSON field layout |
+
+Member-pointer descriptors retained in linking facts carry an optional
+`owner_dependent` boolean. It distinguishes a template owner from a declared
+class with the same spelling. Absent values in earlier exports default to false;
+false values are omitted when writing descriptors. Display names retain the
+original owner spelling.
 
 ### locations
 

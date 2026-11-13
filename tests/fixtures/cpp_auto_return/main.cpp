@@ -120,8 +120,8 @@ void shared_const() { auto p = std::make_shared<const Worker>(); p->run(); p->go
 }
 template<class U> struct Box { void run() {} };
 void shared_template() { auto p = std::make_shared<Box<int>>(); p->run(); }
-// A smart pointer's argument that names a class only through `using` is
-// ambiguous with the spelling the index holds: no guess.
+// A smart pointer's argument resolves through a unique using-directive class
+// and keeps that class's qualified name.
 namespace hdfx { struct Strategy { void run() {} }; }
 namespace strat_user {
 using namespace hdfx;

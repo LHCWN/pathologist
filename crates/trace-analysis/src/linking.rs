@@ -31,6 +31,17 @@ fn parameter_shape(t: &TypeDesc, guesses: &[String], types: &mut TypeTable) -> T
             }
         }
         TypeDesc::Ptr(t) => TypeDesc::Ptr(Box::new(parameter_shape(t, guesses, types))),
+        TypeDesc::MemberPointer {
+            owner_dependent,
+            owner,
+            member,
+            is_function,
+        } => TypeDesc::MemberPointer {
+            owner_dependent: *owner_dependent,
+            owner: owner.clone(),
+            member: Box::new(parameter_shape(member, guesses, types)),
+            is_function: *is_function,
+        },
         TypeDesc::Array { elem, size } => TypeDesc::Array {
             elem: Box::new(parameter_shape(elem, guesses, types)),
             size: *size,
@@ -532,6 +543,65 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn member_pointer_parameter_guesses_survive_cross_provider_class_declarations() {
+        let mut types = TypeTable::default();
+        types.declare_struct("MySize");
+        let named = TypeDesc::Struct {
+            name: "MySize".into(),
+            fields: vec![],
+        };
+        for is_function in [false, true] {
+            let member = if is_function {
+                TypeDesc::FnPtr {
+                    ret: Box::new(named.clone()),
+                    params: vec![named.clone()],
+                }
+            } else {
+                named.clone()
+            };
+            let original = TypeDesc::Array {
+                elem: Box::new(TypeDesc::MemberPointer {
+                    owner_dependent: false,
+                    owner: "C".into(),
+                    is_function,
+                    member: Box::new(member),
+                }),
+                size: Some(2),
+            };
+            let tagged = parameter_shape(&original, &["MySize".into()], &mut types);
+            assert!(!may_name_same_type(&original, &tagged));
+            let TypeDesc::Array {
+                elem,
+                size: Some(2),
+            } = tagged
+            else {
+                panic!("array shape lost")
+            };
+            let TypeDesc::MemberPointer {
+                owner,
+                member,
+                is_function: category,
+                ..
+            } = elem.as_ref()
+            else {
+                panic!("member category lost")
+            };
+            assert_eq!(owner, "C");
+            assert_eq!(*category, is_function);
+            let guessed = if let TypeDesc::FnPtr { ret, params } = member.as_ref() {
+                assert!(types.is_guessed_class(&params[0]));
+                ret.as_ref()
+            } else {
+                member.as_ref()
+            };
+            assert!(types.is_guessed_class(guessed));
+            assert!(
+                matches!(guessed, TypeDesc::Struct { name, .. } if name == "@trace-linking-guess:MySize")
+            );
+        }
+    }
+
     #[test]
     fn source_parameter_guess_is_not_erased_by_another_providers_class() {
         let named = TypeDesc::Struct {
