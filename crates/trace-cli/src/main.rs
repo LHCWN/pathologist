@@ -61,6 +61,10 @@ enum Commands {
         /// without commands, uses host GCC/Clang (must match the target SDK).
         #[arg(long)]
         system_includes: bool,
+        /// Index system headers once as one canonical preamble; faster but
+        /// loses per-translation-unit macro configurations (experimental).
+        #[arg(long)]
+        canonical_system_headers: bool,
         /// Import allowlisted target compiler predefined macros (opt-in).
         #[arg(long)]
         compiler_predefines: bool,
@@ -452,6 +456,7 @@ fn main() -> Result<()> {
             compile_commands,
             require_local_inputs,
             system_includes,
+            canonical_system_headers,
             compiler_predefines,
             compiler,
             compiler_arg,
@@ -481,6 +486,7 @@ fn main() -> Result<()> {
             compile_commands,
             require_local_inputs,
             system_includes,
+            canonical_system_headers,
             compiler_predefines,
             compiler,
             compiler_arg,
@@ -528,6 +534,7 @@ fn run_analyze(
     compile_commands: Option<PathBuf>,
     require_local_inputs: bool,
     system_includes: bool,
+    canonical_system_headers: bool,
     compiler_predefines: bool,
     compiler: Option<PathBuf>,
     compiler_arg: Vec<String>,
@@ -601,6 +608,7 @@ fn run_analyze(
     }
     opts.compilation_database = compile_commands;
     opts.system_includes = system_includes;
+    opts.canonical_system_headers = canonical_system_headers;
     opts.compiler_predefines = compiler_predefines;
     opts.compiler = match compiler {
         Some(path) if path.is_relative() && path.components().count() > 1 => {

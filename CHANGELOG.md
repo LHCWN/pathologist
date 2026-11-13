@@ -4,6 +4,38 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Preserve files and directory context during system-header indexing
+
+Canonical preambles now use exclusively created, run-owned temporary files,
+preserving existing files and links and separating concurrent analyses. Their
+synthetic IR identity stays stable for reproducible exports. Compiler probes
+with relative or empty environment include paths remain scoped to the command
+directory even when the compiler omits those paths from its printed search list.
+
+### Index compiler standard headers as one canonical preamble
+
+Bare-tree `--system-includes` re-lowered standard headers for every
+translation unit. `--canonical-system-headers` now builds one canonical
+compiler-default header environment, lowers one shared prelude `UnitIndex`
+per language, and merges it into the final program once. Translation units no
+longer clone the prelude; project and external source headers keep their own
+units. The mode is opt-in and ignored with configured indexing.
+
+The follow-up applies the canonical macro closure at the first standard include,
+preserves project lookup syntax at its include position, and reuses bounded
+project preambles. Prerequisite declaration imports preserve variable/function
+ownership and implicit initializer dependencies; file-static storage and unsafe
+scope cases retain the inline fallback. Include-graph updates avoid repeated
+canonicalization and quadratic duplicate checks. Explicit system roots retain
+normal configuration-sensitive caching.
+
+The complete-tree cost is substantially lower than the initial implementation,
+but default-mode parity is not established. This remains a deliberate trade in
+macro configuration, overload and standard-library typing precision. See the
+[final design and investigation](docs/CANONICAL_SYSTEM_PRELUDE.md),
+[measurements and validation](docs/EVAL_REPORT.md#canonical-header-reuse-finalization-2026-11-15),
+and [preprocessor contract](docs/PREPROCESSOR.md#shared-system-header-bundles).
+
 ### Look up call sites by ID with a binary search
 
 `SymbolTable::call_site_by_id` checked the record at the ID's position and, on a

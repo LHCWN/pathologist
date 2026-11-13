@@ -311,6 +311,14 @@ impl CompilationDatabase {
                                 &cli_include_paths,
                                 cpath_dirs,
                             );
+                            // Explicit `-isystem` paths are echoed by the probe
+                            // but are not compiler defaults.
+                            let explicit = std::mem::take(&mut opts.system_include_paths);
+                            opts.compiler_system_include_paths =
+                                crate::compiler_includes::compiler_default_paths(
+                                    &search.paths,
+                                    &explicit,
+                                );
                             opts.system_include_paths = search.paths;
                         }
                     }

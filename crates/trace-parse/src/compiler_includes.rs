@@ -1,7 +1,7 @@
 //! Query driver-owned headers and allowlisted predefines using empty input only.
 
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,9 +35,32 @@ pub(super) fn remove_system_include_duplicates(
     });
 }
 
+/// The probe's roots that are compiler defaults rather than explicit
+/// `-isystem` paths. A default root that contains an explicit root is dropped
+/// as a whole: headers under the explicit root must keep the conservative
+/// declaration/preamble gate, and treating only that subdirectory as
+/// non-standard would leave its parents classified as standard.
+pub(super) fn compiler_default_paths(searched: &[PathBuf], explicit: &[PathBuf]) -> Vec<PathBuf> {
+    let explicit: Vec<PathBuf> = explicit
+        .iter()
+        .map(|path| trace_ir::canonicalize(path))
+        .collect();
+    searched
+        .iter()
+        .filter(|path| {
+            !explicit.iter().any(|explicit| {
+                explicit.as_path() == path.as_path() || explicit.starts_with(path.as_path())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Default)]
 pub(super) struct CompilerIncludes {
-    drivers: HashMap<(String, PathBuf), Option<PathBuf>>,
+    // A bare driver name is found on PATH from the process directory, not the
+    // command's, so it is located once for the whole run.
+    drivers: HashMap<(String, Option<PathBuf>), Option<PathBuf>>,
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -45,6 +68,9 @@ pub(super) struct CompilerSearch {
     pub paths: Vec<PathBuf>,
     pub target_defines: Vec<(String, String)>,
     pub failure: Option<String>,
+    /// Printed entries are absolute and the environment has no relative
+    /// include paths. Otherwise the result stays keyed by directory.
+    directory_independent: bool,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -62,8 +88,8 @@ impl DiscoveryMode {
     }
 }
 
-type ProbeKey = (
-    PathBuf,
+/// Everything a probe result depends on except the directory it runs in.
+type ProbeConfiguration = (
     PathBuf,
     Language,
     Vec<String>,
@@ -71,7 +97,26 @@ type ProbeKey = (
     DiscoveryMode,
     bool, // Unsupported macro driver; CL and GNU modes can share an executable.
 );
-static PROBE_PATHS: OnceLock<Mutex<HashMap<ProbeKey, CompilerSearch>>> = OnceLock::new();
+/// Results whose search entries and environment include paths were absolute,
+/// so one probe serves every command with the same configuration. A compilation
+/// database commonly has
+/// thousands of entries across many build directories; probing each one
+/// spawned the compiler once per directory for an identical answer.
+type PortableProbeKey = ProbeConfiguration;
+/// Results with relative printed or environment include paths, whose meaning
+/// depends on the command directory even when a missing path was not printed.
+type DirectoryProbeKey = (PathBuf, ProbeConfiguration);
+static PROBE_PATHS: OnceLock<Mutex<HashMap<PortableProbeKey, CompilerSearch>>> = OnceLock::new();
+static PROBE_PATHS_BY_DIRECTORY: OnceLock<Mutex<HashMap<DirectoryProbeKey, CompilerSearch>>> =
+    OnceLock::new();
+
+fn absolute_include_environment(values: &[Option<OsString>]) -> bool {
+    values.iter().flatten().all(|value| {
+        // An empty component means the compiler's current directory, including
+        // an entirely empty variable. Missing directories may not be printed.
+        !value.is_empty() && std::env::split_paths(value).all(|path| path.is_absolute())
+    })
+}
 
 impl CompilerIncludes {
     /// The driver is the real compiler argument, past ccache-like launchers.
@@ -247,7 +292,11 @@ impl CompilerIncludes {
     }
 
     fn locate(&mut self, driver: &str, directory: &Path) -> Option<PathBuf> {
-        let key = (driver.to_owned(), directory.to_path_buf());
+        let path = Path::new(driver);
+        let key = (
+            driver.to_owned(),
+            (path.components().count() > 1 || path.is_absolute()).then(|| directory.to_path_buf()),
+        );
         self.drivers
             .entry(key)
             .or_insert_with(|| locate_driver(driver, directory))
@@ -266,11 +315,15 @@ impl CompilerIncludes {
         // CPATH and friends can alter a driver's reported search list. A
         // process-wide cache avoids repeatedly probing a launcher across
         // independent projects while respecting changes to that environment.
-        const ENV: &[&str] = &[
+        const INCLUDE_ENV: &[&str] = &[
             "CPATH",
             "C_INCLUDE_PATH",
             "CPLUS_INCLUDE_PATH",
             "OBJC_INCLUDE_PATH",
+            "OBJCPLUS_INCLUDE_PATH",
+            "INCLUDE",
+        ];
+        const ENV: &[&str] = &[
             "PATH",
             "SDKROOT",
             "DEVELOPER_DIR",
@@ -278,47 +331,81 @@ impl CompilerIncludes {
             "COMPILER_PATH",
             "MACOSX_DEPLOYMENT_TARGET",
         ];
-        let environment = ENV.iter().map(std::env::var_os).collect();
-        let key = (
+        let environment: Vec<_> = INCLUDE_ENV
+            .iter()
+            .chain(ENV)
+            .map(std::env::var_os)
+            .collect();
+        let absolute_environment = absolute_include_environment(&environment[..INCLUDE_ENV.len()]);
+        let configuration = (
             executable.clone(),
-            directory.to_path_buf(),
             language,
             flags.clone(),
             environment,
             mode,
             unsupported_predefines,
         );
-        let cache = PROBE_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache
-            .entry(key)
-            .or_insert_with(|| {
-                if !unsupported_predefines {
-                    return run_probe(&executable, directory, language, &flags, mode);
-                }
-                let mut search = if mode.includes {
-                    run_probe(
-                        &executable,
-                        directory,
-                        language,
-                        &flags,
-                        DiscoveryMode {
-                            includes: true,
-                            predefines: false,
-                        },
-                    )
-                } else {
-                    CompilerSearch::default()
-                };
-                search.target_defines.clear();
-                let reason = "unsupported macro probe: requires a GNU-compatible -dM driver (native MSVC/IAR is unsupported)";
-                search.failure = Some(match search.failure {
-                    Some(failure) => format!("{failure}; {reason}"),
-                    None => reason.into(),
-                });
-                search
-            })
-            .clone()
+        // An absolute search list is the same answer whatever directory the
+        // command runs in, so look for a portable entry first.
+        let portable = PROBE_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(search) = portable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&configuration)
+            .filter(|_| absolute_environment)
+        {
+            return search.clone();
+        }
+        let directory_key = (directory.to_path_buf(), configuration.clone());
+        let per_directory = PROBE_PATHS_BY_DIRECTORY.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(search) = per_directory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&directory_key)
+        {
+            return search.clone();
+        }
+        let mut search = if !unsupported_predefines {
+            run_probe(&executable, directory, language, &flags, mode)
+        } else {
+            let mut search = if mode.includes {
+                run_probe(
+                    &executable,
+                    directory,
+                    language,
+                    &flags,
+                    DiscoveryMode {
+                        includes: true,
+                        predefines: false,
+                    },
+                )
+            } else {
+                CompilerSearch::default()
+            };
+            search.target_defines.clear();
+            let reason = "unsupported macro probe: requires a GNU-compatible -dM driver (native MSVC/IAR is unsupported)";
+            search.failure = Some(match search.failure {
+                Some(failure) => format!("{failure}; {reason}"),
+                None => reason.into(),
+            });
+            search
+        };
+        // A compiler may omit nonexistent environment directories from an
+        // otherwise absolute search list. They can exist in another command's
+        // directory, so that answer must not become a portable cache entry.
+        search.directory_independent &= absolute_environment;
+        if search.directory_independent {
+            portable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(configuration, search.clone());
+        } else {
+            per_directory
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(directory_key, search.clone());
+        }
+        search
     }
 }
 
@@ -498,10 +585,10 @@ fn run_probe_with_timeout(
             .as_file_mut()
             .read_to_end(&mut output)
             .map_err(|e| e.to_string())?;
-        let paths = if mode.includes {
+        let (paths, absolute_paths) = if mode.includes {
             parse_search_list(&String::from_utf8_lossy(&output), directory)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         let mut macro_bytes = Vec::new();
         if (mode.predefines && completion.is_none()) || (!mode.predefines && !paths.is_empty()) {
@@ -530,10 +617,17 @@ fn run_probe_with_timeout(
         } else {
             Vec::new()
         };
+        // The caller also checks environment paths before sharing this result.
+        // The printed list must be successful, nonempty and absolute. An empty or failed probe
+        // can be caused by something the command directory supplies, and a
+        // relative entry is joined against that directory.
+        let directory_independent =
+            mode.includes && failure.is_none() && !paths.is_empty() && absolute_paths;
         Ok(CompilerSearch {
             paths,
             target_defines,
             failure,
+            directory_independent,
         })
     };
     run().unwrap_or_else(failed)
@@ -721,9 +815,14 @@ fn parse_probe_flags(
     Ok(flags)
 }
 
-fn parse_search_list(stderr: &str, directory: &Path) -> Vec<PathBuf> {
+/// The existing search directories, and whether every relevant entry was
+/// printed as an absolute path. Relative entries are joined against
+/// `directory`, so the second value lets the caller decide whether the same
+/// answer holds for another command directory.
+fn parse_search_list(stderr: &str, directory: &Path) -> (Vec<PathBuf>, bool) {
     let mut inside = false;
     let mut complete = false;
+    let mut absolute = true;
     let mut paths = Vec::new();
     for line in stderr.lines() {
         let line = line.trim();
@@ -733,6 +832,12 @@ fn parse_search_list(stderr: &str, directory: &Path) -> Vec<PathBuf> {
             complete = true;
             break;
         } else if inside && !line.is_empty() && !line.ends_with("(framework directory)") {
+            if !Path::new(line).is_absolute() {
+                // A relative entry that is not a directory here could become
+                // one under another command directory, so the answer is not
+                // portable even when it contributed no path this time.
+                absolute = false;
+            }
             let path = directory.join(line);
             if path.is_dir() {
                 let path = trace_ir::canonicalize(&path);
@@ -743,9 +848,9 @@ fn parse_search_list(stderr: &str, directory: &Path) -> Vec<PathBuf> {
         }
     }
     if complete {
-        paths
+        (paths, absolute)
     } else {
-        Vec::new()
+        (Vec::new(), false)
     }
 }
 
@@ -802,9 +907,9 @@ pub(super) fn apply_fallback_standard(opts: &mut PreprocessOptions, language: La
         standard.and_then(|s| crate::compile_commands::standard_macros(s).ok())
     {
         if expected == language {
-            // Warming starts from a CLI-seeded shared table and restores CLI
-            // definitions only when absent. Do not overwrite that seed with
-            // standard operations that ordinary TU preprocessing would undo.
+            // Explicit CLI definitions have final precedence in both warm
+            // and TU preprocessing; no fallback standard operation may
+            // replace one of those definitions.
             ops.retain(|op| {
                 let (trace_preproc::CommandMacro::Define(name, _)
                 | trace_preproc::CommandMacro::Undef(name)) = op;
@@ -821,6 +926,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_system_roots_exclude_themselves_and_their_default_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("usr/include");
+        let nested = parent.join("mylib");
+        let other = dir.path().join("usr/local/include");
+        let defaults = compiler_default_paths(
+            &[parent.clone(), other.clone()],
+            std::slice::from_ref(&nested),
+        );
+        // The parent is dropped as a whole so no header under it can be
+        // classified as a compiler default.
+        assert_eq!(defaults, vec![other]);
+    }
+
+    #[test]
     fn parses_only_existing_directories_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let one = dir.path().join("one");
@@ -833,13 +953,111 @@ mod tests {
             two.display(),
             one.display()
         );
+        let (paths, absolute) = parse_search_list(&output, dir.path());
         assert_eq!(
-            parse_search_list(&output, dir.path()),
+            paths,
             vec![trace_ir::canonicalize(&one), trace_ir::canonicalize(&two)]
         );
+        assert!(absolute);
+        let (paths, absolute) =
+            parse_search_list(output.trim_end_matches("End of search list.\n"), dir.path());
+        assert!(paths.is_empty());
+        assert!(!absolute);
+    }
+
+    #[test]
+    fn relative_search_entries_are_not_directory_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = "#include <...> search starts here:\n relative/include\nEnd of search list.\n";
+        let (_, absolute) = parse_search_list(output, dir.path());
+        assert!(!absolute);
+    }
+
+    #[test]
+    fn environment_include_paths_must_all_be_absolute_to_share_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = std::env::join_paths([dir.path(), dir.path()]).unwrap();
+        assert!(absolute_include_environment(&[
+            None,
+            Some(absolute.clone())
+        ]));
+        for relative in [
+            OsString::new(),
+            OsString::from("relative-include"),
+            std::env::join_paths([dir.path(), Path::new(""), dir.path()]).unwrap(),
+        ] {
+            assert!(!absolute_include_environment(&[
+                Some(absolute.clone()),
+                Some(relative)
+            ]));
+        }
+    }
+
+    #[test]
+    fn relative_environment_paths_preserve_each_command_directory() {
+        const CHILD_ROOT: &str = "TRACE_TEST_PROBE_INCLUDE_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let dir = tempfile::tempdir().unwrap();
+            // Isolate environment changes from concurrently running tests.
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "compiler_includes::tests::relative_environment_paths_preserve_each_command_directory", "--nocapture"])
+                .env(CHILD_ROOT, dir.path()).env("C_INCLUDE_PATH", "relative-include");
+            for name in [
+                "CPATH",
+                "CPLUS_INCLUDE_PATH",
+                "OBJC_INCLUDE_PATH",
+                "OBJCPLUS_INCLUDE_PATH",
+                "INCLUDE",
+            ] {
+                child.env_remove(name);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let root = trace_ir::canonicalize(Path::new(&root));
+        let Some(driver) = locate_driver("gcc", &root).or_else(|| locate_driver("clang", &root))
+        else {
+            eprintln!("skipping real compiler environment probe: gcc/clang unavailable");
+            return;
+        };
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir_all(second.join("relative-include")).unwrap();
+        let sources = [root.join("a.c"), root.join("b.c")];
+        let mut commands = Vec::new();
+        for (source, directory) in sources.iter().zip([&first, &second]) {
+            std::fs::write(source, "").unwrap();
+            commands.push(serde_json::json!({"directory": directory, "file": source, "arguments": [driver, "-c", source]}));
+        }
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::to_string(&commands).unwrap(),
+        )
+        .unwrap();
+        let opts = PreprocessOptions::new().with_system_includes(true);
+        let results = crate::CompilationIncludeSearches::default()
+            .searches(&root, &opts, &sources)
+            .unwrap();
+        let include = trace_ir::canonicalize(&second.join("relative-include"));
+        let paths_for = |source: &PathBuf| {
+            &results
+                .iter()
+                .find(|result| result.source.as_ref() == Some(source))
+                .unwrap()
+                .paths
+        };
+        assert!(!paths_for(&sources[0]).contains(&include));
         assert!(
-            parse_search_list(output.trim_end_matches("End of search list.\n"), dir.path())
-                .is_empty()
+            paths_for(&sources[1]).contains(&include),
+            "missing {include:?}: {:?}",
+            paths_for(&sources[1])
         );
     }
 
@@ -925,6 +1143,55 @@ mod tests {
             lines.lines().collect::<Vec<_>>(),
             [first.to_str().unwrap(), second.to_str().unwrap()]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_search_list_is_reused_across_command_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let include = dir.path().join("include");
+        std::fs::create_dir(&include).unwrap();
+        let driver = dir.path().join("compiler");
+        let log = dir.path().join("working_directories");
+        std::fs::write(
+            &driver,
+            format!(
+                "#!/bin/sh\npwd >> '{}'\nprintf '#include <...> search starts here:\\n {}\\nEnd of search list.\\n' >&2\n",
+                log.display(),
+                include.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = vec![driver.to_string_lossy().into_owned()];
+        let mut cache = CompilerIncludes::default();
+        let mut results = Vec::new();
+        for name in ["first", "second"] {
+            let working_directory = dir.path().join(name);
+            std::fs::create_dir_all(&working_directory).unwrap();
+            results.push(
+                cache
+                    .for_command(
+                        &args,
+                        &working_directory,
+                        Language::C,
+                        &[],
+                        DiscoveryMode {
+                            includes: true,
+                            predefines: false,
+                        },
+                    )
+                    .paths,
+            );
+        }
+        assert_eq!(results[0], vec![trace_ir::canonicalize(&include)]);
+        assert_eq!(results[1], results[0]);
+        // A relative-free answer is probed once and reused for the second
+        // build directory.
+        let lines = std::fs::read_to_string(&log).unwrap();
+        let first = trace_ir::canonicalize(&dir.path().join("first"));
+        assert_eq!(lines.lines().collect::<Vec<_>>(), [first.to_str().unwrap()]);
     }
 
     #[cfg(unix)]

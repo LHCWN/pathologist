@@ -81,9 +81,30 @@ When enabled, trace asks the compiler for its include search directories with
 an empty `-E -v` preprocessing run. With compilation commands,
 the command's driver, working directory, environment include paths and
 include-affecting target/sysroot options, including `-arch`, select the search;
-identical probes are cached across commands. The probe includes explicit
-`-isystem` directories so its one ordered result preserves their position
-relative to `CPATH`.
+identical probes are cached across commands, and a bare driver name is located
+once per run. A successful probe whose search entries and environment include
+paths are all absolute is also
+reused across command working directories: a large compilation database often
+has thousands of entries in many directories whose compiler answer is the same.
+Relative search entries stay keyed by directory, because the compiler's path is
+resolved against it. This also applies to relative or empty components in
+`CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`, `OBJC_INCLUDE_PATH`,
+`OBJCPLUS_INCLUDE_PATH` and `INCLUDE`, even when the compiler prints only
+absolute entries: a missing relative environment directory may be omitted from
+one probe's search block and exist in another command directory. Environment
+values participate in cache identity, including Objective-C++ and MSVC-style
+include variables. Unset variables do not restrict sharing; empty components
+mean the command's current directory. The probe includes explicit `-isystem` directories so its
+one ordered result preserves their position relative to `CPATH`. Probe-reported
+roots are recorded in `PreprocessOptions::compiler_system_include_paths`
+(library builder: `with_compiler_system_include`); bare-tree indexing treats
+those roots as standard headers and may separate them after project
+declarations. This treats the compiler's whole default search list as
+compiler-provided, so a locally installed header under such a root inherits the
+relaxation. To keep a specific tree conservative, name its directory explicitly
+with `-isystem` (`with_system_include`): a default root that contains an
+explicit root is dropped from the standard set, and the explicit root itself is
+never standard.
 Relative executable paths are resolved from the command directory; relative
 `PATH` entries are resolved from trace's working directory, and Windows
 executable suffixes are honored. Both `-isysroot=/sdk` and `-isysroot/sdk`
@@ -405,7 +426,7 @@ flowchart LR
 | Missing-header guidance | Bounded CLI summary and opt-in candidate include roots; see [missing-header guidance](#missing-header-guidance). |
 | Compilation options (#62) | Ordered command macro operations, quoted/normal/system/after include search classes, opt-in compiler default path discovery (`--system-includes`), opt-in [compiler predefined macro discovery](#compiler-predefined-macros-230) (#230), forced headers with original LineMap origins; language and standard-version predefines. Inferred paths respect the [test partition](ANALYSIS.md#declaring-header-eligibility). |
 | External-header lexing | Bounded sharing of raw tokens by path, language and contents; macro expansion remains per consumer. See [compilation database options](#compilation-database-options-62). |
-| Shared system bundles | Compatible leading system includes containing only dependency-owned inline text share expansions and declaration IR; see [Shared system header bundles](#shared-system-header-bundles). |
+| Shared system bundles | Compatible leading system includes containing only dependency-owned inline text share expansions and declaration IR; see [Shared system header bundles](#shared-system-header-bundles). Opt-in `--canonical-system-headers` shares one compiler-default preamble across translation units; see [Canonical system preamble](#canonical-system-preamble). |
 | Comments | `//`, `/* */` |
 | Line splicing | Translation phase 2 (C11 5.1.1.2p1) runs inside the lexer, at the character level: every `\`-newline (`\n` or `\r\n`, and — as gcc and clang accept with a warning — with horizontal whitespace between the `\` and the newline) is deleted before any token is recognized, so a spliced identifier is one identifier (`int c\`-newline-`d;` is `int cd;`), a spliced multi-character punctuator is munched whole (`.\`-newline-`..` is `...`, so `#define F(x, .\`-newline-`..)` is the variadic macro gcc and clang see — #38), a spliced encoding prefix or string body stays one literal, a `//` comment ending in `\` continues onto the next line and `/\`-newline-`*` opens a block comment. A `\r` counts only as the first half of a `\r\n`: `\`-CR-CR-LF and `\`-CR-space-LF are not splices, as in clang. Inside a C++11 raw string literal the splice is reverted ([lex.pptoken]p3) and the body is kept as written; in C, where `R"(…)"` is the identifier `R` followed by an ordinary string, a splice in that body is deleted like in any string — clang's `-std=c11` behaviour, while gcc and clang in their default GNU modes lex a raw string there and keep the splice as written. Token positions stay physical — a token starts where its first character sits in the file, which is what the LineMap needs — so adjacency can no longer be read off `line`/`col`; instead the lexer records on every token whether it touched the previous one (`Token::adjacent_before`, with a splice counting as nothing and whitespace, comments and newlines as a gap), and that flag is what the function-like `#define` test and `#` stringizing read. Before #38 the lexer kept `\` + newline as two tokens and each consumer that needed phase 2 skipped the pair itself, so the splice was still visible everywhere else: `int c\`-newline-`d;` came out as `int c\ d;` and a spliced ellipsis stayed three `.` tokens |
 | Punctuators | The multi-character forms the lexer knows are one token each, so the re-speller writes them back unbroken: `##`, the two-character operators (`<<` `>>` `<=` `>=` `==` `!=` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `->`) and the three-character `...` and `->*`. Anything else is one token per character; the ones that still come out glued do so because the output spacing rule happens not to separate them (`::`, `.*`, and the `=` after `>>` / `<<`), not because they are single tokens. `->*` needed its own token because the spacing rule *does* separate it: the space before `*` after `>` that keeps `shared_ptr<T> &p` from gluing into `>&` also split `c->*m` into `c-> * m`, which is not C++, and tree-sitter then recovered the operand as a callee — fabricating a function named after it, in one corpus case named after a template parameter (#37). Recovering the token does not make the construct parse: tree-sitter-cpp knows `->*` only as an overloadable operator name and as a fold operator — `struct S { int operator->*(int); };` and `(a ->* ...)` both parse — and has no rule for it as a binary operator in an ordinary expression, so `c->*m` is an ERROR site even in pristine source, while `c.*m` parses. `->*` is also lexed as one token only in C++: gcc and clang tokenize `a->*b` in C as `->` then `*`. The re-speller gives `...` a leading space when the output already ends in a preprocessing number, because a pp-number absorbs `.` and alphanumerics (C11 6.4.8) and would otherwise swallow it — the GNU case range `case 0x0300 ... 0x0307:` would come back as the single number `0x0300...0x0307`; after an identifier (`Args...`) no space is added. Before #28 there was no `...` case, so every ellipsis lexed as three `.` tokens and, since the spacing rule *does* put a space before `.`, came out as `. . .` — a tree-sitter ERROR site in every variadic declaration, 111 of the 756 catalogued ERROR sites across the pinned corpora |
@@ -714,23 +735,51 @@ Ownership follows each include occurrence that emits inline text, including
 unguarded fragments included earlier with an inactive conditional body. A
 run-wide set of previously included paths cannot establish which files supplied
 text to a particular bundle.
-Bundles containing namespace directives, using-declarations or weak pragmas
+Bundles containing namespace directives, non-member using-declarations or weak pragmas
 remain inline: these affect lookup or declarations in the consumer and are
-not carried by declaration IR. Type aliases (`using Name = Type;`) remain
+not carried by declaration IR. A using-declaration inside a proven class body
+is shareable: class member imports are retained in the shared IR. The lexical
+tracker retains the conservative fallback for namespace/linkage bodies and
+unclassified or malformed scopes; class-template parameter lists alone do not
+establish a class body. Type aliases (`using Name = Type;`) remain
 shareable. During system-header sharing, this fallback also applies to nested
 project cache entries so an enclosing bundle cannot hide these effects.
+In experimental canonical mode, project headers whose only consumer effects are global or namespace/linkage
+using-declarations may share declaration IR while retaining a small syntax
+projection at the include position. The projection preserves the original
+namespace grouping and LineMap origins; bodies and other declarations stay in
+the header unit. Nested include fragments inside an existing scope, weak
+pragmas, malformed boundaries, unclassified scopes, file-static data and
+anonymous namespace dependencies retain the inline
+fallback. Header units carrying such a projection import prerequisite callable
+declarations as well as types so their own uses retain return/result typing.
+Storage-context dependencies propagate through cached replays and guard skips;
+static function definitions and class static members do not alone trigger them.
+Each prerequisite contributes its own declarations and global variable metadata;
+imported prerequisite bodies are not recursively copied into another header unit.
+Callable imports retain possible literal uses, lifecycle/operator/template
+candidates, and names read by stored member initializers and default arguments.
+All overloads of a retained spelling remain candidates. Parameters whose owning
+function was excluded are excluded too, preserving ownership through nesting.
+This uses the existing [shared-project-header approximation](ANALYSIS.md#shared-header-functions)
+for implicit incoming type dependencies; ordinary system indexing keeps its
+conservative import fallback.
 `_Pragma` operators, including macro-generated libc++ macro-cleanup sequences,
 are processed as directives and removed before scope tracking. A header ending
 in those operators can finish a bundle without preventing the following system
 include from sharing. Macro push/pop stacks are not modeled: both pragma
 spellings retain the existing ignore policy for `push_macro`/`pop_macro`.
 
-Project declarations and a nonempty preceding project-header preamble still
-prevent system bundle separation. System-root membership alone does not prove
-independence from project types or overload context; relaxing this gate also
-requires preserving include-position imports. In particular, own-header-first
-layouts can still keep later system headers inline. The
-[indexing diagnostics](MEMORY_PROFILE.md#indexing-subphase-timings) expose
+Compiler-default standard headers — the roots the include probe reports and
+`PreprocessOptions::compiler_system_include_paths` records — separate even
+after project declarations and a preceding project-header preamble. Those
+headers are written against reserved names, and any project macro they read is
+still part of the expansion fingerprint. Explicit `-isystem` roots keep the
+declaration/preamble gate: a project can place its own aliases there, and a
+system header that uses such an alias must be lowered in the consumer's scope
+(verified by the `project-aliases` test). Completion refuses any bundle that
+embeds project text, changes consumer lookup, or cannot cover its prerequisites.
+The [indexing diagnostics](MEMORY_PROFILE.md#indexing-subphase-timings) expose
 refused bundle attempts by reason, so successful sharing must be checked on
 each platform rather than inferred from Linux measurements.
 
@@ -790,15 +839,60 @@ opposite include orders may form a path-level cycle while the variant
 dependencies remain acyclic. Genuine cycles retain a deterministic sequential
 fallback.
 
+### Canonical system preamble
+
+`--canonical-system-headers` (bare-tree only) replaces per-consumer lowering of
+compiler-default standard headers with one shared prelude. Indexing writes a
+temporary `.trace-canonical-std.tmp` in the target root containing each standard
+angle spelling, preprocesses it inline once, and lowers the result to one
+`UnitIndex` per language. The prelude is merged into the final program once,
+after project-header and translation-unit merges, so it does not enlarge the
+dedup tables those merges consult; translation units do not clone it. Project
+and external source headers still get their own units and are filtered out of
+the prelude only when they lie under a compiler-default root. See
+[Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md) for the full
+design, rejected approaches and measurements.
+
+Because standard declarations are no longer present while a translation unit
+is lowered, member resolution that depends on a standard-library type (for
+example `std::shared_ptr`'s `operator->`) can differ from per-command
+`--system-includes` indexing. The per-unit overhead is then the project-header
+context only; it no longer scales with the standard-library IR size.
+
+The expansion cache stores only the first variant of each compiler-default
+standard header (`canonical_system_headers`). Journal publishing is first-wins
+for those paths, while project headers keep the normal variant cap. Explicit
+`-isystem` and `-idirafter` roots are not canonicalized: a project can place
+aliases there, so those headers retain the existing per-consumer
+declaration/preamble gate. The prelude is built before parallel discovery, so
+discovery and translation units all replay the same stored variant.
+
+This is a precision-for-speed tradeoff. All translation units see one macro
+configuration, so conditional standard-library variants, per-unit declaration
+sets and dependent type spellings can differ from ordinary
+`--system-includes` indexing. Project bodies, call sites and project-header
+units are not intentionally deduplicated. Project call edges can therefore
+move toward the no-system-include result rather than matching every
+per-consumer system typing. The mode is ignored when compilation commands
+configure indexing, because each command carries its own configuration. It is
+currently a subset optimization: on the complete `ability_ability_runtime`
+tree it is slower than master without options. See
+[Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md) for the design,
+rejected approaches and complete measurements, and the
+[system-header measurements](EVAL_REPORT.md#canonical-system-preamble-measurements)
+for the evaluation-report summary.
+
 ### Determinism
 
 Indexing output must be identical across runs of the same tree. Two mechanisms guarantee this:
 
-- **Macro warm pass** runs sequentially over TU-reachable headers in canonical (`index_order`) order, once per language the header is reachable in (C++ when a C++ TU reaches it or the extension is a C++ header spelling, C when a C TU reaches it; `PreprocessOptions::with_language` forces one language for everything). Each warm runs under a **fresh macro table** seeded only from command-line defines lexed in that language; the per-header final states are merged into a **per-language union table** — every warmed header lands in both unions, the same-language warm preferred and the other language's re-lexed for the destination as fallback (`MacroDef::relexed` spells the tokens back with their adjacency intact, which is all the two lexers disagree about), so each union stays the full macro superset (twin-guard dedup, orphan and PCH headers) whichever language reached a header — and each later phase hands a file the union (and option set) of the language it is lexed and parsed as. The first language warmed is the one the header is parsed as and feeds the source cache; a second only fills the expansion cache and its union. Reachability comes from the include graph and warming grows that graph (a `#include MACRO` is discovered only while preprocessing the header spelling it), so the pass runs to a **fixed point**: after each round the discovered edges are added, every header's language list is recomputed, and a header whose list changed — a `.h` first reached from C alone that a C++ unit turns out to reach through a macro include, and is therefore parsed as C++ — is evicted from the source cache and warmed again under a fresh table, so the text the parser sees is always the preprocess in the language it is parsed as. The root file of a preprocess run is never replayed from the expansion cache (a nested include may have cached it first); only nested `#include`s replay. Sharing one accumulating table across headers let include guards defined by earlier-warmed headers starve later headers' expansions (the starved text was then frozen into the expansion cache). Dedup between headers comes from the shared expansion cache, not from shared guard state.
+- **Macro warm pass** runs sequentially over TU-reachable headers in canonical (`index_order`) order, once per reachable language. C++ TUs and C++ header extensions select C++; C TUs also select C; an explicit language override applies to all units. Each warm starts from a **fresh local macro table** using the same predefined/compiler/command/CLI precedence as TU preprocessing. Final warm macro tables are discarded: publishing every definition to an additional locked table is unnecessary. The first language supplies the source cache; another language only fills its expansion variants and diagnostics. Warming grows include reachability through macro-spelled includes, so it runs to a **fixed point**: changed language lists evict and re-warm the affected headers. The root file is never replayed from the expansion cache; nested includes may replay. Deduplication uses the shared expansion cache, never another header's include guards.
 - **No output reads a hash-map iteration order.** This is not a mechanism so much as an invariant the other two rest on, and it is worth stating because the maps are hashed with `rustc-hash`, which unlike `std`'s `RandomState` is *not* seeded per process: a change that started ordering output by a `HashMap`/`HashSet` traversal would no longer be caught by comparing two runs. Where an order matters it comes from a sort, a `Vec`, an `IndexMap`, or `index_order`. Byte-identical output across the hasher swap is the evidence that nothing did (#83).
 - **Expansion-cache freeze**: the cache is keyed by (canonical path, language), so a C unit never replays a header's C++ tokenization or vice versa. Every parallel phase after discovery reads the include-expansion cache read-only (`PreprocessOptions::frozen_expansion_cache`): hits replay stored entries, misses expand inline under each TU's own macro/guard state and are *not* inserted — first-writer-wins inserts would make results scheduling-dependent. The one pass that writes it, discovery, runs its units on the pool too, but publishes in unit order (see [Parallel discovery](#parallel-discovery-88)).
 
-Translation units inherit the **union** of all warm-pass macro states: cached expansions replay without executing their `#define` directives, so TU-local code still needs those macros.
+Translation units start from their own option-derived macro state and acquire
+header directives through their actual includes. Cached expansion hits replay
+their ordered macro operations; no union of warm-pass guards enters a TU.
 
 ### Parallel discovery (#88)
 

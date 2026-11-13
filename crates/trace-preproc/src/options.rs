@@ -193,6 +193,10 @@ pub struct MacroFingerprint {
     /// `required_headers`, this distinguishes the whole declaration context,
     /// including the absence of a previously supplied bundle.
     pub header_context_size: Option<usize>,
+    /// Whether the canonical closure was already supplied on entry. A cold
+    /// entry's operation log can supply it; replaying that log in an already
+    /// primed consumer would undo intervening project macro overrides.
+    pub canonical_prelude: Option<bool>,
 }
 
 impl MacroFingerprint {
@@ -226,6 +230,11 @@ impl MacroFingerprint {
             (3u8, size).hash(&mut h);
             acc ^= h.finish();
         }
+        if let Some(primed) = self.canonical_prelude {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (4u8, primed).hash(&mut h);
+            acc ^= h.finish();
+        }
         acc
     }
 
@@ -239,8 +248,12 @@ impl MacroFingerprint {
         any_bound: impl FnOnce(&FxHashSet<Arc<str>>) -> bool,
         mut header: impl FnMut(&Path) -> Option<u64>,
         header_count: impl FnOnce() -> usize,
+        canonical_prelude: impl FnOnce() -> bool,
     ) -> bool {
         !self.incompatible
+            && self
+                .canonical_prelude
+                .is_none_or(|primed| primed == canonical_prelude())
             && self
                 .header_context_size
                 .is_none_or(|size| size == header_count())
@@ -321,6 +334,7 @@ struct SearchPaths {
     quote: Vec<PathBuf>,
     include: Vec<PathBuf>,
     system: Vec<PathBuf>,
+    compiler_system: Vec<PathBuf>,
     after: Vec<PathBuf>,
     inferred: Vec<PathBuf>,
     root: Option<PathBuf>,
@@ -416,6 +430,7 @@ impl SourceCache {
             quote: opts.quote_include_paths.clone(),
             include: opts.include_paths.clone(),
             system: opts.system_include_paths.clone(),
+            compiler_system: opts.compiler_system_include_paths.clone(),
             after: opts.after_include_paths.clone(),
             inferred: opts.inferred_include_paths.clone(),
             root: opts.inference_root.clone(),
@@ -503,6 +518,15 @@ pub enum FileGuard {
 /// Cached preprocessed body for a `#include`d file (shared across translation units).
 #[derive(Debug, Clone)]
 pub struct IncludeExpansion {
+    /// Lookup syntax retained at the original include position while the
+    /// header's declarations and bodies are lowered once in their own unit.
+    pub consumer_context: Option<Arc<crate::ConsumerContext>>,
+    /// Replaying this entry supplies the canonical prelude's macro state.
+    /// Its operation log carries the definitions; replay also marks the
+    /// consumer as primed so later cached entries cannot reset overrides.
+    pub provides_canonical_prelude: bool,
+    /// Project file-static data requires the consumer's storage context.
+    pub has_static_data: bool,
     /// Effective C++ language version for semantic lowering of this header.
     pub cpp_standard: u32,
     pub text: Arc<str>,
@@ -561,6 +585,37 @@ pub struct IncludeExpansion {
     pub id: usize,
 }
 
+/// One language's fixed standard-header environment. Only the experimental
+/// canonical indexer constructs this; ordinary preprocessing has none.
+#[derive(Debug, Clone)]
+pub struct CanonicalSystemPrelude {
+    pub ops: Arc<[crate::MacroOp]>,
+    pub files: Arc<FxHashSet<PathBuf>>,
+}
+
+impl CanonicalSystemPrelude {
+    pub fn new(ops: Arc<[crate::MacroOp]>, files: FxHashSet<PathBuf>) -> Self {
+        // Applying the closure has no intervening source reads. Keep each
+        // name's final directive, including undef of an initially absent
+        // name, in last-write order rather than replaying redundant writes.
+        let mut seen = FxHashSet::default();
+        let mut compact = ops
+            .iter()
+            .rev()
+            .filter(|op| {
+                let (crate::MacroOp::Define(name, _) | crate::MacroOp::Undef(name)) = op;
+                seen.insert(name.as_ref())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        compact.reverse();
+        Self {
+            ops: compact.into(),
+            files: Arc::new(files),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CommandMacro {
     Define(String, String),
@@ -578,6 +633,16 @@ pub struct PreprocessOptions {
     /// Query a compiler for its effective system header search paths during
     /// indexing. Off by default; explicit system paths remain available.
     pub system_includes: bool,
+    /// Index system headers once in a canonical macro context and replay that
+    /// single expansion for every consumer. An explicit imprecision trade for
+    /// indexing speed.
+    pub canonical_system_headers: bool,
+    /// Optional canonical macro closure, applied lazily on its first covered
+    /// standard include. Indexed by language; never shared across dialects.
+    pub canonical_system_preludes: Option<Arc<FxHashMap<Language, Arc<CanonicalSystemPrelude>>>>,
+    /// Capture executed macro directives in `PreprocessResult::macro_ops`.
+    /// Used only while preparing a canonical macro closure.
+    pub record_macro_ops: bool,
     /// Opt in to allowlisted compiler predefined macros during indexing.
     pub compiler_predefines: bool,
     /// Fallback driver for sources without a usable compilation command.
@@ -602,6 +667,12 @@ pub struct PreprocessOptions {
     pub quote_include_paths: Vec<PathBuf>,
     /// System directories follow `include_paths`, in supplied order.
     pub system_include_paths: Vec<PathBuf>,
+    /// Compiler-default roots reported by the include probe, as opposed to
+    /// explicit `-isystem` paths. Bare-tree indexing shares standard headers
+    /// under these roots even after project declarations, because the
+    /// compiler's own headers are written to stand alone there; other system
+    /// roots keep the conservative declaration/preamble gate.
+    pub compiler_system_include_paths: Vec<PathBuf>,
     /// Selected target/hosted macros reported by the compiler include probe.
     /// Command macro operations and explicit `defines` may override these.
     pub compiler_defines: indexmap::IndexMap<String, String>,
@@ -720,6 +791,9 @@ impl Default for PreprocessOptions {
             diagnostic_pool: None,
             compilation_database: None,
             system_includes: false,
+            canonical_system_headers: false,
+            canonical_system_preludes: None,
+            record_macro_ops: false,
             compiler_predefines: false,
             compiler: None,
             compiler_args: Vec::new(),
@@ -731,6 +805,7 @@ impl Default for PreprocessOptions {
             test_partition: trace_ir::TestPartition::default(),
             quote_include_paths: Vec::new(),
             system_include_paths: Vec::new(),
+            compiler_system_include_paths: Vec::new(),
             compiler_defines: indexmap::IndexMap::new(),
             after_include_paths: Vec::new(),
             strict_include_search: false,
@@ -780,10 +855,12 @@ impl PreprocessOptions {
             || !self.forced_includes.is_empty()
             || !self.quote_include_paths.is_empty()
             || !self.system_include_paths.is_empty()
+            || !self.compiler_system_include_paths.is_empty()
             || !self.compiler_defines.is_empty()
             || !self.after_include_paths.is_empty()
             || self.compiler_predefines
             || self.system_includes
+            || self.canonical_system_headers
             || self.strict_include_search
     }
 
@@ -869,6 +946,13 @@ impl PreprocessOptions {
         self
     }
 
+    /// Enable canonical, single-variant indexing of system headers.
+    #[must_use]
+    pub fn with_canonical_system_headers(mut self, enabled: bool) -> Self {
+        self.canonical_system_headers = enabled;
+        self
+    }
+
     /// Enable or disable allowlisted compiler macro discovery during indexing.
     #[must_use]
     pub fn with_compiler_predefines(mut self, enabled: bool) -> Self {
@@ -901,6 +985,16 @@ impl PreprocessOptions {
     #[must_use]
     pub fn with_system_include(mut self, path: impl Into<PathBuf>) -> Self {
         self.system_include_paths.push(path.into());
+        self
+    }
+
+    /// Declare a compiler-default system root that the include probe reported.
+    /// The root is searched as a system directory and its standard headers may
+    /// be shared after project declarations; explicit
+    /// [`with_system_include`](Self::with_system_include) roots may not.
+    #[must_use]
+    pub fn with_compiler_system_include(mut self, path: impl Into<PathBuf>) -> Self {
+        self.compiler_system_include_paths.push(path.into());
         self
     }
 
