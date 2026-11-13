@@ -3511,7 +3511,9 @@ flow tables hold no flow graph, as source-level `inspect dataflow` does.
   whose line moves no pointer or function value through that name is an
   error.
 - **One file.** `--file` is a literal substring of the recorded path (`_`
-  and `%` are no wildcards), as in every `inspect` query. When it matches
+  and `%` are no wildcards; `/` and `\` are interchangeable), as in every
+  `inspect` query. On Windows an absolute existing spelling is canonicalized,
+  so an 8.3 short name expands to the stored long path. When it matches
   several files and more than one of them has a declaration or a use at the
   position, the query is refused with the files listed: give more of the
   path.

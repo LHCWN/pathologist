@@ -732,7 +732,7 @@ mod tests {
             let app = db.targets.iter().find(|t| t.name == "//:app").unwrap();
             assert!(app
                 .output
-                .starts_with(dir.path().canonicalize().unwrap().join(".trace-gn")));
+                .starts_with(trace_ir::canonicalize(dir.path()).join(".trace-gn")));
             assert_eq!(app.sources.len(), 1);
             assert_eq!(app.dependencies.len(), 1);
             assert_eq!(db.targets[app.dependencies[0]].name, "//:lib");
@@ -950,7 +950,7 @@ mod tests {
         // common.gni is read once for three imports; the missing file is
         // never read.
         assert_eq!(IMPORT_LOADS.with(|n| n.get()), 1);
-        let root = dir.path().canonicalize().unwrap();
+        let root = trace_ir::canonicalize(dir.path());
         let names: Vec<_> = db.targets.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["//a:a", "//b:b", "//c:c"], "{:?}", db.warnings);
         assert_eq!(

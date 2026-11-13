@@ -265,7 +265,7 @@ instead.
 | `<DB>` | Path to SQLite file produced by `trace analyze`. |
 | `--from <FN>` | Filter edges where the **caller** name equals `FN` or ends with `::FN` (C++ qualified methods). `_` and `%` in `FN` are literal, not `LIKE` wildcards. |
 | `--to <FN>` | Filter edges where the **callee** name equals `FN` or ends with `::FN`. Same escaping as `--from`. |
-| `--file <SUBSTR>` | Filter ordinary edges by call-site or callee file; synthetic edges by caller or callee definition file. |
+| `--file <SUBSTR>` | Filter ordinary edges by call-site or callee file; synthetic edges by caller or callee definition file. `/` and `\` are interchangeable. |
 | `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden. |
 | `--exclude-deps` | Hide call edges whose caller or callee comes from a dependency root (`is_dep = 1`). Requires a v4 or later database. |
 
@@ -310,7 +310,7 @@ trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction dow
 
 | Option | Description |
 |--------|-------------|
-| `--file <SUBSTR>` | File path substring to disambiguate same-name functions. |
+| `--file <SUBSTR>` | File path substring to disambiguate same-name functions. `/` and `\` are interchangeable. |
 | `--line <N>` | A line inside the function of interest. |
 | `--depth <N>` | Maximum BFS depth (default 3). |
 | `--show-lambdas` | Inspect the complete graph, including lambda intermediates. |
@@ -414,7 +414,7 @@ trace inspect <DB> sequence (--function FN | --file SUBSTR --line N [--col C] [-
 
 | Option | Description |
 |--------|-------------|
-| `--function <FN>` | Function name, C++ qualified suffix, or `FILE:LINE`; `--file` narrows a name, and shows only the bodies compiled from or written in that file. |
+| `--function <FN>` | Function name, C++ qualified suffix, or `FILE:LINE`; `--file` narrows a name, and shows only the bodies compiled from or written in that file (`/` and `\` are interchangeable). |
 | `--file <SUBSTR>`, `--line <N>` | Position of the starting call: its spelling or its macro invocation. A call several configuration variants compile is one call, followed in each of them. |
 | `--col <C>`, `--callee <NAME>` | Pick one call when the line holds several (`NAME` or a `::NAME` suffix). |
 | `--to-file`, `--to-line`, `--to-col`, `--to-callee` | The second call: show the paths between the two and report their relation. |
@@ -453,7 +453,9 @@ trace inspect /tmp/trace.db diagnostics --file main.cpp --format json
 
 Text output includes severity, pipeline stage, message, and the original source
 path and line when available. `--stage` and `--severity` match exactly;
-`--file` matches a literal path substring. Filters combine, and records retain
+`--file` matches a literal path substring; `/` and `\` are interchangeable, and
+on Windows an absolute existing spelling is canonicalized (8.3 short names
+expand to the stored long path). Filters combine, and records retain
 export order. Diagnostics for the whole run (such as a solver budget limit)
 have no source path and are omitted when filtering by file. JSON output is an
 array of objects with `severity`, `file` (nullable), `line`, `message`, and
@@ -475,7 +477,7 @@ trace inspect <DB> dataflow --file SUBSTR --line N --col C [--depth N] [--direct
 
 | Option | Description |
 |--------|-------------|
-| `--file <SUBSTR>` | File path substring. |
+| `--file <SUBSTR>` | File path substring; `/` and `\` are interchangeable. |
 | `--line <N>`, `--col <C>` | Position near a source variable **declaration**. Synthetic intermediates are excluded. |
 | `--depth <N>` | Maximum visible transitions after collapsing technical nodes (default 3). |
 | `--direction` | `down` = where values flow (default), `up` = where they come from. |
@@ -565,7 +567,7 @@ trace inspect <DB> slice --file SUBSTR --line N --col C [--name IDENT]
 
 | Option | Description |
 |--------|-------------|
-| `--file <SUBSTR>`, `--line <N>`, `--col <C>` | Position of a variable (declaration, use, or a call's argument: `p` in `sink(p);`) or of a field access (`cb_` in `cb_ = cb;`; `p` after `->` in `s->p = p;`, the other `p` being the variable). `--file` is a literal substring of the recorded path (`%` and `_` are not wildcards). The column is inside the identifier. |
+| `--file <SUBSTR>`, `--line <N>`, `--col <C>` | Position of a variable (declaration, use, or a call's argument: `p` in `sink(p);`) or of a field access (`cb_` in `cb_ = cb;`; `p` after `->` in `s->p = p;`, the other `p` being the variable). `--file` is a literal substring of the recorded path (`%` and `_` are not wildcards; `/` and `\` are interchangeable; on Windows an absolute existing spelling is canonicalized). The column is inside the identifier. |
 | `--name <IDENT>` | The identifier at the position, when the recorded source file cannot be read from here or the line moves several values. |
 | `--up-depth <N>` | Stage 1 limit: edges followed backwards to the sources. |
 | `--down-depth <N>` | Stage 2 limit: edges followed forwards from each source. |

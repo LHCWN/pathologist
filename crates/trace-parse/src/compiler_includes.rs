@@ -820,6 +820,18 @@ pub(super) fn apply_fallback_standard(opts: &mut PreprocessOptions, language: La
 mod tests {
     use super::*;
 
+    /// Windows is case-insensitive, and `PATHEXT` may spell the extension
+    /// `.EXE` even when the file was created as `gcc.exe`.
+    fn same_path(actual: Option<PathBuf>, expected: &Path) -> bool {
+        actual.is_some_and(|actual| {
+            actual.parent() == expected.parent()
+                && actual
+                    .file_name()
+                    .zip(expected.file_name())
+                    .is_some_and(|(a, e)| a.eq_ignore_ascii_case(e))
+        })
+    }
+
     #[test]
     fn parses_only_existing_directories_in_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -1316,9 +1328,13 @@ mod tests {
         let driver = bin.join(if cfg!(windows) { "gcc.exe" } else { "gcc" });
         std::fs::write(&driver, "compiler").unwrap();
         let search = std::env::join_paths([Path::new("relative-bin")]).unwrap();
-        assert_eq!(
-            locate_on_path(Path::new("gcc"), &search, &process_directory),
-            Some(driver)
+        assert!(
+            same_path(
+                locate_on_path(Path::new("gcc"), &search, &process_directory),
+                &driver
+            ),
+            "{}",
+            driver.display()
         );
         assert!(!command_directory.join("relative-bin").exists());
     }
@@ -1329,7 +1345,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let driver = dir.path().join("gcc.exe");
         std::fs::write(&driver, "compiler").unwrap();
-        assert_eq!(existing_executable(&dir.path().join("gcc")), Some(driver));
+        let actual = existing_executable(&dir.path().join("gcc"));
+        assert!(
+            same_path(actual.clone(), &driver),
+            "expected driver at {:?}, found {:?}",
+            driver,
+            actual
+        );
     }
 
     #[cfg(unix)]

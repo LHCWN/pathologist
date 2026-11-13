@@ -212,7 +212,11 @@ fn a_field_access_starts_at_the_cells_it_designates() {
     let start = resolve_slice_start(&conn, FILE, line, col, None).unwrap();
     assert_eq!(start.kind, "field");
     assert_eq!(start.name, "callback_");
-    assert!(start.at.path.ends_with(FILE), "{:?}", start.at);
+    assert!(
+        std::path::Path::new(&start.at.path).ends_with(FILE),
+        "{:?}",
+        start.at
+    );
     let labels: Vec<String> = start
         .nodes
         .iter()
@@ -830,7 +834,10 @@ fn json_output_carries_spans_contexts_and_flags() {
     assert!(!flagged.is_empty());
     for e in flagged {
         assert!(e["site"]["line"].as_i64().unwrap() > 0, "{e}");
-        assert!(e["site"]["path"].as_str().unwrap().ends_with(FILE), "{e}");
+        assert!(
+            std::path::Path::new(e["site"]["path"].as_str().unwrap()).ends_with(FILE),
+            "{e}"
+        );
     }
     assert!(doc["contexts"]
         .as_array()
@@ -1596,6 +1603,24 @@ fn a_file_filter_is_a_literal_substring() {
         !syms.is_empty() && syms.iter().all(|s| s.path.ends_with("a_b.c")),
         "{syms:?}"
     );
+}
+
+#[test]
+fn a_trailing_separator_still_narrows_a_file_filter() {
+    // Canonicalizing the filter must not drop the separator the caller typed:
+    // `src/proj/` matches `a.c`, not its sibling `src/proj-old/b.c`.
+    let (dir, _db, conn) = scratch_db(&[
+        ("src/proj/a.c", "void fa(int *v) { int *p = v; }\n"),
+        ("src/proj-old/b.c", "void fb(int *v) { int *p = v; }\n"),
+    ]);
+    let filter = format!(
+        "{}{}",
+        dir.path().join("src/proj").display(),
+        std::path::MAIN_SEPARATOR
+    );
+    let functions = trace_db::find_functions_at(&conn, &filter, 1).unwrap();
+    let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["fa"]);
 }
 
 #[test]

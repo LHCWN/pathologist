@@ -549,7 +549,7 @@ fn startup_rejects_missing_invalid_and_incompatible_databases() {
 
 fn store_relative_paths(fixture: &Fixture) {
     let conn = Connection::open(&fixture.db).unwrap();
-    let root = fixture.root.canonicalize().unwrap();
+    let root = trace_ir::canonicalize(&fixture.root);
     for path in trace_db::editor_file_paths(&conn).unwrap() {
         let relative = Path::new(&path).strip_prefix(&root).unwrap();
         conn.execute(
@@ -567,7 +567,7 @@ fn relative_paths_use_the_unique_root_across_all_runs() {
     let function = fixture.functions("caller").remove(0);
     store_relative_paths(&fixture);
     let conn = Connection::open(&fixture.db).unwrap();
-    let canonical_root = fixture.root.canonicalize().unwrap();
+    let canonical_root = trace_ir::canonicalize(&fixture.root);
     // A relative root and an equivalent absolute root are unambiguous.
     conn.execute(
         "UPDATE analysis_run SET target_root=?1",
@@ -686,6 +686,10 @@ fn startup_waits_for_a_transient_writer_lock() {
     });
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "Windows cannot atomically replace a database file that is open"
+)]
 #[test]
 fn snapshot_stays_pinned_when_database_is_replaced() {
     let fixture = Fixture::new("lsp_calls");

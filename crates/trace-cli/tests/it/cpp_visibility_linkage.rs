@@ -13,7 +13,7 @@ fn cpp_visibility_linkage_keeps_unrelated_parse_diagnostics() {
 
 #[test]
 fn cpp_visibility_linkage_orders_preserve_identity_and_source_mapping() {
-    let root = fixture("cpp_visibility_linkage").canonicalize().unwrap();
+    let root = trace_ir::canonicalize(&fixture("cpp_visibility_linkage"));
     let opts = PreprocessOptions::new().with_include(root.clone());
     for file in ["api.hpp", "factory.cpp", "caller.cpp"] {
         let preprocessed = preprocess_file(&root.join(file), &opts).unwrap();
