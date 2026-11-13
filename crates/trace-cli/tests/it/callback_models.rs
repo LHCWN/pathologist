@@ -6,6 +6,27 @@ use common::*;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, FnModelSet, ResolutionKind};
 use trace_parse::build_program;
 
+analyzed_fixture!(cpp_ctor_callback);
+
+/// A driver entry installed in a static ops table is reached indirectly, and
+/// so is the dispatch callback it installs.
+#[test]
+fn driver_entry_and_service_dispatch_callbacks_are_resolved() {
+    let (program, analysis) = cpp_ctor_callback();
+    for callee in ["SampleDriverInit", "SampleDispatch"] {
+        assert!(
+            has_edge(
+                program,
+                analysis,
+                "test_callback_dispatch",
+                callee,
+                ResolutionKind::Indirect
+            ),
+            "the driver entry table must reach {callee}"
+        );
+    }
+}
+
 #[test]
 fn callback_model_bare_name_matches_namespaced_and_member_callees() {
     let dir = tempfile::tempdir().unwrap();

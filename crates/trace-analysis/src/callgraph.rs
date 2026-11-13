@@ -197,6 +197,26 @@ mod tests {
     }
 
     #[test]
+    fn query_helpers_select_edges_by_endpoint() {
+        // 1 -> 2 (site 10), 3 -> 2 (site 20), 1 -> 4 (site 30)
+        let cg = CallGraph {
+            edges: vec![
+                make_edge(1, 2, 10),
+                make_edge(3, 2, 20),
+                make_edge(1, 4, 30),
+            ],
+        };
+
+        assert_eq!(cg.callees_of(FnId(1)), vec![FnId(2), FnId(4)]);
+        assert_eq!(
+            cg.callers_of(FnId(2)),
+            vec![(FnId(1), CallSiteId(10)), (FnId(3), CallSiteId(20))]
+        );
+        assert!(cg.callees_of(FnId(9)).is_empty());
+        assert!(cg.callers_of(FnId(9)).is_empty());
+    }
+
+    #[test]
     fn test_cycle_to_self() {
         // 1 -> 2 -> 1
         let cg = CallGraph {

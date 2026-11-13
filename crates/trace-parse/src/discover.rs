@@ -77,36 +77,28 @@ pub fn discover_source_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (found.sources, found.headers)
 }
 
-#[allow(dead_code)]
-fn discover_by_extension(root: &Path, ext: &str) -> Vec<PathBuf> {
-    if root.is_file() {
-        return root
-            .extension()
-            .and_then(|e| e.to_str())
-            .filter(|e| *e == ext)
-            .map(|_| vec![root.to_path_buf()])
-            .unwrap_or_default();
-    }
-    let mut paths: Vec<PathBuf> = WalkDir::new(root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| x == ext)
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    paths.sort();
-    paths
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn public_discovery_helpers_split_translation_units_and_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.c");
+        let header = dir.path().join("util.hpp");
+        let idl = dir.path().join("iface.idl");
+        std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+        std::fs::write(&header, "struct S {};\n").unwrap();
+        std::fs::write(&idl, "interface IFoo {};\n").unwrap();
+
+        assert_eq!(discover_c_files(dir.path()), vec![source.clone()]);
+        assert_eq!(discover_header_files(dir.path()), vec![header]);
+        // A single-file root keeps the same classification.
+        assert_eq!(discover_c_files(&source), vec![source.clone()]);
+        assert!(discover_header_files(&source).is_empty());
+        assert!(discover_c_files(&idl).is_empty());
+    }
 
     #[test]
     fn cpp_header_extensions_are_cpp() {
