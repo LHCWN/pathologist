@@ -42,12 +42,13 @@ pub fn normalize(path: &Path) -> PathBuf {
 
 pub fn local_path(path: &Path) -> PathBuf {
     if let Ok(resolved) = path.canonicalize() {
-        return resolved;
+        return trace_ir::canonicalize(&resolved);
     }
     let path = normalize(path);
     // Missing files still inherit symlinks in their existing parent path.
     for ancestor in path.ancestors() {
         if let Ok(resolved) = ancestor.canonicalize() {
+            let resolved = trace_ir::canonicalize(&resolved);
             let remainder = path.strip_prefix(ancestor).unwrap();
             return if remainder.as_os_str().is_empty() {
                 resolved
@@ -227,13 +228,13 @@ mod tests {
         assert!(Source::read(&path).is_some());
         std::fs::write(&path, [0xff]).unwrap();
         assert!(Source::read(&path).is_none());
-        let mut remote_uri = Url::parse(&uri).unwrap();
-        remote_uri.set_host(Some("remote")).unwrap();
         for invalid in [
             "https://example.org/a.c".to_owned(),
             format!("{uri}?x"),
             format!("{uri}#x"),
-            remote_uri.into(),
+            // A drive-letter path makes the WHATWG parser drop a file URI's
+            // host, so use a non-drive path to exercise remote rejection.
+            "file://remote/project/file.c".to_owned(),
             "invalid".to_owned(),
         ] {
             assert!(uri_path(&invalid).is_err(), "{invalid}");

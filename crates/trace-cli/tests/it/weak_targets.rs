@@ -580,7 +580,7 @@ fn suppressed_weak_definitions_do_not_leak_origins_of_surviving_constraints() {
             let db = common::cli_analyze(root, &args);
             let conn = Connection::open(db.path()).unwrap();
             let rows: Vec<(String, i64, String)> = conn.prepare(
-            "SELECT t.name,o.line,o.expression FROM flow_origins o JOIN flow_nodes n ON n.id=o.dst_node JOIN variables v ON v.id=n.var_id JOIN link_targets t ON t.id=v.target_id JOIN files p ON p.id=o.file_id WHERE v.name='slot' AND p.path LIKE '%/weak.c' ORDER BY t.name,o.line,o.col"
+            "SELECT t.name,o.line,o.expression FROM flow_origins o JOIN flow_nodes n ON n.id=o.dst_node JOIN variables v ON v.id=n.var_id JOIN link_targets t ON t.id=v.target_id JOIN files p ON p.id=o.file_id WHERE v.name='slot' AND replace(p.path, char(92), '/') LIKE '%/weak.c' ORDER BY t.name,o.line,o.col"
         ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
             let expected: Vec<(String, i64, String)> = vec![
                 ("full".into(), 3, "slot = &x".into()),
@@ -595,7 +595,7 @@ fn suppressed_weak_definitions_do_not_leak_origins_of_surviving_constraints() {
             previous = Some(rows);
             if with_header {
                 let headers: Vec<(String, String)> = conn.prepare(
-                "SELECT t.name,o.expression FROM flow_origins o JOIN flow_nodes n ON n.id=o.dst_node JOIN variables v ON v.id=n.var_id JOIN link_targets t ON t.id=v.target_id JOIN files p ON p.id=o.file_id WHERE v.name='slot' AND p.path LIKE '%/shared.h' ORDER BY t.name"
+                "SELECT t.name,o.expression FROM flow_origins o JOIN flow_nodes n ON n.id=o.dst_node JOIN variables v ON v.id=n.var_id JOIN link_targets t ON t.id=v.target_id JOIN files p ON p.id=o.file_id WHERE v.name='slot' AND replace(p.path, char(92), '/') LIKE '%/shared.h' ORDER BY t.name"
             ).unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
                 assert_eq!(
                     headers,
@@ -765,9 +765,7 @@ Callback get_beta(void) { return beta; }
                         format!("Text({callee:?})"),
                         format!(
                             "Text({:?})",
-                            root.join(format!("{image}.{extension}"))
-                                .canonicalize()
-                                .unwrap()
+                            trace_ir::canonicalize(&root.join(format!("{image}.{extension}")))
                                 .to_str()
                                 .unwrap()
                         ),

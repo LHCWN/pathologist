@@ -83,7 +83,7 @@ fn configurable_test_partition_controls_includes_and_calls() {
                 header,
             ),
         ] {
-            let edges: i64 = conn.query_row("SELECT count(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id JOIN functions callee ON callee.id=e.callee_fn_id JOIN files f ON f.id=callee.file_id WHERE caller.name=?1 AND callee.name=?2 AND callee.is_defined=1 AND e.resolution='direct' AND f.path LIKE '%' || ?3", [caller, callee, suffix], |r| r.get(0)).unwrap();
+            let edges: i64 = conn.query_row("SELECT count(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id JOIN functions callee ON callee.id=e.callee_fn_id JOIN files f ON f.id=callee.file_id WHERE caller.name=?1 AND callee.name=?2 AND callee.is_defined=1 AND e.resolution='direct' AND replace(f.path, char(92), '/') LIKE '%' || ?3", [caller, callee, suffix], |r| r.get(0)).unwrap();
             assert_eq!(edges, i64::from(admitted), "{args:?}: {caller} -> {callee}");
         }
         let options: String = conn
@@ -229,7 +229,7 @@ fn exported_production_calls_do_not_reach_mock_definitions() {
     assert_eq!(rows.len(), 3, "{rows:?}");
     for (caller, _, file) in rows {
         assert!(
-            file.ends_with(if caller == "ns::test_use" {
+            std::path::Path::new(&file).ends_with(if caller == "ns::test_use" {
                 "test/mock/worker.h"
             } else {
                 "src/worker.cpp"

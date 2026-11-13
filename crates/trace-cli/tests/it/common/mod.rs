@@ -136,7 +136,7 @@ fn unique_variable<'a>(
 /// The `FileId` of `path` under `root`. Files are interned by canonical
 /// path, which a temporary directory's path need not be.
 pub fn file_id(program: &Program, root: &Path, path: &str) -> trace_ir::FileId {
-    let canonical = root.join(path).canonicalize().unwrap();
+    let canonical = trace_ir::canonicalize(&root.join(path));
     program
         .symbols
         .file_by_path(&canonical)
@@ -256,7 +256,11 @@ pub fn analyze_source(files: &[(&str, &str)]) -> (Program, AnalysisResult) {
 /// A scratch tree with the given `(relative path, contents)` files; it goes
 /// away when the value is dropped, including on a failed assertion.
 pub fn scratch(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("temp dir");
+    // Create under the canonical temp root: Windows can spell %TEMP% with an
+    // 8.3 short name (`RUNNER~1`), while the analysis stores canonical paths.
+    let dir = tempfile::Builder::new()
+        .tempdir_in(trace_ir::canonicalize(&std::env::temp_dir()))
+        .expect("temp dir");
     for (path, contents) in files {
         let full = dir.path().join(path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();

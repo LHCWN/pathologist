@@ -9,12 +9,15 @@ use trace_preproc::PreprocessOptions;
 fn whitespace_only_lines_are_ignored_without_trimming_arguments() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    std::fs::create_dir(root.join(" include space ")).unwrap();
-    std::fs::write(
-        root.join(" include space /config.h"),
-        "#define HEADER_OK 1\n",
-    )
-    .unwrap();
+    // Windows strips trailing spaces from path components, so keep the
+    // leading and internal spaces that prove arguments are not trimmed.
+    let include = if cfg!(windows) {
+        " include space"
+    } else {
+        " include space "
+    };
+    std::fs::create_dir(root.join(include)).unwrap();
+    std::fs::write(root.join(include).join("config.h"), "#define HEADER_OK 1\n").unwrap();
     std::fs::write(
         root.join("main.c"),
         "#include <config.h>\n#if HEADER_OK && FROM_FLAGS == 7\nvoid selected(void) {}\n#endif\n",
@@ -26,7 +29,7 @@ fn whitespace_only_lines_are_ignored_without_trimming_arguments() {
             "\t",
             "-I",
             " \t ",
-            " include space ",
+            include,
             "-DFROM_FLAGS=7",
             "\t  ",
             "",

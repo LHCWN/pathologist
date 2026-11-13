@@ -30797,7 +30797,7 @@ mod index_window_tests {
                 .find(|d| {
                     d.line == line
                         && d.file.is_some_and(|file| {
-                            unit.files[file.0 as usize] == origin.canonicalize().unwrap()
+                            unit.files[file.0 as usize] == trace_ir::canonicalize(origin)
                         })
                 })
                 .unwrap();

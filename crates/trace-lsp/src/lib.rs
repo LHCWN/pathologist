@@ -331,7 +331,7 @@ impl Server {
 /// Relative file paths have no per-run ownership in the existing schema.
 /// Accept only one unambiguous source root; merged metadata lists input DBs.
 fn relative_path_base(conn: &Connection, database: &Path) -> Result<PathBuf> {
-    let database_path = database.canonicalize()?;
+    let database_path = trace_ir::canonicalize(database);
     let directory = database_path.parent().context("database has no parent")?;
     let mut roots = BTreeSet::new();
     let mut stmt =

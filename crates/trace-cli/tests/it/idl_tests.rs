@@ -9,6 +9,12 @@ use trace_ir::Program;
 use trace_parse::build_program_with_jobs;
 use trace_preproc::PreprocessOptions;
 
+/// Diagnostics and generated paths use the host separator; assertions spell
+/// them with `/`.
+fn unix_paths(text: &str) -> String {
+    text.replace('\\', "/")
+}
+
 fn build(root: &Path, opts: PreprocessOptions) -> Program {
     build_program_with_jobs(root, &opts, 1).expect("build program")
 }
@@ -484,6 +490,7 @@ fn idl_header_collision_is_deterministic() {
     assert!(!names(&first).contains(&"q::IAtm::Second".to_string()));
     assert!(idl_warnings(&first)
         .iter()
+        .map(|m| unix_paths(m))
         .any(|m| m.contains("a/IAtm.idl") && m.contains("b/IAtm.idl")));
     // `q.IAtm` lost its proxy and stub headers, so it records no fact.
     assert_eq!(descriptors(&first), vec!["p.IAtm"]);
@@ -498,6 +505,7 @@ fn idl_interface_collision_keeps_owner_fact() {
     assert!(!declares(&program, "p::AtmProxy::Second"));
     assert!(idl_warnings(&program)
         .iter()
+        .map(|m| unix_paths(m))
         .any(|m| m.contains("atm_proxy.h") && m.contains("a/IAtm.idl") && m.contains("b/Atm.idl")));
 }
 
@@ -738,7 +746,7 @@ fn idl_cli_exports_client_and_ipc_edges() {
     );
     let dep: i64 = conn
         .query_row(
-            "SELECT is_dep FROM files WHERE path LIKE '%/.trace-idl-generated/atm_proxy.h'",
+            "SELECT is_dep FROM files WHERE replace(path, char(92), '/') LIKE '%/.trace-idl-generated/atm_proxy.h'",
             [],
             |r| r.get(0),
         )
@@ -863,7 +871,7 @@ fn idl_production_interface_wins_over_a_test_one() {
         .filter(|f| f.path.ends_with("atm_proxy.h"))
         .map(|f| {
             let p = f.path.to_string_lossy();
-            p[p.find(".trace-idl-generated").unwrap()..].to_string()
+            unix_paths(&p[p.find(".trace-idl-generated").unwrap()..])
         })
         .collect();
     assert!(

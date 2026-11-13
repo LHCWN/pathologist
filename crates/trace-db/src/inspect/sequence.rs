@@ -245,9 +245,9 @@ fn variants_in(conn: &Connection, function: FunctionRowId, file: &str) -> Result
         .prepare_cached(
             "SELECT cf.id FROM cfg_functions cf \
              LEFT JOIN files t ON t.id = cf.tu_file_id \
-             WHERE cf.fn_id = ?1 AND (t.path LIKE ?2 ESCAPE '!' OR EXISTS ( \
+             WHERE cf.fn_id = ?1 AND (replace(t.path, char(92), '/') LIKE ?2 ESCAPE '!' OR EXISTS ( \
                  SELECT 1 FROM cfg_blocks b JOIN files f ON f.id = b.file_id \
-                 WHERE b.cfg_id = cf.id AND f.path LIKE ?2 ESCAPE '!')) \
+                 WHERE b.cfg_id = cf.id AND replace(f.path, char(92), '/') LIKE ?2 ESCAPE '!')) \
              ORDER BY cf.variant, cf.id",
         )?
         .query_map(
@@ -262,7 +262,7 @@ fn variants_in(conn: &Connection, function: FunctionRowId, file: &str) -> Result
 /// matching files are found first, so each position is an index lookup by
 /// `(file_id, line)` or `(expansion_file_id, expansion_line)`.
 const RESOLVE_EVENT_SQL: &str = "WITH matching(id) AS ( \
-             SELECT id FROM files WHERE path LIKE ?2 ESCAPE '!') \
+             SELECT id FROM files WHERE replace(path, char(92), '/') LIKE ?2 ESCAPE '!') \
          SELECT e.id, e.cfg_id, cf.fn_id, f.path, e.line, e.col, \
                 CASE WHEN e.line = ?1 AND e.file_id IN matching THEN x.path END, \
                 e.expansion_line, cs.callee_text, \

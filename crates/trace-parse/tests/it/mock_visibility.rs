@@ -97,10 +97,10 @@ fn production_fallback_does_not_select_test_bodies_or_missing_external_mock_head
                 f.is_defined.then(|| {
                     program.symbols.files[f.span.file.0 as usize]
                         .path
-                        .strip_prefix(tree.path().canonicalize().unwrap())
+                        .strip_prefix(trace_ir::canonicalize(tree.path()))
                         .unwrap()
                         .to_string_lossy()
-                        .into_owned()
+                        .replace('\\', "/")
                 })
             })
             .collect();
@@ -288,10 +288,10 @@ fn bound_body(program: &trace_ir::Program, tree: &Path, caller: &str, callee: &s
         .map(|f| {
             program.symbols.files[f.span.file.0 as usize]
                 .path
-                .strip_prefix(tree.canonicalize().unwrap())
+                .strip_prefix(trace_ir::canonicalize(tree))
                 .unwrap()
                 .to_string_lossy()
-                .into_owned()
+                .replace('\\', "/")
         })
         .collect()
 }
