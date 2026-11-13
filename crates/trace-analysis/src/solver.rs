@@ -17,7 +17,7 @@ use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, Target
 /// does not correspond to any single source-level call (the proxy method has
 /// only the opaque `SendRequest` call site), so exporters/consumers can
 /// distinguish it and must not join it to a real `CallSite`.
-pub const SYNTHETIC_CALL_SITE: CallSiteId = CallSiteId(u32::MAX);
+pub use trace_ir::SYNTHETIC_CALL_SITE;
 
 #[derive(Debug, Clone)]
 pub struct AnalyzeOptions {

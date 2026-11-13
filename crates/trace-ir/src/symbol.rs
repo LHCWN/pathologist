@@ -1,4 +1,4 @@
-use crate::{CallName, CallSiteId, FileId, FnId, Span, TypeId, VarId};
+use crate::{CallName, CallSiteId, FileId, FnId, Span, TypeId, VarId, SYNTHETIC_CALL_SITE};
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
@@ -3405,13 +3405,23 @@ impl SymbolTable {
         self.call_site_slot(id).map(|slot| &self.call_sites[slot])
     }
 
-    /// Where call `id` sits in `call_sites`: at its own index unless records
-    /// were removed or reordered, else wherever a scan finds it.
+    /// Where call `id` sits in `call_sites`: at its own index unless the ID is
+    /// unknown or the table is sparse. Allocation hands out increasing IDs and
+    /// every append path pushes in that order; the vector is never reordered,
+    /// so it stays sorted by ID. The miss path binary-searches (export looks up
+    /// every edge, and a sparse table would otherwise rescan the whole vector).
+    /// Synthetic edges are never records, so they answer before the search.
     fn call_site_slot(&self, id: CallSiteId) -> Option<usize> {
+        if id == SYNTHETIC_CALL_SITE {
+            return None;
+        }
         let at = id.0 as usize;
         match self.call_sites.get(at) {
             Some(site) if site.id == id => Some(at),
-            _ => self.call_sites.iter().position(|c| c.id == id),
+            _ => self
+                .call_sites
+                .binary_search_by_key(&id, |site| site.id)
+                .ok(),
         }
     }
 
@@ -3593,6 +3603,52 @@ mod tests {
             symbols.overload_sites[&CallSiteId(7)],
             [FnId(7), FnId(5), FnId(5)]
         );
+    }
+
+    /// A call table can be sparse: a caller-built table, or a synthetic IPC
+    /// site (`u32::MAX`). Lookup must still find a real record by binary search
+    /// over the ID-sorted vector, and an absent ID must stay absent.
+    #[test]
+    fn call_site_lookup_handles_sparse_ids() {
+        let site = |id| CallSite {
+            id: CallSiteId(id),
+            caller: FnId(0),
+            callee_name: "call".into(),
+            callee_var: None,
+            callee_fn_id: None,
+            var_args: Vec::new(),
+            details: None,
+            args_bound_past_this: false,
+            span: Span::new(FileId(0), 1, 1),
+            expansion_span: None,
+            is_direct: true,
+            in_loop: false,
+            unevaluated: false,
+            receiver_class: None,
+            exact_receiver: false,
+            return_dst: None,
+            receiver: None,
+            tu: None,
+        };
+        let symbols = SymbolTable {
+            // Slots 0..4 hold IDs 0, 3, 4, 5 and 9. A lookup at its own slot
+            // hits the fast path; an in-range slot holding another record's ID
+            // (`3` -> slot 3 holds 5, `4` -> slot 4 holds 9) and an out-of-range
+            // slot both fall through to the binary search.
+            call_sites: vec![site(0), site(3), site(4), site(5), site(9)],
+            ..Default::default()
+        };
+        for (slot, id) in [(0, 0), (1, 3), (2, 4), (3, 5), (4, 9)] {
+            assert_eq!(symbols.call_site_slot(CallSiteId(id)), Some(slot));
+            assert_eq!(
+                symbols.call_site_by_id(CallSiteId(id)).unwrap().id,
+                CallSiteId(id)
+            );
+        }
+        // In-range positions occupied by other records, and beyond the tail.
+        assert!(symbols.call_site_by_id(CallSiteId(1)).is_none());
+        assert!(symbols.call_site_by_id(CallSiteId(2)).is_none());
+        assert!(symbols.call_site_by_id(CallSiteId(10)).is_none());
     }
 
     #[test]

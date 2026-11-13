@@ -22,6 +22,13 @@ pub struct LocId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CallSiteId(pub u32);
 
+/// Sentinel for a call edge with no source-level call site, such as an IPC
+/// bridge the solver synthesizes. Real sites are allocated sequentially from
+/// zero; this value is never stored in [`SymbolTable::call_sites`].
+///
+/// [`SymbolTable::call_sites`]: crate::SymbolTable::call_sites
+pub const SYNTHETIC_CALL_SITE: CallSiteId = CallSiteId(u32::MAX);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PagNodeId(pub u32);
 

@@ -4,6 +4,27 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Look up call sites by ID with a binary search
+
+`SymbolTable::call_site_by_id` checked the record at the ID's position and, on a
+miss, scanned every call record. IPC bridge edges carry the synthetic
+`CallSiteId(u32::MAX)`, which is never a record, so the two loops in
+`export_flow_provenance` that visit every analysis call edge paid a full scan
+per IPC edge: on ability_runtime 1,923 synthetic edges against 658,901 records,
+per loop. Conditional lowering (#256) added the second such loop, doubling the
+cost, which is why the indexing fixes in #280 (`dae2487`) did not recover the
+export phase.
+
+Call records stay sorted by ID: allocation hands out increasing IDs, every
+append path pushes in that order (`merge_unit`, per-unit lowering, the linking
+view), and target scoping only retains records in place. Synthetic IPC sites
+answer `None` in O(1) before the search, and other missing IDs binary-search.
+Header-dedup merge tests pin the order, and the sparse-ID test covers both miss
+paths. On
+`ability_ability_runtime` export falls from 44.7 to 27.1 s and the provenance
+step from 19.8 to 1.75 s, with identical exported data. See
+`docs/EVAL_REPORT.md` ("Call-site lookup by ID").
+
 ### Let a smart-pointer factory build a standard class through its constructor models (#284)
 
 `std::make_shared<T>(args)` and `std::make_unique<T>(args)` recorded a

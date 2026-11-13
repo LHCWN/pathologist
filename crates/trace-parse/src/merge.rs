@@ -2712,6 +2712,30 @@ mod tests {
         }
     }
 
+    /// Merged IDs stay ascending: `merge_unit` allocates them in append order
+    /// and never reorders the vector, so the binary-search fallback in
+    /// `call_site_by_id` stays valid even after header dedup coalesces records.
+    fn assert_call_site_ids_ascending(program: &Program) {
+        let sites = &program.symbols.call_sites;
+        assert!(
+            sites.windows(2).all(|w| w[0].id < w[1].id),
+            "call-site IDs must stay ascending: {:?}",
+            sites.iter().map(|site| site.id).collect::<Vec<_>>()
+        );
+        for site in sites {
+            assert_eq!(
+                program.symbols.call_site_by_id(site.id).map(|held| held.id),
+                Some(site.id),
+                "lookup must find record {}",
+                site.id.0
+            );
+        }
+        assert!(program
+            .symbols
+            .call_site_by_id(trace_ir::CallSiteId(u32::MAX))
+            .is_none());
+    }
+
     /// Issue #127 review: one unit can carry the same header body twice (a
     /// cached header expansion plus the translation unit's own copy). Both
     /// merge into one function; the second copy's temporaries must match the
@@ -2825,6 +2849,7 @@ mod tests {
             .count();
         assert_eq!(program.symbols.functions.len(), 1, "one function");
         assert_eq!(records, 1, "one record for the one call");
+        assert_call_site_ids_ascending(&program);
     }
 
     /// Copies of one call in one definition's body that units bound
@@ -3033,6 +3058,7 @@ mod tests {
                 .collect();
             assert_eq!(sites.len(), 1, "one record for the one occurrence");
             assert!(sites[0].in_loop, "loop in the first unit: {loop_first}");
+            assert_call_site_ids_ascending(&program);
         }
     }
 
