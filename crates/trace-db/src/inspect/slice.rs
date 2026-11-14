@@ -1467,7 +1467,7 @@ pub fn resolve_slice_start(
     require_slice_schema(conn)?;
     let pattern = super::contains_pattern(file);
     let paths: Vec<(i64, String)> = conn
-        .prepare("SELECT id, path FROM files WHERE path LIKE ?1 ESCAPE '!' ORDER BY path, id")?
+        .prepare("SELECT id, path FROM files WHERE replace(path, char(92), '/') LIKE ?1 ESCAPE '!' ORDER BY path, id")?
         .query_map([&pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let path_of: BTreeMap<i64, &str> = paths.iter().map(|(id, p)| (*id, p.as_str())).collect();
@@ -1500,7 +1500,7 @@ pub fn resolve_slice_start(
                         FROM flow_origins o \
                         JOIN files f ON f.id = o.file_id \
                         WHERE o.line <= ?1 \
-                          AND CASE WHEN f.path LIKE ?2 ESCAPE '!' THEN \
+                          AND CASE WHEN replace(f.path, char(92), '/') LIKE ?2 ESCAPE '!' THEN \
                               o.line + length(o.expression) \
                                   - length(replace(o.expression, char(10), '')) >= ?1 \
                               ELSE 0 END) \
@@ -1517,7 +1517,7 @@ pub fn resolve_slice_start(
                    JOIN files f ON f.id = cs.file_id \
                    LEFT JOIN flow_call_expressions ce ON ce.call_site_id = cs.id \
                    WHERE cs.line <= ?1 \
-                     AND CASE WHEN f.path LIKE ?2 ESCAPE '!' THEN \
+                     AND CASE WHEN replace(f.path, char(92), '/') LIKE ?2 ESCAPE '!' THEN \
                          cs.line + length(coalesce(ce.expression, '')) \
                              - length(replace(coalesce(ce.expression, ''), char(10), '')) >= ?1 \
                          ELSE 0 END \
@@ -1528,7 +1528,7 @@ pub fn resolve_slice_start(
                    LEFT JOIN flow_call_expressions ce ON ce.call_site_id = cs.id \
                    WHERE cs.callee_var IS NOT NULL \
                      AND cs.line <= ?1 \
-                     AND CASE WHEN f.path LIKE ?2 ESCAPE '!' THEN \
+                     AND CASE WHEN replace(f.path, char(92), '/') LIKE ?2 ESCAPE '!' THEN \
                          cs.line + length(coalesce(ce.expression, '')) \
                              - length(replace(coalesce(ce.expression, ''), char(10), '')) >= ?1 \
                          ELSE 0 END",

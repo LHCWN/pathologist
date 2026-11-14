@@ -292,18 +292,18 @@ pub(super) fn summary(program: &Program, system_includes: bool) -> String {
 
 fn is_internal_kernel_header(name: &str) -> bool {
     let normalized = include_path(name);
-    let Some(name) = normalized.to_str() else {
-        return false;
-    };
-    matches!(
-        name,
-        "linux/device.h"
-            | "linux/dma-mapping.h"
-            | "linux/of.h"
-            | "linux/module.h"
-            | "linux/slab.h"
-            | "linux/platform_device.h"
-    )
+    // Compare path components so the match does not depend on the host
+    // separator Rust uses when collecting components into a PathBuf.
+    [
+        "linux/device.h",
+        "linux/dma-mapping.h",
+        "linux/of.h",
+        "linux/module.h",
+        "linux/slab.h",
+        "linux/platform_device.h",
+    ]
+    .iter()
+    .any(|header| normalized == Path::new(header))
 }
 
 fn is_standard_header(name: &str) -> bool {

@@ -7158,7 +7158,7 @@ fn relative_qualified_callee_in_enclosing_namespace_and_using_directive() {
         .prefix("trace_relative_qual_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("connection.h"),
@@ -7267,7 +7267,7 @@ fn distinct_definitions_indexed_separately_and_context_aware_call_resolution() {
         .prefix("trace_distinct_defs_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -7365,7 +7365,7 @@ fn regression_declaration_only_overload_ranking() {
         .prefix("trace_overload_decl_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("a.cpp"),
@@ -7432,7 +7432,7 @@ fn regression_relative_qualified_candidates_shadowing() {
         .prefix("trace_shadow_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("test.cpp"),
@@ -7489,7 +7489,7 @@ fn check_header_helper(with_compile_commands: bool) {
         .prefix("trace_header_helper_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -7682,7 +7682,7 @@ fn check_header_callback_initializer(with_compile_commands: bool) {
         .prefix("trace_header_cb_init_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -7795,7 +7795,7 @@ fn check_header_array_callback_initializer(with_compile_commands: bool) {
         .prefix("trace_header_arr_cb_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -7885,7 +7885,7 @@ fn check_header_struct_callback_initializer(with_compile_commands: bool) {
         .prefix("trace_header_struct_cb_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -7978,7 +7978,7 @@ fn regression_call_return_dataflow_isolation_across_tus() {
         .prefix("trace_call_return_iso_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -8088,7 +8088,7 @@ fn regression_shape_equivalence_param_types_across_tus() {
         .prefix("trace_shape_eq_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -8148,7 +8148,7 @@ fn regression_transitive_return_flow_call_tu_isolation() {
         .prefix("trace_transitive_return_iso_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -8265,7 +8265,7 @@ fn regression_relative_qualified_template_callee() {
         .prefix("trace_rel_qual_tmpl_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("test.cpp"),
@@ -8317,7 +8317,7 @@ fn regression_in_class_member_decl_dedup_against_definition() {
         .prefix("trace_in_class_dedup_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("worker.h"),
@@ -8372,7 +8372,7 @@ fn regression_cross_tu_member_fn_implicit_this_and_explicit_arity() {
         .prefix("trace_member_cross_tu_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("calc.h"),
@@ -8447,7 +8447,7 @@ fn regression_merge_c_and_cpp_def_order_symmetric() {
         .prefix("trace_c_cpp_order_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("impl_cpp.cpp"),
@@ -8481,7 +8481,7 @@ fn regression_bind_calls_past_this_shape_aware() {
         .prefix("trace_bind_past_this_shape_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("common.h"),
@@ -14218,7 +14218,7 @@ fn cpp_implicit_member_value_and_chained_fn_ptr_call() {
         .prefix("trace_implicit_member_fn_ptr_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),
@@ -15425,7 +15425,7 @@ fn cpp_member_call_and_fn_ptr_declarator_no_spurious_direct_call() {
         .prefix("trace_spurious_direct_call_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),
@@ -15507,7 +15507,7 @@ fn cpp_unresolved_member_call_does_not_fall_back_to_unrelated_free_function() {
         .prefix("trace_unresolved_member_no_fallback_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),
@@ -15563,7 +15563,7 @@ fn cpp_member_call_edge_cases_and_declarator_variants() {
         .prefix("trace_member_call_edge_cases_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),
@@ -15693,7 +15693,7 @@ fn cpp_member_function_returning_fn_ptr_is_recognized_as_method() {
         .prefix("trace_member_returning_fn_ptr_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),
@@ -15756,7 +15756,7 @@ fn cpp_implicit_member_fn_ptr_call_does_not_fall_back_to_free_function() {
         .prefix("trace_implicit_member_no_fallback_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),
@@ -15811,7 +15811,7 @@ fn cpp_local_and_param_callback_shadows_member() {
         .prefix("trace_callback_shadows_member_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),
@@ -15858,7 +15858,7 @@ fn cpp_nested_callback_variable_flow() {
         .prefix("trace_nested_callback_flow_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),
@@ -15912,7 +15912,7 @@ fn cpp_pointer_to_member_function_variable() {
         .prefix("trace_member_fn_ptr_var_")
         .tempdir()
         .unwrap();
-    let root_buf = dir.path().canonicalize().unwrap();
+    let root_buf = trace_ir::canonicalize(dir.path());
     let root = root_buf.as_path();
     std::fs::write(
         root.join("main.cpp"),

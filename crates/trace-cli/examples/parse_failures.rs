@@ -225,7 +225,11 @@ mod tests {
         let mut output = Vec::new();
         run([dir.path().display().to_string()].into_iter(), &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.find("/a.c\t").unwrap() < text.find("/z.c\t").unwrap());
+        let separator = std::path::MAIN_SEPARATOR;
+        assert!(
+            text.find(&format!("{separator}a.c\t")).unwrap()
+                < text.find(&format!("{separator}z.c\t")).unwrap()
+        );
         let rows: Vec<_> = text.lines().collect();
         assert_eq!(rows.last().unwrap(), &format!("END\t{}", rows.len() - 1));
     }

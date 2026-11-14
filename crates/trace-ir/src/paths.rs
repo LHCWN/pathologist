@@ -36,14 +36,13 @@ pub fn canonicalize(path: &Path) -> PathBuf {
     })
 }
 
-fn canonicalize_uncached(path: &Path) -> PathBuf {
-    let canonical = match std::fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(_) => return path.to_path_buf(),
-    };
+/// Strip the Windows extended-length prefix from a path that is already
+/// canonical. Unlike [`canonicalize`], this neither touches the filesystem nor
+/// fills the thread-local cache.
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        let text = canonical.as_os_str().to_string_lossy();
+        let text = path.as_os_str().to_string_lossy();
         if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
             return PathBuf::from(format!(r"\\{rest}"));
         }
@@ -51,7 +50,14 @@ fn canonicalize_uncached(path: &Path) -> PathBuf {
             return PathBuf::from(rest);
         }
     }
-    canonical
+    path.to_path_buf()
+}
+
+fn canonicalize_uncached(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => strip_verbatim_prefix(&canonical),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Bumped by [`start_file_probe_epoch`]; a thread whose memo carries an older
@@ -749,8 +755,13 @@ mod tests {
         start_file_probe_epoch();
         release_thread_path_caches();
         let missing = dir.path().join("missing");
-        let escaping = missing.join("../a.h");
-        assert!(!escaping.is_file(), "{}", escaping.display());
+        // Windows resolves `..` lexically even when `missing` is absent,
+        // unlike POSIX; `is_file_in` keeps the kernel-walk answer everywhere.
+        #[cfg(not(windows))]
+        {
+            let escaping = missing.join("../a.h");
+            assert!(!escaping.is_file(), "{}", escaping.display());
+        }
         assert!(!is_file_in(&missing, Path::new("../a.h")));
         // Under a search directory that exists, the same spelling is found.
         let present = dir.path().join("present");

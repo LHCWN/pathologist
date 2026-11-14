@@ -128,8 +128,25 @@ jobs:
       - name: Test (trace-cli, default features)
         run: cargo test -p trace-cli
 
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
   build:
-    needs: check
+    needs: [check, check-windows]
     strategy:
       matrix:
         include:
