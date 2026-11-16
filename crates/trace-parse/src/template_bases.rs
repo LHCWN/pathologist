@@ -1,4 +1,4 @@
-//! Subclasses through template-parameter bases (docs/ANALYSIS.md,
+//! Subclasses through template-parameter bases (docs/CXX.md,
 //! "Template-parameter bases"): `class S : public IRemoteStub<IFoo>` with
 //! `template<class I> class IRemoteStub : public I` derives from `IFoo`.
 
@@ -177,7 +177,7 @@ pub(crate) fn expand_template_parameter_bases(program: &mut Program) {
     }
     // Guesses land after every declared base, and each only when it closes
     // no cycle: `A : W<B>` and `B : W<A>` add only the first
-    // (docs/ANALYSIS.md, "Template-parameter bases").
+    // (docs/CXX.md, "Template-parameter bases").
     for guess in overriding(program, guessed) {
         if !program.derives_from(&guess.base, &guess.derived) {
             guess.add_to(program);

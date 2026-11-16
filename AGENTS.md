@@ -16,6 +16,18 @@ This file is for AI agents and human contributors working on the trace codebase.
 | `trace-merge` | Cross-repository database merger & callgraph reconstruction (`trace-merge`) |
 | `trace-lsp` | Read-only stdio LSP server (`trace-lsp --db`): call hierarchy over an existing analysis database, via `trace-db` editor queries; see [LSP configuration](docs/LSP.md) |
 
+Analysis documentation is split by aspect:
+
+| Document | Covers |
+|----------|--------|
+| [docs/ANALYSIS.md](docs/ANALYSIS.md) | Overall design: pipeline, source locations, symbol identity, link targets, merging |
+| [docs/IR.md](docs/IR.md) | Type and call-record storage, IR flow constraints, returns, conditions, casts, smart pointers |
+| [docs/POINTERS.md](docs/POINTERS.md) | PAG, solver, field/array modeling, argument wiring |
+| [docs/CXX.md](docs/CXX.md) | C++ lowering, templates, automatic objects, factories, IDL |
+| [docs/MODELS.md](docs/MODELS.md) | Function models, IPC bridges, callbacks, execution contexts |
+| [docs/USAGE.md](docs/USAGE.md) | Value slices, sequencing, dependency roots, compilation databases, exploration |
+| [docs/FAQ.md](docs/FAQ.md) | Known imprecision, performance notes, recommendations |
+
 ## Pipeline (do not reorder casually)
 
 ```
@@ -34,7 +46,7 @@ settle preprocessing, settle standalone orphan headers, lower selected header
 variants while retiring their consumed expansions, plan reusable preambles,
 merge header units (`pch-merge`), then lower/merge orphan headers and source
 TUs. See [Shared system header bundles](docs/PREPROCESSOR.md#shared-system-header-bundles)
-and [Indexing syntax reuse](docs/ANALYSIS.md#indexing-syntax-reuse) before
+and [Indexing syntax reuse](docs/CXX.md#indexing-syntax-reuse) before
 changing their ordering or cache lifetimes.
 
 ## Invariants
@@ -45,15 +57,15 @@ changing their ordering or cache lifetimes.
 4. **IDs**: Use newtype IDs from `trace-ir` (`FnId`, `VarId`, `CallSiteId`, `FieldId`, etc.). Do not use raw integers in public APIs. `SymbolTable::call_sites` must stay sorted by `CallSiteId`: allocation is increasing, append paths push in that order, and the vector is never reordered, because `call_site_by_id` binary-searches it. `SYNTHETIC_CALL_SITE` (`u32::MAX`, IPC bridges) is never stored in the vector.
 5. **Internal linkage**: `static` functions are not in `fn_by_name`. A `static` class member is not one: it has external linkage wherever its body is written. Solver and `pag.expand_return_flows` must resolve scope-first, not through external-only `resolve_function` — and through the image-aware forms, `resolve_function_in_scope_in_target` / `resolve_function_candidates_in_target`, passing the caller's target. The unscoped wrappers name no image and are for callers that genuinely have none (lowering, which runs before targets exist).
 6. **Storage classes**: file-scope `static` → `FileStatic`; function-local `static` → `FnStatic` (see `storage_for` in `lower.rs`).
-7. **IPC detection (see `docs/ANALYSIS.md`, "OpenHarmony IPC bridges")**: Proxy/stub pairs are detected from class-name suffixes (`*Proxy`/`*Client` and `*Stub`) + recognized IPC send call presence, or named by an `.idl` interface (`Program::idl_interfaces`; see `docs/ANALYSIS.md`, "IDL-generated interfaces"); bridges match by interface + method-name correspondence. Detection is **pure** (reads `&Program`, returns `Vec<IpcBridge>`, no `Program` mutation, no control-flow/opcode analysis) and runs during PAG build; the solver injects a synthetic `CallGraphEdge` per bridge (`call_site_id = SYNTHETIC_CALL_SITE`). Synthetic sites must never be indexed into `Program.symbols.call_sites`. IPC pairing is deliberately **not** link-target scoped: the boundary it models is a process boundary, so proxy and stub normally belong to different link images and a bridge edge may cross `target_id` (see `docs/ANALYSIS.md`, "Link targets and weak symbols").
+7. **IPC detection (see `docs/MODELS.md`, "OpenHarmony IPC bridges")**: Proxy/stub pairs are detected from class-name suffixes (`*Proxy`/`*Client` and `*Stub`) + recognized IPC send call presence, or named by an `.idl` interface (`Program::idl_interfaces`; see `docs/CXX.md`, "IDL-generated interfaces"); bridges match by interface + method-name correspondence. Detection is **pure** (reads `&Program`, returns `Vec<IpcBridge>`, no `Program` mutation, no control-flow/opcode analysis) and runs during PAG build; the solver injects a synthetic `CallGraphEdge` per bridge (`call_site_id = SYNTHETIC_CALL_SITE`). Synthetic sites must never be indexed into `Program.symbols.call_sites`. IPC pairing is deliberately **not** link-target scoped: the boundary it models is a process boundary, so proxy and stub normally belong to different link images and a bridge edge may cross `target_id` (see `docs/ANALYSIS.md`, "Link targets and weak symbols").
 8. **Dependency roots (`--dep <PATH>`)**: Dependency roots isolate external build dependencies from code under analysis. Sources under dependency roots never become translation units. Headers in dependency roots contribute declarations only: function bodies merge as declarations (`is_defined = false`) without local variables, call sites, flow constraints, or return flows. All symbols from dependency roots are marked `is_dep = true`.
 9. **Compilation databases (`--compile-commands`)**: Automatic discovery (`compile_commands.json` at target root or `build/`, or explicit flag). Commands provide per-TU include paths, macros, forced includes (`-include`), and language standards. CLI `--include` precedes compilation database `-I`, and CLI `-D` overrides database macros.
-10. **Determinism and bit-reproducibility**: The pipeline must produce identical SQLite analysis data across runs with identical inputs (excluding run metadata such as `analysis_run.created_at`). Preprocessing cache discovery publishes to the expansion cache in unit order whatever the job count (`docs/PREPROCESSOR.md`, "Parallel discovery"), so header content never depends on scheduling. Distinct strong definitions of a C++ function from separate translation units are indexed separately; within a target, a matching strong definition takes precedence over a weak one (see `docs/ANALYSIS.md`, "Link targets and weak symbols"). In translation units defining a function, direct calls resolve exclusively to that unit's definition; units without a definition treat matching definitions as equal candidates. Solver iterations and PAG traversal order must remain deterministic. Propagation order is part of that contract: the solver's reused buffers and filtered source views must be filled in the same order as the per-step vectors they replace (see [Propagation highlights](docs/ANALYSIS.md#propagation-highlights)).
+10. **Determinism and bit-reproducibility**: The pipeline must produce identical SQLite analysis data across runs with identical inputs (excluding run metadata such as `analysis_run.created_at`). Preprocessing cache discovery publishes to the expansion cache in unit order whatever the job count (`docs/PREPROCESSOR.md`, "Parallel discovery"), so header content never depends on scheduling. Distinct strong definitions of a C++ function from separate translation units are indexed separately; within a target, a matching strong definition takes precedence over a weak one (see `docs/ANALYSIS.md`, "Link targets and weak symbols"). In translation units defining a function, direct calls resolve exclusively to that unit's definition; units without a definition treat matching definitions as equal candidates. Solver iterations and PAG traversal order must remain deterministic. Propagation order is part of that contract: the solver's reused buffers and filtered source views must be filled in the same order as the per-step vectors they replace (see [Propagation highlights](docs/POINTERS.md#propagation-highlights)).
 11. **PAG and Solver monotonic convergence**: The Andersen solver uses worklist-based propagation over PAG constraints. Parameter copy wiring and points-to sets must grow monotonically toward a fixpoint. No flow-sensitive or path-sensitive branching is permitted.
 
 ## IR flow constraints (`trace-ir/src/flow.rs`)
 
-Lowering emits `FlowConstraint` (+ `ReturnFlow` on functions). Document new kinds in `docs/ANALYSIS.md` before adding.
+Lowering emits `FlowConstraint` (+ `ReturnFlow` on functions). Document new kinds in `docs/IR.md` before adding.
 
 Current kinds:
 - `Copy { dst, src }`: Pointer assignment (`p = q`).
@@ -63,26 +75,26 @@ Current kinds:
 - `Store { dst, src }`: Store through pointer (`*p = y`, `field = val`).
 - `GepField { dst, base, field, field_name }`: Field address or access (`&obj.field`, `p->field`). `field_name` disambiguates structurally distinct types sharing positional field offsets.
 - `ArrayFnMember { array, callee }`: Function-pointer array initializer member (`{ fn0, fn1 }`).
-- `CallReturn { dst, callee_name, caller }`: Direct call assignment (`dst = callee()`), expanded during PAG construction using `fn_returns` in `caller`'s scope (`None` for a file-scope initializer; see `docs/ANALYSIS.md`, "Return-value flow").
+- `CallReturn { dst, callee_name, caller }`: Direct call assignment (`dst = callee()`), expanded during PAG construction using `fn_returns` in `caller`'s scope (`None` for a file-scope initializer; see `docs/IR.md`, "Return-value flow").
 - `CallReturnResolved { dst, callee }`: Return from an exact selected `FnId`, expanded by the PAG; used after merge for file-scope getters without a call site.
 - `CallReferenceReturn { dst, callee_name }`: Address returned by a direct file-scope reference getter; expanded after merge in the destination's file and link target using `LvalueAddress` facts.
 - `CallReferenceReturnDeclared { dst, callee, args }`: Address returned by a selected file-scope getter; its declaration and explicit actual variables are remapped, matched to definitions by signature in the destination's file and link target, then bound before address-return expansion.
 - `CallReturnIndirect { dst, callee_var }`: Indirect/virtual call assignment (`dst = callee_var()`), callee resolved at analysis time from points-to sets.
-- `NewHeap { dst }`: Heap allocation (`new T(...)`, and a smart-pointer factory's object; see `docs/ANALYSIS.md`, "Factory construction"), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
+- `NewHeap { dst }`: Heap allocation (`new T(...)`, and a smart-pointer factory's object; see `docs/CXX.md`, "Factory construction"), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
 - `StringConst { dst, value }`: String literal constant interned as abstract location, enabling dynamic symbol lookup (`dlsym`, `GetProcAddress`).
 - `NullPointer { dst }`: Explicit C++ `nullptr` value, copied from a PAG value node with no abstract location or points-to targets.
-- `UnwrapPointer { dst, src }`: Step through a smart pointer's overloaded `->`/`*` (`sp->field`) or modeled owning-pointer `get()` into a pointee-typed receiver or raw-pointer result; the solver admits only pointee-compatible locations (see `docs/ANALYSIS.md`, "Smart-pointer unwrap").
+- `UnwrapPointer { dst, src }`: Step through a smart pointer's overloaded `->`/`*` (`sp->field`) or modeled owning-pointer `get()` into a pointee-typed receiver or raw-pointer result; the solver admits only pointee-compatible locations (see `docs/IR.md`, "Smart-pointer unwrap").
 
 Return-value flow (`ReturnFlow` in `program.fn_returns`):
 - `AddrOfVar { src }`: `return &var`
 - `AddrOfFn { callee }`: `return &fn`
 - `Copy { src }`: `return local` or `return param`
-- `Call { callee_name }`: `return other()` (transitive call return)
-- `LvalueAddress(inner)`: address/copy/call fact for the original cell of a returned reference; expanded only for address consumers (see `docs/ANALYSIS.md`, "Return-value flow")
+- `Call { callee_name, result }`: `return other()` (transitive call return with a temporary for that occurrence's modeled field result)
+- `LvalueAddress(inner)`: address/copy/call fact for the original cell of a returned reference; expanded only for address consumers (see `docs/IR.md`, "Return-value flow")
 
 ## Adding analysis constraints
 
-1. Document constraint kind in `docs/ANALYSIS.md`
+1. Document constraint kind in `docs/IR.md`
 2. Add IR fact in `trace-ir/src/flow.rs` if needed; lower in `trace-parse/src/lower.rs`
 3. Map to PAG in `trace-analysis/src/pag.rs` (`build_flow_constraints`)
 4. Handle in `trace-analysis/src/solver.rs` worklist propagation
@@ -105,7 +117,7 @@ Return-value flow (`ReturnFlow` in `program.fn_returns`):
 
 ## Libc and external summaries
 
-Register external function summaries and function models (`FnModelSet`, loaded via `--models <FILE>`) in `trace-analysis/src/summaries.rs`. Document each summary's imprecision in `docs/ANALYSIS.md`.
+Register external function summaries and function models (`FnModelSet`, loaded via `--models <FILE>`) in `trace-analysis/src/summaries.rs`. Document each summary's imprecision in `docs/MODELS.md`.
 
 ## Tests
 
@@ -150,44 +162,44 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 |------|---------------|
 | Editor call hierarchy (LSP) | `crates/trace-lsp/src/`, `crates/trace-db/src/inspect/editor.rs` → [docs/LSP.md](docs/LSP.md) |
 | Fix include resolution / graph | `trace-parse/src/deps.rs`, `trace-preproc/src/preprocessor.rs` |
-| Shared system-header bundles / preamble cache / syntax reuse / `TRACE_PROFILE_INDEX` | `trace-preproc/src/preprocessor.rs` (`is_cacheable_header`, `OutputScope`), `trace-parse/src/lower.rs` (`HeaderIr`, `HeaderExpansionConsumers`), `parse.rs` (`edit_previous`), `index_profile.rs` → [Shared system header bundles](docs/PREPROCESSOR.md#shared-system-header-bundles), [Indexing syntax reuse](docs/ANALYSIS.md#indexing-syntax-reuse), [Indexing diagnostics](docs/MEMORY_PROFILE.md#indexing-subphase-timings) |
+| Shared system-header bundles / preamble cache / syntax reuse / `TRACE_PROFILE_INDEX` | `trace-preproc/src/preprocessor.rs` (`is_cacheable_header`, `OutputScope`), `trace-parse/src/lower.rs` (`HeaderIr`, `HeaderExpansionConsumers`), `parse.rs` (`edit_previous`), `index_profile.rs` → [Shared system header bundles](docs/PREPROCESSOR.md#shared-system-header-bundles), [Indexing syntax reuse](docs/CXX.md#indexing-syntax-reuse), [Indexing diagnostics](docs/MEMORY_PROFILE.md#indexing-subphase-timings) |
 | Canonical system-header prelude (`--canonical-system-headers`) | `trace-parse/src/lower.rs` (`canonical_system_preamble`, prelude run and lowering thread, final merge), `trace-preproc/src/preprocessor.rs` (`apply_canonical_prelude`, `canonical_base_key`, covered-include skip in `process_file`), `trace-preproc/src/options.rs` (`CanonicalSystemPrelude`) → [Canonical system-header prelude](docs/CANONICAL_SYSTEM_PRELUDE.md) |
-| Analyze-phase cost / points-to propagation | `trace-analysis/src/solver.rs` → [Propagation highlights](docs/ANALYSIS.md#propagation-highlights) |
+| Analyze-phase cost / points-to propagation | `trace-analysis/src/solver.rs` → [Propagation highlights](docs/POINTERS.md#propagation-highlights) |
 | Measure peak memory / phase CPU (Linux: `scripts/profile_memory.py`; macOS: `scripts/profile_memory_macos.py`, compare `phys_footprint`) | `docs/MEMORY_PROFILE.md`, [macOS measurements](docs/PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175) |
 | Analyze-phase name lookup order | `trace-ir/src/symbol.rs` → [Shared header functions](docs/ANALYSIS.md#shared-header-functions) |
 | Return-value / call assignment flow | `trace-parse/src/lower.rs`, `pag.expand_return_flows` |
-| Variadic parameter packs (`Args &&...args`, `args...`, `std::forward<Args>(args)...`) | `trace-parse/src/lower.rs` (`lower_parameters`, `collect_call_arg_nodes`, `mark_pack_actuals`), `trace-ir/src/symbol.rs` (`Function::has_pack_param`), `program.rs` (`pack_vars`), `merge.rs`, `trace-analysis/src/solver.rs` (`wire_actuals`, `recorded_position`, `invoke_alignments`) → `docs/ANALYSIS.md` ("Variadic parameter packs") |
+| Variadic parameter packs (`Args &&...args`, `args...`, `std::forward<Args>(args)...`) | `trace-parse/src/lower.rs` (`lower_parameters`, `collect_call_arg_nodes`, `mark_pack_actuals`), `trace-ir/src/symbol.rs` (`Function::has_pack_param`), `program.rs` (`pack_vars`), `merge.rs`, `trace-analysis/src/solver.rs` (`wire_actuals`, `recorded_position`, `invoke_alignments`) → `docs/POINTERS.md` ("Variadic parameter packs") |
 | Static / internal call resolution | `symbol.rs` (`resolve_function_in_scope_in_target`), `solver.rs`, `pag.rs` |
 | Link targets / weak symbols | `link_commands.rs` (reading build metadata), `target_merge.rs` (per-image scopes and weak selection), `symbol.rs` (`TargetScope`) |
 | Fn-ptr arg-flow export | `solver.rs` (`extract_arg_flow`), `export.rs`, `arg_flow_edges.actual_fn_id` |
 | Flow-graph export / inspect queries | `export.rs` (`export_flow_graph`), `inspect.rs` |
-| Where a flow edge's operation is written (`flow_origins`; enclosing function as the innermost definition holding the line) | `trace-parse/src/lower.rs`, `flow_origins.rs`, `merge.rs`, `trace-db/src/export.rs` (`export_flow_provenance`), `inspect.rs` (`innermost_definition_holding`) → `docs/ANALYSIS.md` ("Where a value moves") |
+| Where a flow edge's operation is written (`flow_origins`; enclosing function as the innermost definition holding the line) | `trace-parse/src/lower.rs`, `flow_origins.rs`, `merge.rs`, `trace-db/src/export.rs` (`export_flow_provenance`), `inspect.rs` (`innermost_definition_holding`) → `docs/POINTERS.md` ("Where a value moves") |
 | Field summary / GEP fallback | `trace-analysis/src/pag.rs`, `solver.rs` |
 | New SQLite column | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | Parse new C/C++ construct | `trace-parse/src/lower.rs` |
-| C++ spellings the pinned grammar rejects (attributed `friend`, computed `decltype` bases, GNU `__typeof__`, member-function pointers) | `trace-parse/src/parse.rs` (`normalize_cpp_parse_syntax`, `cpp_type_operand_parses`), `cpp_type_names.rs` → `docs/ANALYSIS.md` ("C++ parse-input normalization") |
-| Constructor/destructor sites of automatic objects (`T x;`, scope exit, range-for/catch variables) | `trace-parse/src/lower.rs` (`emit_automatic_lifecycle`, `lifecycle_members`, `lower_statement_local`, `range_element_desc`) → `docs/ANALYSIS.md` ("Automatic objects") |
-| Constructor sites of factory-built objects (`std::make_shared<T>`, `std::make_unique<T>`, `sptr<T>::MakeSptr`) | `trace-parse/src/lower.rs` (`factory_constructed_class`, `emit_factory_construction`, `construct_on_heap`, shared with `lower_new_object`) → `docs/ANALYSIS.md` ("Factory construction") |
-| Member-initializer lists (`Base(a)`, `m_(a)` constructing; `cb_(cb)` storing into a non-class member) | `trace-parse/src/lower.rs` (`lower_field_initializer_list`, `lower_class_initializer`, `lower_aggregate_subobjects`, `lower_default_member_initializer`, `lower_implicit_copy_subobjects`, `lower_inherited_subobjects`, `initializer_constructors`, `lifecycle_members`, `store_member_initializer`, recursive `lower_class_definitions`), `trace-ir/src/types.rs` (reference fields, constant array bounds, scoped default initializers, own cv/ref constructor signatures and explicit imports preserved by header merges) → `docs/ANALYSIS.md` ("C++ support (first step)", constructions) |
+| C++ spellings the pinned grammar rejects (attributed `friend`, computed `decltype` bases, GNU `__typeof__`, member-function pointers) | `trace-parse/src/parse.rs` (`normalize_cpp_parse_syntax`, `cpp_type_operand_parses`), `cpp_type_names.rs` → `docs/CXX.md` ("C++ parse-input normalization") |
+| Constructor/destructor sites of automatic objects (`T x;`, scope exit, range-for/catch variables) | `trace-parse/src/lower.rs` (`emit_automatic_lifecycle`, `lifecycle_members`, `lower_statement_local`, `range_element_desc`) → `docs/CXX.md` ("Automatic objects") |
+| Constructor sites of factory-built objects (`std::make_shared<T>`, `std::make_unique<T>`, `sptr<T>::MakeSptr`) | `trace-parse/src/lower.rs` (`factory_constructed_class`, `emit_factory_construction`, `construct_on_heap`, shared with `lower_new_object`) → `docs/CXX.md` ("Factory construction") |
+| Member-initializer lists (`Base(a)`, `m_(a)` constructing; `cb_(cb)` storing into a non-class member) | `trace-parse/src/lower.rs` (`lower_field_initializer_list`, `lower_class_initializer`, `lower_aggregate_subobjects`, `lower_default_member_initializer`, `lower_implicit_copy_subobjects`, `lower_inherited_subobjects`, `initializer_constructors`, `lifecycle_members`, `store_member_initializer`, recursive `lower_class_definitions`), `trace-ir/src/types.rs` (reference fields, constant array bounds, scoped default initializers, own cv/ref constructor signatures and explicit imports preserved by header merges) → `docs/CXX.md` ("C++ support (first step)", constructions) |
 | C++ virtual dispatch & hierarchy | `trace-ir/src/program.rs` (`inheritance`), `trace-parse/src/lower.rs` (`expand_virtual_overrides`) |
-| Owning-pointer `get()` aliases, returned wrapper references, and getter definition visibility | `trace-parse/src/lower.rs` (`pointer_extraction`, `receiver_value`, `settle_merged_pointer_extractions`), `trace-analysis/src/pag.rs` → [Smart-pointer unwrap](docs/ANALYSIS.md#smart-pointer-unwrap) |
+| Owning-pointer `get()` aliases, returned wrapper references, and getter definition visibility | `trace-parse/src/lower.rs` (`pointer_extraction`, `receiver_value`, `settle_merged_pointer_extractions`), `trace-analysis/src/pag.rs` → [Smart-pointer unwrap](docs/IR.md#smart-pointer-unwrap) |
 | C++ smart pointer unwrapping | `trace-parse/src/lower.rs` (`ArrowReturn`), `symbol.rs` |
-| Member calls on a class the unit never declares (`MessageParcel &data; data.WriteInt32()`) | `trace-parse/src/lower.rs` (`undeclared_class_guess`), `trace-ir/src/types.rs` (`note_guessed_class`, `is_guessed_class`), `symbol.rs` (`spelled_alike`, `int_stands_for_fn_ptr`) → `docs/ANALYSIS.md` ("Undeclared receiver classes") |
-| Smart-pointer value flow (`sp->field`, `wp.lock()`) | `trace-parse/src/lower.rs` (`decompose_field_path`, `emit_wrapper_boundaries`, `weak_promotion`, `promoted_receiver_value`), `trace-analysis/src/solver.rs` (`unwrap_admits`) → `docs/ANALYSIS.md` ("Smart-pointer unwrap", "Weak-pointer promotion") |
-| C++ class-template member return substitution | `trace-ir/src/program.rs` (`TemplateReturn`), `trace-parse/src/lower.rs` (`register_template_return`, `substituted_template_return`), `merge.rs` → `docs/ANALYSIS.md` |
-| Type of a call-expression receiver (`S::Get().Open()`) | `trace-parse/src/lower.rs` (`CallResult`, `call_result_shape`, `receiver_desc`) → `docs/ANALYSIS.md` |
+| Member calls on a class the unit never declares (`MessageParcel &data; data.WriteInt32()`) | `trace-parse/src/lower.rs` (`undeclared_class_guess`), `trace-ir/src/types.rs` (`note_guessed_class`, `is_guessed_class`), `symbol.rs` (`spelled_alike`, `int_stands_for_fn_ptr`) → `docs/CXX.md` ("Undeclared receiver classes") |
+| Smart-pointer value flow (`sp->field`, `wp.lock()`) | `trace-parse/src/lower.rs` (`decompose_field_path`, `emit_wrapper_boundaries`, `weak_promotion`, `promoted_receiver_value`), `trace-analysis/src/solver.rs` (`unwrap_admits`) → `docs/IR.md` ("Smart-pointer unwrap", "Weak-pointer promotion") |
+| C++ class-template member return substitution | `trace-ir/src/program.rs` (`TemplateReturn`), `trace-parse/src/lower.rs` (`register_template_return`, `substituted_template_return`), `merge.rs` → `docs/CXX.md` |
+| Type of a call-expression receiver (`S::Get().Open()`) | `trace-parse/src/lower.rs` (`CallResult`, `call_result_shape`, `receiver_desc`) → `docs/CXX.md` |
 | C API functions / FFI bindings | `crates/trace-capi/src/`, `crates/trace-capi/include/trace.h`, `docs/CAPI.md`, `Doxyfile` |
 | Dependency roots (`--dep`) | `trace-parse/src/configured.rs`, `merge.rs`, `trace-db/src/inspect.rs`, `trace-cli/src/main.rs` |
-| OpenHarmony `.idl` synthesis (interfaces/proxies/stubs) | `trace-parse/src/idl.rs` (`parse`, `Names::of`, `cpp_type`, `render`, `synthesize`), `lower.rs` (`build_program_inner`), `trace-analysis/src/ipc.rs` (`scan`) → `docs/ANALYSIS.md` ("IDL-generated interfaces") |
+| OpenHarmony `.idl` synthesis (interfaces/proxies/stubs) | `trace-parse/src/idl.rs` (`parse`, `Names::of`, `cpp_type`, `render`, `synthesize`), `lower.rs` (`build_program_inner`), `trace-analysis/src/ipc.rs` (`scan`) → `docs/CXX.md` ("IDL-generated interfaces") |
 | Measure what the configuration excludes (`#if` arms not taken) | `PreprocessOptions::record_conditionals` + `PreprocessResult::conditionals` (`trace-preproc/src/conditionals.rs`), `trace-cli/examples/conditional_coverage.rs`, `scripts/gen_conditional_coverage_report.py` → `docs/CONDITIONAL_COVERAGE.md` |
-| Bounded conditional-variant exploration (`--explore`) | `PreprocessOptions::explore` + `explore_budget`, `trace-parse/src/explore.rs`, `gn_defines.rs`, `merge_unit_variants`, `lower.rs` → `docs/ANALYSIS.md` |
+| Bounded conditional-variant exploration (`--explore`) | `PreprocessOptions::explore` + `explore_budget`, `trace-parse/src/explore.rs`, `gn_defines.rs`, `merge_unit_variants`, `lower.rs` → `docs/USAGE.md` |
 | Parallel discovery pass (expansion-cache writes) | `trace-parse/src/expansion_discovery.rs`, `trace-preproc/src/journal.rs` → `docs/PREPROCESSOR.md` |
-| Compilation database (`--compile-commands`) | `trace-parse/src/compile_commands.rs`, `configured.rs`, `merge_unit_variants` → `docs/ANALYSIS.md` |
-| Function models / summaries | `trace-analysis/src/summaries.rs` (`FnModelSet`, `--models`) → `docs/ANALYSIS.md` |
-| Value slice with execution-context hints (`inspect slice`), memory access edges (`mem_read` / `mem_write`) | `trace-db/src/inspect/slice.rs` (`resolve_slice_start`, `value_slice`, `render_slice`), `trace-analysis/src/memory.rs` (`memory_accesses`), `trace-db/src/export.rs` (`export_flow_graph`, `export_memory_origins`), `trace-parse/src/lower.rs` (`read_field_receiver`) → `docs/ANALYSIS.md` ("Value slice", "Memory access edges") |
-| Callbacks a callee runs / thread entry points (`invoke`, `pthread_create`, `std::thread`) | `trace-analysis/src/summaries.rs` (`Effect::Invoke`, `InvokeArgs`), `solver.rs` (`wire_invocations`, `callback_edges`) → `docs/ANALYSIS.md` ("Callback invocation") |
-| Call order between calls (`--sequencing`, `cfg_*` tables, `inspect sequence`) | `trace-ir/src/cfg.rs` (`FunctionCfg`, `add_variant`, `compact`, `remap`), `trace-parse/src/cfg_build.rs` (`CfgRecorder`, `build_function_cfg`), `merge.rs` (`merge_unit`), `trace-db/src/export.rs` (`export_cfg`, `read_cfgs`), `trace-db/src/inspect/sequence.rs` (`sequence_graph`, `render_sequence`), `trace-merge/src/lib.rs` (`site_keys`) → `docs/ANALYSIS.md` ("Call sequencing") |
-| Execution contexts (thread/task starts, IPC handlers, multi-instance evidence; `execution_contexts` table) | `trace-analysis/src/contexts.rs`, `summaries.rs` (`ContextKind`), `solver.rs` (`callback_edges`), `trace-parse/src/lower.rs` (`repeats_in_loop`, `CallSite::in_loop`), `trace-db/src/export.rs`, `trace-merge` → `docs/ANALYSIS.md` ("Execution contexts") |
-| OpenHarmony task/thread primitives (`ffrt::submit`, `PostTask`, `ThreadPool`, timers, HDF work), framework entries (`Thread::Run`, `ProcessEvent`, `OnRemoteDied`), qualified model matching, the receiver a task is queued on | `trace-analysis/src/summaries.rs` (`builtin`, `ModelLookup`: `lookup`, `model`, `entry`; `class_may_be`), `contexts.rs` (`framework_entries`), `trace-parse/src/lower.rs` (`Receiver`, `CallSite::receiver`) → `docs/ANALYSIS.md` ("Model matching", "Built-in models", "Execution contexts") |
-| Noise macro filtering (`--ignore-macro`, `--ignore-logging`) | `trace-preproc/src/line_map.rs`, `trace-parse/src/lower.rs`, `trace-analysis/src/summaries.rs` → `docs/ANALYSIS.md` |
+| Compilation database (`--compile-commands`) | `trace-parse/src/compile_commands.rs`, `configured.rs`, `merge_unit_variants` → `docs/USAGE.md` |
+| Function models / summaries | `trace-analysis/src/summaries.rs` (`FnModelSet`, `--models`) → `docs/MODELS.md` |
+| Value slice with execution-context hints (`inspect slice`), memory access edges (`mem_read` / `mem_write`) | `trace-db/src/inspect/slice.rs` (`resolve_slice_start`, `value_slice`, `render_slice`), `trace-analysis/src/memory.rs` (`memory_accesses`), `trace-db/src/export.rs` (`export_flow_graph`, `export_memory_origins`), `trace-parse/src/lower.rs` (`read_field_receiver`) → `docs/USAGE.md` ("Value slice"), `docs/POINTERS.md` ("Memory access edges") |
+| Callbacks a callee runs / thread entry points (`invoke`, `pthread_create`, `std::thread`) | `trace-analysis/src/summaries.rs` (`Effect::Invoke`, `InvokeArgs`), `solver.rs` (`wire_invocations`, `callback_edges`) → `docs/MODELS.md` ("Callback invocation") |
+| Call order between calls (`--sequencing`, `cfg_*` tables, `inspect sequence`) | `trace-ir/src/cfg.rs` (`FunctionCfg`, `add_variant`, `compact`, `remap`), `trace-parse/src/cfg_build.rs` (`CfgRecorder`, `build_function_cfg`), `merge.rs` (`merge_unit`), `trace-db/src/export.rs` (`export_cfg`, `read_cfgs`), `trace-db/src/inspect/sequence.rs` (`sequence_graph`, `render_sequence`), `trace-merge/src/lib.rs` (`site_keys`) → `docs/USAGE.md` ("Call sequencing") |
+| Execution contexts (thread/task starts, IPC handlers, multi-instance evidence; `execution_contexts` table) | `trace-analysis/src/contexts.rs`, `summaries.rs` (`ContextKind`), `solver.rs` (`callback_edges`), `trace-parse/src/lower.rs` (`repeats_in_loop`, `CallSite::in_loop`), `trace-db/src/export.rs`, `trace-merge` → `docs/MODELS.md` ("Execution contexts") |
+| OpenHarmony task/thread primitives (`ffrt::submit`, `PostTask`, `ThreadPool`, timers, HDF work), framework entries (`Thread::Run`, `ProcessEvent`, `OnRemoteDied`), qualified model matching, the receiver a task is queued on | `trace-analysis/src/summaries.rs` (`builtin`, `ModelLookup`: `lookup`, `model`, `entry`; `class_may_be`), `contexts.rs` (`framework_entries`), `trace-parse/src/lower.rs` (`Receiver`, `CallSite::receiver`) → `docs/MODELS.md` ("Model matching", "Built-in models", "Execution contexts") |
+| Noise macro filtering (`--ignore-macro`, `--ignore-logging`) | `trace-preproc/src/line_map.rs`, `trace-parse/src/lower.rs`, `trace-analysis/src/summaries.rs` → `docs/USAGE.md` |
 | Builtin fallback macros | `trace-preproc/src/preprocessor.rs`, `tests/fixtures/builtin_macros/` → `docs/PREPROCESSOR.md` |

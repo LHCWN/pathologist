@@ -51,7 +51,7 @@ The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`)
   Preprocessed units and header variants retain their C++ language version.
   Implicit construction expands nontrivial subobjects. Recursive
   member lowering records it for nested classes and member class templates
-  too; see [member-initializer construction](ANALYSIS.md#c-support-first-step).
+  too; see [member-initializer construction](CXX.md#c-support-first-step).
 - **Orphan headers** (not reached by a project TU) are lowered separately and merged into the program.
 - **Cross-TU linking**: `merge_unit_index` merges compatible declarations and definitions, preserving distinct strong C++ definitions from different TUs. Build metadata assigns link images in `merge_linked_units`. Analysis uses the shared image-aware, scope-first resolver for internal and external functions. File-scope `static` variables use `SymbolTable::file_static_named`. See [Shared header functions](ANALYSIS.md#shared-header-functions) and [Link targets and weak symbols](ANALYSIS.md#link-targets-and-weak-symbols) for identity, ownership, and resolution precedence.
 
@@ -128,8 +128,8 @@ Lowering (`trace-parse/src/lower.rs`) walks tree-sitter ASTs and emits **flow co
 | `AnalysisResult.points_to` | Optional PAG-node → location sets (`--debug-points-to` only) |
 | `AnalysisResult.call_edges` | Resolved direct, indirect, and synthetic IPC call graph edges; IPC edges use `SYNTHETIC_CALL_SITE`, which must not be indexed into `Program.symbols.call_sites` |
 | `AnalysisResult.arg_flow_edges` | Actual → formal mapping per call site (`actual_var` or `actual_fn` + `formal`) |
-| `AnalysisResult.execution_contexts` | Where threads, tasks and IPC requests start running code, with multi-instance evidence ([Execution contexts](ANALYSIS.md#execution-contexts)) |
-| `AnalysisResult.memory_accesses` | The cells each load reads and each store writes, read off the converged points-to sets; exported as `flow_memory_access` rows naming the load's or store's `flow_edges` row, whose `flow_origins` rows are their sites; one row without a cell marks an access whose cells are not recorded ([Memory access edges](ANALYSIS.md#memory-access-edges)) |
+| `AnalysisResult.execution_contexts` | Where threads, tasks and IPC requests start running code, with multi-instance evidence ([Execution contexts](MODELS.md#execution-contexts)) |
+| `AnalysisResult.memory_accesses` | The cells each load reads and each store writes, read off the converged points-to sets; exported as `flow_memory_access` rows naming the load's or store's `flow_edges` row, whose `flow_origins` rows are their sites; one row without a cell marks an access whose cells are not recorded ([Memory access edges](POINTERS.md#memory-access-edges)) |
 | SQLite | Persisted subset of the above (see export modes below) |
 
 ## Export modes

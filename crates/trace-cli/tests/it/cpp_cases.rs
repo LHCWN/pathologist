@@ -4651,7 +4651,7 @@ fn every_conversion_target_kind_spells_one_member_under_any_macro() {
     // rather than inside the member — the macro and the keyword land there
     // together and the target becomes a `declaration` beside them — so the
     // member walk never sees it and no repair here can reach it. Recorded in
-    // `docs/ANALYSIS.md`.
+    // `docs/CXX.md`.
     let prelude = "namespace ns { struct S { int x; }; template <class T> struct Vec { T v; }; }\n\
                    struct S { int y; };\n\
                    template <class T> struct Vec { T v; };\n\
@@ -14290,7 +14290,7 @@ void run() {
 
 analyzed_fixture!(deref_member_reads);
 
-/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): `func`'s lowered
+/// Issue #151 (docs/IR.md, "Dereferenced operands"): `func`'s lowered
 /// facts in `deref_member_reads` as value-flow `(src, dst, label)` edges for
 /// [`common::flow_chain`]. A `Store` runs from the stored value to the
 /// pointer it goes through; a `GepField` is labelled `gep <field>`.
@@ -14868,7 +14868,7 @@ fn deref_of_an_unrecorded_call_result_emits_nothing() {
 }
 
 /// Issue #151: a member a base declares resolves through the base's layout
-/// (docs/ANALYSIS.md, "Implicit this member variable access"), so a
+/// (docs/POINTERS.md, "Implicit this member variable access"), so a
 /// dereference through it resolves: `*this->bpp = *h->pp` stores through
 /// `bpp`, and `*d->get()` reads the recorded result of a call through the
 /// inherited `get`.
@@ -15927,7 +15927,7 @@ void (S::*cb)(int) = &S::target;
 
     // `cb` must be registered as a variable under its own identifier: the
     // parse input approximates the member-function pointer as an ordinary
-    // function pointer (docs/ANALYSIS.md, "C++ parse-input normalization"),
+    // function pointer (docs/CXX.md, "C++ parse-input normalization"),
     // so the owner never leaks into the name.
     let var = program.symbols.variables.iter().find(|v| v.name == "cb");
     assert!(

@@ -36,7 +36,7 @@ pub fn is_cpp_header_path(path: &Path) -> bool {
     has_extension_in(path, HEADER_EXTENSIONS) && Language::from_path(path) == Language::Cpp
 }
 
-/// `.idl` interface definitions (docs/ANALYSIS.md, "IDL-generated interfaces").
+/// `.idl` interface definitions (docs/CXX.md, "IDL-generated interfaces").
 const IDL_EXTENSION: &str = "idl";
 
 /// Everything one directory walk classifies, each list sorted.

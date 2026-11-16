@@ -1,6 +1,6 @@
 //! Execution contexts: the places where a thread, a task or an IPC request
 //! starts running code, with the evidence that one may run more than once at
-//! a time (`docs/ANALYSIS.md`, "Execution contexts").
+//! a time (`docs/MODELS.md`, "Execution contexts").
 //!
 //! Read once off the converged call graph, like the callback edges the
 //! contexts start at: nothing here feeds the solver.

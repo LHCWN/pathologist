@@ -1,4 +1,4 @@
-//! OpenHarmony `.idl` synthesis (#123; docs/ANALYSIS.md, "IDL-generated interfaces").
+//! OpenHarmony `.idl` synthesis (#123; docs/CXX.md, "IDL-generated interfaces").
 
 use crate::common;
 

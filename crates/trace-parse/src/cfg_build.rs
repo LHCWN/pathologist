@@ -4,7 +4,7 @@
 //! ([`CfgRecorder`]). Once a body is walked, [`build_function_cfg`] walks the
 //! same tree again and places each node's sites, as events, in blocks and in
 //! a block-local sequenced-before order. Semantics and limits:
-//! docs/ANALYSIS.md, "Call sequencing (control-flow sidecar)".
+//! docs/USAGE.md, "Call sequencing (control-flow sidecar)".
 
 use super::{last_segment_of, node_span, operator_call, LowerContext, MAX_AST_WALK_DEPTH};
 use crate::node_metadata::NodeMetadata;
@@ -736,7 +736,7 @@ impl<'s, 'a> Builder<'s, 'a> {
                 self.live += 1;
                 // An object's base destructors are one unordered group: the
                 // IR does not say which bases are virtual, so their order is
-                // not claimed (docs/ANALYSIS.md, "Statements").
+                // not claimed (docs/USAGE.md, "Statements").
                 let sites = std::mem::take(&mut self.scopes[scope].objects[object]);
                 self.emit_unordered(&sites, Some(EventKind::Destroy));
                 self.scopes[scope].objects[object] = sites;
@@ -1206,7 +1206,7 @@ impl<'a> Builder<'_, 'a> {
 
     /// The operand of an operator that may not evaluate it. Lowering tags
     /// the calls of one the language never evaluates (`CallSite::unevaluated`;
-    /// docs/ANALYSIS.md, "Unevaluated operands"): those
+    /// docs/USAGE.md, "Unevaluated operands"): those
     /// [never run](Self::never_run). The calls of one that may be evaluated
     /// (`typeid(e)`, a `sizeof` operand of possibly variably modified type)
     /// [may run](Self::may_run).

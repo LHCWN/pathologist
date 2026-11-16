@@ -1,5 +1,5 @@
 //! `trace inspect sequence`: bounded call sequences rebuilt from the
-//! call-order CFGs of a `--sequencing` export (docs/ANALYSIS.md, "Call
+//! call-order CFGs of a `--sequencing` export (docs/USAGE.md, "Call
 //! sequencing (control-flow sidecar)").
 //!
 //! The query is demand-driven: it loads only the graphs of the functions it
@@ -439,7 +439,7 @@ fn narrowed(col: Option<i64>, callee: Option<&str>) -> String {
 }
 
 /// How the invocation of one event relates to another's; see
-/// docs/ANALYSIS.md, "Events and what \"before\" means".
+/// docs/USAGE.md, "Events and what \"before\" means".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Relation {
@@ -911,7 +911,7 @@ struct EventGaps {
     unevaluated: bool,
 }
 
-/// Where control may move without an edge in one graph (docs/ANALYSIS.md,
+/// Where control may move without an edge in one graph (docs/USAGE.md,
 /// "Boundaries and gaps").
 struct ControlFacts {
     /// Blocks control may leave for anywhere: an `unsupported` edge, or an

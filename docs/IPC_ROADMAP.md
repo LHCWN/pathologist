@@ -2,7 +2,7 @@
 
 This document records the original design. Current detection rules, IDL support
 and configurable summaries for absent framework sources (including DataShare
-`OpenFile`) are specified in [OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges).
+`OpenFile`) are specified in [OpenHarmony IPC bridges](MODELS.md#openharmony-ipc-bridges).
 Verification of `SendTransactCmd` wrappers, including the shared scheduler
 transport call at `ability_scheduler_proxy.cpp:1222`, is recorded in the
 [evaluation report](EVAL_REPORT.md#ipc-sends-through-sendtransactcmd--2026-11-06).
@@ -388,7 +388,7 @@ so a constructor-only `*Stub` class does not enable interface fallback.
 **Proxy detection** — a C++ class is a proxy if its qualified class name
 ends in `Proxy` or `Client`. Its methods count as IPC sends if their body
 calls a recognized IPC send function; see
-[OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges) for the
+[OpenHarmony IPC bridges](MODELS.md#openharmony-ipc-bridges) for the
 authoritative send-name and spelling rules.
 
 **Matching** — proxy methods are matched to stub handlers by:
@@ -429,8 +429,8 @@ A proxy and a stub whose names pair are not bridged when their
 `IRemoteProxy<I>` / `IRemoteStub<I>` arguments name two unrelated declared
 interfaces, and a proxy deriving from an out-of-tree `IRemoteProxy<IFoo>`
 is a subclass of `IFoo` (#122). Both rules and their limits are in
-[`docs/ANALYSIS.md`](ANALYSIS.md#openharmony-ipc-bridges) and
-[Template-parameter bases](ANALYSIS.md#template-parameter-bases).
+[`MODELS.md`](MODELS.md#openharmony-ipc-bridges) and
+[Template-parameter bases](CXX.md#template-parameter-bases).
 
 #### IR structures
 
@@ -524,7 +524,7 @@ by the same suffix rules.
 |---------|-------------------|-------|
 | Switch dispatch in stub | Not needed — stub detected by class name, handlers by class membership | Opcode resolution deferred to v2 |
 | if/else-if dispatch in stub | Not needed — same as above | Same |
-| Proxy send call | Proxy detected by class name + a recognized send in the body | Includes transport helpers; see [current rules](ANALYSIS.md#openharmony-ipc-bridges) |
+| Proxy send call | Proxy detected by class name + a recognized send in the body | Includes transport helpers; see [current rules](MODELS.md#openharmony-ipc-bridges) |
 | Enum/macro opcodes | Not resolved in v1 — edge wired by name matching | Opcode resolution in v2 via IDL |
 | Descriptor string | Optional: `GetDescriptor()` return or `DECLARE_INTERFACE_DESCRIPTOR` | Used for logging, not matching |
 | Callback interfaces | Same name-based matching in reverse direction | Proxy class ↔ stub class |
@@ -557,7 +557,7 @@ targets" below).
 - Name-based matching can produce false positives when a proxy/stub class
   name pattern collides with unrelated classes (e.g. a `*Proxy*` class that
   is not an IPC proxy). The recognized-send presence check mitigates this;
-  see [current rules](ANALYSIS.md#openharmony-ipc-bridges).
+  see [current rules](MODELS.md#openharmony-ipc-bridges).
 - `HandleX` prefix-stripping fallback is heuristic — a `FooProxy::Bar`
   method may not map to `FooStub::HandleBar` if the stub uses a different
   naming convention.
@@ -611,7 +611,7 @@ Phase 4: Export + CLI                                      [PARTIAL]
   → dedicated ipc_bridges SQLite table                      [DEFERRED]
 
 Phase 5: IDL-aware matching (optional, v2)
-  → Parse .idl files and synthesize interface/proxy/stub declarations [DONE, #123; docs/ANALYSIS.md "IDL-generated interfaces"]
+  → Parse .idl files and synthesize interface/proxy/stub declarations [DONE, #123; docs/CXX.md "IDL-generated interfaces"]
   → HDI omitted-return methods and composed-stub C++ IPC pairing [DONE; same authoritative section]
   → opcode (ipccode) matching [DEFERRED]
   → Fixtures: idl_basic/, idl_hdi/

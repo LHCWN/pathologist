@@ -1,6 +1,6 @@
 //! Inferred bare-tree include directories are the last search class: an
 //! explicit `-I` or `-isystem` directory wins over a same-named tree header.
-//! See docs/ANALYSIS.md, "Compilation databases (#62)".
+//! See docs/USAGE.md, "Compilation databases (#62)".
 
 use trace_preproc::{preprocess_string, PreprocessOptions};
 

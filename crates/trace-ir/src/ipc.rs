@@ -2,7 +2,7 @@ use crate::FnId;
 
 /// Whether a callee spelling names an OpenHarmony IPC send operation.
 /// Shared by bridge detection and exported linking facts; see
-/// docs/ANALYSIS.md, "OpenHarmony IPC bridges".
+/// docs/MODELS.md, "OpenHarmony IPC bridges".
 pub fn is_ipc_send(name: &str) -> bool {
     let mut name = name.trim();
     // Explicit template arguments may contain qualified or nested types.
@@ -42,7 +42,7 @@ pub fn is_ipc_send(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct IpcBridge {
     /// The sending proxy method or bodyless framework function whose model
-    /// summarizes the IPC call (docs/ANALYSIS.md, "OpenHarmony IPC bridges").
+    /// summarizes the IPC call (docs/MODELS.md, "OpenHarmony IPC bridges").
     pub proxy_method: FnId,
     /// The stub handler that processes it (resolved to exact `FnId`).
     pub stub_handler: FnId,
@@ -53,12 +53,12 @@ pub struct IpcBridge {
 }
 
 /// One interface declared by an `.idl` file, with the classes synthesized
-/// for it (docs/ANALYSIS.md, "IDL-generated interfaces").
+/// for it (docs/CXX.md, "IDL-generated interfaces").
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdlInterface {
     /// HDI stubs hold a separate implementation of `interface`; service-IDL
     /// stubs inherit it. Pairing searches interface implementations only for
-    /// this composition model (docs/ANALYSIS.md, "IDL-generated interfaces").
+    /// this composition model (docs/CXX.md, "IDL-generated interfaces").
     pub composed_stub: bool,
     /// Dotted IDL name as written (`OHOS.Security.IAtm`), idl-tool's interface descriptor.
     pub descriptor: String,

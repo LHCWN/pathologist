@@ -3,7 +3,7 @@
 //! dependencies. The parse input blanks the owner (and, for named typedefs,
 //! the trailing function qualifiers the ordinary-pointer approximation cannot
 //! carry) in place; original bytes outside those ranges and all line/column
-//! positions are unchanged (docs/ANALYSIS.md, "C++ parse-input
+//! positions are unchanged (docs/CXX.md, "C++ parse-input
 //! normalization").
 
 use std::fs;

@@ -122,7 +122,7 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         explore_budget: usize,
         /// Record per-function call-order graphs for `inspect sequence`
-        /// (opt-in; see docs/ANALYSIS.md, "Call sequencing").
+        /// (opt-in; see docs/USAGE.md, "Call sequencing").
         #[arg(long)]
         sequencing: bool,
         /// Solver work budget in worklist pops. The default scales with the
@@ -315,7 +315,7 @@ enum InspectCommands {
     /// Callees are inlined up to `--depth`; loops stay back edges, and
     /// unknown callees, omitted bodies, recursion, thread/task starts and IPC
     /// bridges are shown as boundaries. With `--to-*`, the relation of the
-    /// two calls is reported (docs/ANALYSIS.md, "Call sequencing").
+    /// two calls is reported (docs/USAGE.md, "Call sequencing").
     Sequence {
         /// Function name, C++ qualified suffix, or FILE:LINE: every variant
         /// of its body.

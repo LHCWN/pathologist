@@ -258,7 +258,7 @@ fn hdf_work_items_and_osal_timers_are_contexts_with_their_argument() {
 /// which real code does not do: a real header object (from
 /// `ffrt_create_function_wrapper`, or one whose `exec` member the runtime
 /// calls) is not looked into, so real C-form sites do not resolve yet (see
-/// `docs/ANALYSIS.md`, "Documented imprecision").
+/// `docs/MODELS.md`, "Documented imprecision").
 #[test]
 fn ffrt_c_forms_pin_their_callback_parameter() {
     let (p, a) = task_primitives();

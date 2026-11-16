@@ -1,7 +1,7 @@
 /*
  * Function models: dataflow through bodyless memory functions
  * (memcpy_s / memset_s) and through project wrappers described in a TOML
- * model configuration. See docs/ANALYSIS.md ("Function models").
+ * model configuration. See docs/MODELS.md ("Function models").
  *
  * OpsA / OpsB are structurally identical but DISTINCT types: instance-
  * insensitive field summaries are keyed per type, so copying an initialized

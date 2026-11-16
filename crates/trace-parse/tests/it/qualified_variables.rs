@@ -621,7 +621,7 @@ fn internal_namespace_variables_are_not_external_symbols() {
 
 /// A dependency header's qualified variables are declarations the target
 /// resolves against, and nothing more: no initializer or body of the
-/// dependency contributes flow (`docs/ANALYSIS.md`, "Dependency roots").
+/// dependency contributes flow (`docs/USAGE.md`, "Dependency roots").
 #[test]
 fn dependency_qualified_variables_declare_without_initializer_flow() {
     let dir = tempfile::tempdir().unwrap();

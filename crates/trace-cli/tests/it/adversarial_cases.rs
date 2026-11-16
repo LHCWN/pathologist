@@ -204,7 +204,7 @@ fn comma_without_assignment_keeps_first_fn_ptr() {
     );
 }
 
-// --- libc memcpy/memmove modeling (function models, see docs/ANALYSIS.md) ---
+// --- libc memcpy/memmove modeling (function models, see docs/MODELS.md) ---
 
 /// `memcpy(&fp, &src, n)` copies fn-ptr bits: the builtin model resolves the
 /// indirect call through the copy. Without models the gap remains.

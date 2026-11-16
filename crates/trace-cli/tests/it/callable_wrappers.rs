@@ -1,5 +1,5 @@
 //! Callables wrapped by `std::bind` and `std::packaged_task` keep the call
-//! edge from the code that wraps them (docs/ANALYSIS.md, "Callable
+//! edge from the code that wraps them (docs/MODELS.md, "Callable
 //! wrappers").
 
 use crate::common;
@@ -33,7 +33,7 @@ fn submit_reaches_the_callable_it_binds() {
     );
 }
 
-/// A parameter pack is followed (docs/ANALYSIS.md, "Variadic parameter
+/// A parameter pack is followed (docs/POINTERS.md, "Variadic parameter
 /// packs"): `Hit` goes into `Submit`'s `Args&&... args`, out through
 /// `std::forward<Args>(args)...` into the bind, and so to `Work`'s `cb`.
 #[test]

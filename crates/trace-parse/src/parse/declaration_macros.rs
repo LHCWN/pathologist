@@ -1,4 +1,4 @@
-//! Narrow, diagnosed approximations; see docs/ANALYSIS.md, C++ parse-input normalization.
+//! Narrow, diagnosed approximations; see docs/CXX.md, C++ parse-input normalization.
 use super::*;
 use std::ops::Range;
 

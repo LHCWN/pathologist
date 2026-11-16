@@ -721,7 +721,7 @@ fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// Rewrite syntax in C++ parse input that tree-sitter cannot recognize without
 /// parse errors. Replaces bytes in place with spaces so node offsets and line/column
 /// numbers continue to identify the original source location
-/// (docs/ANALYSIS.md, "C++ parse-input normalization").
+/// (docs/CXX.md, "C++ parse-input normalization").
 ///
 /// In standard C++, attributes can precede `friend` declarations (e.g.
 /// `[[nodiscard]] friend bool operator==(...)`), but upstream tree-sitter C++

@@ -294,7 +294,7 @@ values. Serde representation and the C ABI/SQLite schema are unchanged.
 
 ## Implemented follow-up: struct compaction, expansion sharing, and lifecycle reclamation
 
-Rules and API migration contracts are documented in [Type storage and TypeFields](ANALYSIS.md#typefields-and-layout-storage), [Constraint representation and accessors](ANALYSIS.md#constraint-representation-and-accessors), and [Post-solve flow-release lifecycle](ANALYSIS.md#post-solve-flow-release-lifecycle). Measured probe details and reproduction steps are documented in [Evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
+Rules and API migration contracts are documented in [Type storage and TypeFields](IR.md#typefields-and-layout-storage), [Constraint representation and accessors](POINTERS.md#constraint-representation-and-accessors), and [Post-solve flow-release lifecycle](POINTERS.md#post-solve-flow-release-lifecycle). Measured probe details and reproduction steps are documented in [Evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
 
 1. **`TypeInfo` and `TypeLayout` struct compaction (`trace-ir`)**:
    - `TypeInfo` inline size reduced from 104 B to 40 B (−61.5%).
@@ -313,7 +313,7 @@ Rules and API migration contracts are documented in [Type storage and TypeFields
    - `UnitIndex.held_headers` shares `expansion.inlined` as `Arc<[PathBuf]>` without copying path vectors.
    - Cached header `UnitIndex` instances shrunk to fit prior to caching in `HeaderIr`.
    - `HeaderIr` and `include_expansion_cache` dropped immediately as translation unit parsing completes before program finalization.
-   - Program IR flow memory released via `program.release_flow()` after SQLite provenance export; see [flow-release lifecycle](ANALYSIS.md#post-solve-flow-release-lifecycle) for the current retention rule.
+   - Program IR flow memory released via `program.release_flow()` after SQLite provenance export; see [flow-release lifecycle](POINTERS.md#post-solve-flow-release-lifecycle) for the current retention rule.
    - PAG `Constraint` inline size reduced from 48 B to 24 B (−50.0%) by boxing field access metadata (`FieldAccess.field_name` stored as `Arc<str>`, eliminating heap allocations in solver worklist propagation); eliminated cloning and destructive modification of call edges and wired argument flows during analysis.
 
 ### End-to-end benchmark measurements

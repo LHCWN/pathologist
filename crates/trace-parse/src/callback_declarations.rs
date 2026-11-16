@@ -1,5 +1,5 @@
 //! Recovery for C++ expression/declaration ambiguities.
-//! Rules and source-location contract: docs/ANALYSIS.md, C++ parse-input normalization.
+//! Rules and source-location contract: docs/CXX.md, C++ parse-input normalization.
 
 use super::*;
 use crate::parse::{parse_source_with_lang, SourceLang};

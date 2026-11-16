@@ -141,7 +141,7 @@ fn origin_in_a_header_body_names_the_header_and_its_function() {
 }
 
 /// A function-pointer table initializer records each element at its own
-/// position (`docs/ANALYSIS.md`, "Source-level dataflow presentation"):
+/// position (`docs/USAGE.md`, "Source-level dataflow presentation"):
 /// inside `table_init` for the local `table`, at file scope (no function)
 /// for `ftable`.
 #[test]
@@ -356,7 +356,7 @@ fn a_lambda_body_site_uses_the_visible_lexical_owner() {
 }
 
 /// A call through a pointer field reads the field at the call
-/// (docs/ANALYSIS.md, "Memory access edges"), however the member is spelled:
+/// (docs/POINTERS.md, "Memory access edges"), however the member is spelled:
 /// an explicit member operator (`cb_->operator()()`, `cb_->operator->()`)
 /// reads it as an ordinary member call (`this->cb_->OnError()`) does.
 #[test]

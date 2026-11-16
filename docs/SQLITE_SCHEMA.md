@@ -142,7 +142,7 @@ by the same code as `trace inspect sequence` and written by the same code as
 and `"partial"` otherwise; each input without graphs is then named in an
 `info` diagnostic with `stage = 'merge'` (`MissingSequencing`). Which graph a
 shared header body keeps, and how an event whose sites were not carried is
-spliced out: [Call sequencing, Merge](ANALYSIS.md#merge).
+spliced out: [Call sequencing, Merge](USAGE.md#merge).
 
 It does **not** populate `variables`, `types`, `locations`,
 `points_to`, `arg_flow_edges`, or any `flow_*` tables. `call_sites.callee_var`
@@ -637,7 +637,7 @@ Exactly one of `actual_var_id` or `actual_fn_id` is set per row. A function name
 
 Places where code starts running on a thread, a task queue or the IPC worker
 pool. Semantics, evidence rules and row order:
-[Execution contexts](ANALYSIS.md#execution-contexts). An additive v7 table: a
+[Execution contexts](MODELS.md#execution-contexts). An additive v7 table: a
 v7 export written before it existed has no `execution_contexts` table, so a
 reader checks for the table (and the columns it reads) instead of the schema
 version; in an ordinary analysis an empty table means no context was found. A
@@ -668,7 +668,7 @@ Per-function call-order control-flow graphs, written by `trace analyze
 --sequencing` in every export mode and empty otherwise (see the
 [capability marker](#version-and-capability-contract)). What an event, an
 edge, an order pair and a gap mean, and what "before" may be concluded from
-them: [Call sequencing](ANALYSIS.md#call-sequencing-control-flow-sidecar).
+them: [Call sequencing](USAGE.md#call-sequencing-control-flow-sidecar).
 Additive to v8. Kind and coverage columns are `strings` ids (`JOIN strings s
 ON s.id = kind_id`). Row ids count up from 1 in function id, then variant
 order; a graph's blocks and events take consecutive ids in ordinal order, so
@@ -696,7 +696,7 @@ heads, case labels, labels, `try` bodies and handlers).
 (`fallthrough`, `branch_true`, `branch_false`, `switch_case`, `back_edge`,
 `return`, `exception`, `unsupported`, `sequenced`; a `sequenced` edge joins
 two halves of one block's local order, see
-[Representation](ANALYSIS.md#representation)). Primary key `(src_block,
+[Representation](USAGE.md#representation)). Primary key `(src_block,
 dst_block, kind_id)`, `WITHOUT ROWID`.
 
 `cfg_events`: one row per invocation.
@@ -769,12 +769,12 @@ intermediate values. Source selection filters this metadata, never name prefixes
 
 PAG value-flow nodes (`trace inspect dataflow`). Always exported. A global
 or static that no flow, return or call site names has no node (see
-[Program Assignment Graph](ANALYSIS.md#program-assignment-graph-pag)).
+[Program Assignment Graph](POINTERS.md#program-assignment-graph-pag)).
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | PAG node id (same id space as `points_to.var_node_id`) |
-| `kind` | TEXT | `var`, `loc`, `constant` (immutable value with no abstract location), `call_target` (indirect-call site node), or `terminator` (function-model clears event) |
+| `kind` | TEXT | `var`, `loc`, `constant` (immutable value with no abstract location), `field_address` (intermediate member address for a getter model), `call_target` (indirect-call site node), or `terminator` (function-model clears event) |
 | `label` | TEXT | Human-readable label (empty for `var` nodes where label is read from `variables.name`; `loc:…`, `fn:…`, `"memset_s clears arg0"`) |
 | `detail` | TEXT | Extra context (empty for `var` nodes where detail is derived from `variables.kind`, `variables.line`, and `functions.name`; location kind for `loc`, call site for `call_target`/`terminator`) |
 | `var_id` | INTEGER FK → `variables` | Variable this node belongs to (`NULL` for function locations) |
@@ -821,7 +821,7 @@ Edge kinds:
 - `unwrap` — a smart pointer's overloaded `->`/`*` (`sp->field`) or modeled
   owning-pointer `get()`: the wrapper value flows into a pointee-typed
   receiver or raw-pointer result. Only pointee-compatible locations cross it; see
-  [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap).
+  [Smart-pointer unwrap](IR.md#smart-pointer-unwrap).
 - `points_to` — implicit var → storage-location edge derived from the final
   var→location map.
 - `call_arg` — actual-to-formal argument passing from `arg_flow_edges`,
@@ -838,10 +838,10 @@ Which memory cells a `load` reads and a `store` writes is not an edge here:
 see [`flow_memory_access`](#flow_memory_access).
 
 Edges have no position columns. Where the statement behind an edge is written
-is recorded once, in [`flow_origins`](#source-level-presentation-metadata-v7),
+is recorded once, in [`flow_origins`](#source-level-presentation-metadata-v7-and-v8),
 keyed by the same `(src_node, dst_node, kind)`; edges with no statement of their
 own have no origin rows. Rules:
-[Where a value moves](ANALYSIS.md#where-a-value-moves); query:
+[Where a value moves](POINTERS.md#where-a-value-moves); query:
 [Source sites of a value move](#source-sites-of-a-value-move).
 
 **Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`
@@ -864,7 +864,7 @@ row. The access's sites are its load's or store's `flow_origins` rows (join
 are repeated for it. Read as edges, a load's row is a `mem_read` from the cell
 into the load's destination and a store's a `mem_write` from the stored value
 into the cell; `inspect slice` follows them, `inspect dataflow` and the C API
-do not. Rules: [Memory access edges](ANALYSIS.md#memory-access-edges).
+do not. Rules: [Memory access edges](POINTERS.md#memory-access-edges).
 
 Detect it with the table and its two columns: an earlier v7 export lacks the
 table, and `trace-merge` output (`analysis_run.options_json.stage = "merge"`)
@@ -1002,7 +1002,7 @@ WHERE af.actual_fn_id IS NOT NULL;
 ### Source sites of a value move
 
 Every statement that moves `b`'s value or storage into `pp`, with the enclosing
-function by the [edge-scope rule](ANALYSIS.md#where-a-value-moves): when
+function by the [edge-scope rule](POINTERS.md#where-a-value-moves): when
 several definitions hold the line, the innermost one if the line is strictly
 inside it (not its first or last line); a line held by a single definition is
 that definition's, its first and last lines included; otherwise `NULL`:
@@ -1063,7 +1063,7 @@ trace inspect graph.db sequence (--function FN | --file SUBSTR --line N [--col C
   value flow forward (`down`: where the value flows) or backward (`up`: where
   it came from). Depth counts visible transitions after technical PAG nodes
   collapse; see the authoritative
-  [source-level contract](ANALYSIS.md#source-level-dataflow-presentation).
+  [source-level contract](USAGE.md#source-level-dataflow-presentation).
   Parameters duplicated across TUs (header prototype vs definition copies)
   are reconciled automatically when the queried copy carries no edges.
 
@@ -1075,7 +1075,7 @@ trace inspect graph.db sequence (--function FN | --file SUBSTR --line N [--col C
   [call sequencing tables](#call-sequencing-tables) of each function, the
   callees from `call_edges`, `execution_contexts` starts and `ipc` edges as
   boundaries. Semantics:
-  [Call sequencing, Query](ANALYSIS.md#query).
+  [Call sequencing, Query](USAGE.md#query).
 
 Both graph commands print a forest with `(truncated at --depth …)` markers
 when the frontier was cut off.
@@ -1199,4 +1199,4 @@ Raw tables keep their existing meaning under the
 Inspect checks required structures for older exports; the source-level view
 requires its presentation metadata and an analysis origin. The CLI JSON and
 raw API compatibility rules are defined in
-[Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+[Source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation).

@@ -2044,8 +2044,12 @@ fn remap_return_flow(
         ReturnFlow::LvalueAddress(inner) => {
             ReturnFlow::LvalueAddress(Box::new(remap_return_flow(inner, fn_map, var_map)))
         }
-        ReturnFlow::Call { callee_name } => ReturnFlow::Call {
+        ReturnFlow::Call {
+            callee_name,
+            result,
+        } => ReturnFlow::Call {
             callee_name: callee_name.clone(),
+            result: rv(*result),
         },
     }
 }

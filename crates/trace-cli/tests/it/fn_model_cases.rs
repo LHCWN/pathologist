@@ -249,7 +249,7 @@ fn content_store_model_writes_values_present_before_wiring() {
 }
 
 /// Argument and return models match the callee's exact name only
-/// (`docs/ANALYSIS.md`, "Model matching"): the libc `memset`, `memcpy` and
+/// (`docs/MODELS.md`, "Model matching"): the libc `memset`, `memcpy` and
 /// `malloc` models do not reach a class's or namespace's own `memset`,
 /// `memcpy` or `malloc`, defined in the tree or not, while the plain,
 /// `::`- and `std::`-qualified calls keep them.
@@ -357,6 +357,359 @@ void std_clear(void) { std::memset(&g_std_cleared, 0, sizeof(op_t)); }
         !points_to_heap("member_alloc", "p"),
         "Arena::malloc is not libc malloc"
     );
+}
+
+/// `return_field` models a bodyless accessor: a call to `get_run(&g_ops)`
+/// returns the `run` member of the object, so a function stored there is
+/// reachable through the accessor's result (docs/MODELS.md, "Modeling
+/// recipes (examples)").
+#[test]
+fn return_field_model_resolves_a_bodyless_accessor() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("getter.c"),
+        "typedef int (*op_t)(int);\n\
+         static int impl_run(int x) { return x; }\n\
+         struct Ops { op_t run; int value; };\n\
+         struct Ops g_ops;\n\
+         void init_ops(void) { g_ops.run = impl_run; }\n\
+         op_t get_run(struct Ops *o);\n\
+         op_t get_null(struct Ops *o) { return 0; }\n\
+         void use_getter(void) { op_t f = get_run(&g_ops); (void)f(1); }\n\
+         void consume(op_t f) { (void)f(1); }\n\
+         void use_nested(void) { consume(get_run(&g_ops)); }\n\
+         void use_null_argument(void) { op_t f = get_run(0); (void)f(1); }\n\
+         void use_indexed_body(void) { op_t f = get_null(&g_ops); (void)f(1); }\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+
+    let base = analyze_no_models(&program);
+    assert!(
+        !indirect_targets(&program, &base, "use_getter").contains(&"impl_run".to_string()),
+        "baseline must not resolve through the unmodeled accessor"
+    );
+
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        "version = 1\n\
+         [[model]]\n\
+         name = \"get_run\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"run\" } ]\n\
+         [[model]]\n\
+         name = \"get_null\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"run\" } ]\n",
+    )
+    .expect("parse toml");
+    let with = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            models: Arc::new(models),
+            ..Default::default()
+        },
+    )
+    .1;
+    assert!(
+        indirect_targets(&program, &with, "use_getter").contains(&"impl_run".to_string()),
+        "the accessor's result must reach the member stored in the object"
+    );
+    assert_eq!(indirect_targets(&program, &with, "consume"), ["impl_run"]);
+    for caller in ["use_null_argument", "use_indexed_body"] {
+        assert!(
+            indirect_targets(&program, &with, caller).is_empty(),
+            "{caller}"
+        );
+    }
+}
+
+#[test]
+fn return_field_distinguishes_member_values_and_call_occurrences() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("getter.c"),
+        "typedef int (*op_t)(int);\n\
+         static int impl_run(int x) { return x; }\n\
+         struct Ops { op_t run; op_t *indirect; };\n\
+         struct Ops a, b;\n\
+         op_t slot;\n\
+         op_t *get_run_address(struct Ops *ops);\n\
+         op_t *get_slot(struct Ops *ops);\n\
+         void write_slot(void) {\n\
+             op_t *p = get_slot(&a);\n\
+             *p = impl_run;\n\
+             a.indirect = &slot;\n\
+             (void)slot(1);\n\
+         }\n\
+         void write_both(void) {\n\
+             op_t *p = get_run_address(&a);\n\
+             p = get_run_address(&b);\n\
+             *p = impl_run;\n\
+         }\n\
+         op_t *wrap(void) { get_run_address(&a); return get_run_address(&b); }\n\
+         void write_wrapped(void) { op_t *p = wrap(); *p = impl_run; }\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        "version = 1\n\
+         [[model]]\n\
+         name = \"get_run_address\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"run\" } ]\n\
+         [[model]]\n\
+         name = \"get_slot\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"indirect\" } ]\n",
+    )
+    .unwrap();
+    let (pag, analysis) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            models: Arc::new(models),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        indirect_targets(&program, &analysis, "write_slot"),
+        ["impl_run"]
+    );
+    for (caller, expected) in [
+        ("write_slot", &["slot"][..]),
+        ("write_both", &["a", "b"][..]),
+        ("write_wrapped", &["b"][..]),
+    ] {
+        let pointer = pag.var_node[&local_variable(&program, caller, "p")];
+        let mut owners: Vec<_> = analysis
+            .memory_accesses
+            .iter()
+            .filter_map(|access| {
+                let constraint = &pag.constraints[access.constraint.0 as usize];
+                if constraint.dst != pointer
+                    || constraint.kind != trace_analysis::ConstraintKind::Store
+                {
+                    return None;
+                }
+                let loc = &pag.locations[access.loc?.0 as usize];
+                Some(program.symbols.variable(loc.var?).name.as_str())
+            })
+            .collect();
+        owners.sort_unstable();
+        assert_eq!(owners, expected, "{caller}");
+    }
+}
+
+#[test]
+fn return_field_static_member_uses_explicit_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("getter.cpp"),
+        "using Op = int (*)(int);\n\
+         struct Ops { Op run; };\n\
+         struct Wrapper { Op run; static Op get(Ops *ops); };\n\
+         int actual(int x) { return x; }\n\
+         int wrong(int x) { return x; }\n\
+         Ops ops;\n\
+         Wrapper wrapper;\n\
+         void setup() { ops.run = actual; wrapper.run = wrong; }\n\
+         void through_object() { Ops *ps = &ops; Op f = wrapper.get(ps); (void)f(1); }\n\
+         void through_class() { Op f = Wrapper::get(&ops); (void)f(1); }\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        "version = 1\n\
+         [[model]]\n\
+         name = \"Wrapper::get\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"run\" } ]\n",
+    )
+    .unwrap();
+    let (_, analysis) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            models: Arc::new(models),
+            ..Default::default()
+        },
+    );
+    for caller in ["through_object", "through_class"] {
+        assert_eq!(
+            indirect_targets(&program, &analysis, caller),
+            ["actual"],
+            "{caller}"
+        );
+    }
+}
+
+/// The README's shape: a getter of a struct-valued member returns a pointer to
+/// the member, and a later field access on that pointer (`get_ops(&d)->run`)
+/// projects through the accessor's result. The member's field summary can
+/// resolve the callback even without the model, so the projection is checked in
+/// the getter result's points-to.
+#[test]
+fn return_field_model_projects_a_struct_member() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("nested_getter.c"),
+        "typedef int (*op_t)(int);\n\
+         static int impl_run(int x) { return x; }\n\
+         struct Inner { op_t run; int value; };\n\
+         struct Driver { struct Inner ops; int id; };\n\
+         struct Driver g_driver;\n\
+         void init_driver(void) { g_driver.ops.run = impl_run; }\n\
+         struct Inner *get_ops(struct Driver *d);\n\
+         void use_nested(void) { struct Inner *p = get_ops(&g_driver); (void)p->run(1); }\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+
+    let result_points_to = |models: trace_analysis::FnModelSet| {
+        let (pag, analysis) = analyze_with_options(
+            &program,
+            AnalyzeOptions {
+                retain_points_to: true,
+                models: Arc::new(models),
+                ..Default::default()
+            },
+        );
+        let p = local_variable(&program, "use_nested", "p");
+        analysis
+            .points_to
+            .get(&pag.var_node[&p])
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    assert!(
+        result_points_to(trace_analysis::FnModelSet::default()).is_empty(),
+        "baseline: the unmodeled accessor's result has no pointee"
+    );
+
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        "version = 1\n\
+         [[model]]\n\
+         name = \"get_ops\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"ops\" } ]\n",
+    )
+    .expect("parse toml");
+    assert!(
+        !result_points_to(models).is_empty(),
+        "the accessor's result must point at the projected member"
+    );
+}
+
+/// A class-member prototype records no parameter variables, so `return_field`
+/// must take the object from the call site's actual argument (here the
+/// receiver) rather than a formal (docs/MODELS.md, "Accessor getters"). Both
+/// `p->get_ops()` and `obj.get_ops()` receivers must work.
+#[test]
+fn return_field_model_supports_an_in_class_prototype_accessor() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("proto_getter.cpp"),
+        "typedef int (*op_t)(int);\n\
+         struct Inner { op_t run; };\n\
+         struct Driver { Inner ops; Inner *get_ops(); };\n\
+         static int impl_run(int x) { return x; }\n\
+         Driver g_driver;\n\
+         void init_driver(void) { g_driver.ops.run = impl_run; }\n\
+         void use_proto(Driver *d) { Inner *p = d->get_ops(); (void)p->run(1); }\n\
+         void use_proto_obj(void) { Inner *q = g_driver.get_ops(); (void)q->run(1); }\n\
+         void drive(void) { use_proto(&g_driver); }\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+
+    let result_points_to = |models: trace_analysis::FnModelSet, caller: &str, name: &str| {
+        let (pag, analysis) = analyze_with_options(
+            &program,
+            AnalyzeOptions {
+                retain_points_to: true,
+                models: Arc::new(models),
+                ..Default::default()
+            },
+        );
+        let var = local_variable(&program, caller, name);
+        analysis
+            .points_to
+            .get(&pag.var_node[&var])
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    for (caller, name) in [("use_proto", "p"), ("use_proto_obj", "q")] {
+        assert!(
+            result_points_to(trace_analysis::FnModelSet::default(), caller, name).is_empty(),
+            "{caller}: baseline prototype accessor result has no pointee"
+        );
+    }
+
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        "version = 1\n\
+         [[model]]\n\
+         name = \"Driver::get_ops\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"ops\" } ]\n",
+    )
+    .expect("parse toml");
+    for (caller, name) in [("use_proto", "p"), ("use_proto_obj", "q")] {
+        assert!(
+            !result_points_to(models.clone(), caller, name).is_empty(),
+            "{caller}: the prototype accessor's result must point at the projected member"
+        );
+    }
+}
+
+/// `return_field` needs a pointer-like result and a one-pointer-deep parameter
+/// (docs/MODELS.md, "Documented imprecision"): a scalar-returning getter and a
+/// getter whose parameter is `T **` project nothing.
+#[test]
+fn return_field_ignores_scalar_and_double_pointer_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("shapes.c"),
+        "typedef int (*op_t)(int);\n\
+         static int impl_run(int x) { return x; }\n\
+         struct Ops { op_t run; int value; };\n\
+         struct Ops g_ops;\n\
+         struct Ops *g_ptr;\n\
+         void init_ops(void) { g_ops.run = impl_run; }\n\
+         int get_value(struct Ops *o);\n\
+         op_t get_deep(struct Ops **o);\n\
+         void use_shapes(void) {\n\
+             int v = get_value(&g_ops);\n\
+             op_t f = get_deep(&g_ptr);\n\
+             (void)v;\n\
+             (void)f;\n\
+         }\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        "version = 1\n\
+         [[model]]\n\
+         name = \"get_value\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"run\" } ]\n\
+         [[model]]\n\
+         name = \"get_deep\"\n\
+         effects = [ { kind = \"return_field\", param = 0, field = \"run\" } ]\n",
+    )
+    .expect("parse toml");
+    let (pag, analysis) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            models: Arc::new(models),
+            ..Default::default()
+        },
+    );
+    for result in ["v", "f"] {
+        let var = local_variable(&program, "use_shapes", result);
+        let points = analysis
+            .points_to
+            .get(&pag.var_node[&var])
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            points.is_empty(),
+            "{result} must not receive a projected member"
+        );
+    }
 }
 
 #[test]

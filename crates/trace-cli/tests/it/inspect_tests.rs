@@ -1598,7 +1598,7 @@ fn inspect_callgraph_up_for_implicit_member_pointer_fn_ptr() {
     );
 }
 
-/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): what `dataflow`
+/// Issue #151 (docs/IR.md, "Dereferenced operands"): what `dataflow`
 /// reports down from `func`'s locals `starts`, uncut, as value-flow
 /// `(from, to, label)` edges for [`common::flow_chain`].
 fn dataflow_down(

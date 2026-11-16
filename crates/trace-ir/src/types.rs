@@ -637,7 +637,7 @@ impl TypeTable {
     }
 
     /// Record that lowering guessed the class `name` for a type it could not
-    /// resolve (an undeclared receiver class; `docs/ANALYSIS.md`, "Undeclared
+    /// resolve (an undeclared receiver class; `docs/CXX.md`, "Undeclared
     /// receiver classes"). Until a unit declares the class, a descriptor of
     /// the name -- interned here or in a table this one's types are merged
     /// into -- registers no tag, so the guess never answers a tag lookup for
@@ -1557,7 +1557,7 @@ impl TypeTable {
     /// could not resolve ([`note_guessed_class`](Self::note_guessed_class))
     /// that no unit declares: what read as `int` before lowering guessed a
     /// class (#193), and still stands in as that `int` where the spellings
-    /// of a signature are read leniently (`docs/ANALYSIS.md`, "Undeclared
+    /// of a signature are read leniently (`docs/CXX.md`, "Undeclared
     /// receiver classes").
     pub fn is_guessed_class(&self, desc: &TypeDesc) -> bool {
         match desc {
@@ -2000,7 +2000,7 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
 
 /// [`may_name_same_type`], with a class lowering guessed for an unresolved
 /// type standing in as the `int` that type read as before the guess
-/// (`docs/ANALYSIS.md`, "Undeclared receiver classes"): it may be any
+/// (`docs/CXX.md`, "Undeclared receiver classes"): it may be any
 /// class, however spelled, or a typedef of a scalar.
 pub fn may_name_same_type_in(types: &TypeTable, a: &TypeDesc, b: &TypeDesc) -> bool {
     if may_name_same_type(a, b) {

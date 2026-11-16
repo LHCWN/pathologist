@@ -1,5 +1,5 @@
 // Objects built by smart-pointer factories reach their constructor as
-// `new T(args)` does (#192, docs/ANALYSIS.md "Factory construction").
+// `new T(args)` does (#192, docs/CXX.md "Factory construction").
 // <memory> is not in the tree: the factories stay external.
 // factory.h is shared with other.cpp and third.cpp (several translation
 // units, for the --jobs determinism test and header deduplication).

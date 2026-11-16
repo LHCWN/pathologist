@@ -91,7 +91,7 @@ fn context_entries(s: &ValueSlice, node: &SliceNode) -> Vec<String> {
 const CALLBACK: &str = "summary:IDeviceStub.callback_";
 
 /// The function a `flow_origins` row `o` is written in, by the edge-scope
-/// rule (`docs/ANALYSIS.md`, "Where a value moves"): the innermost
+/// rule (`docs/POINTERS.md`, "Where a value moves"): the innermost
 /// definition whose line range in the row's file holds its line, strictly
 /// inside it when several hold the line.
 const SITE_FUNCTION: &str = "(SELECT CASE WHEN COUNT(DISTINCT f.id) = 1 THEN MIN(f.name) END \

@@ -1,6 +1,6 @@
 //! OpenHarmony `.idl` interface definitions: the service/HDI grammars, naming
 //! conventions and the declarations idl-tool/hdi-gen would generate
-//! (docs/ANALYSIS.md, "IDL-generated interfaces").
+//! (docs/CXX.md, "IDL-generated interfaces").
 
 use crate::deps::VirtualHeaders;
 use crate::discover::DiscoveredFiles;
@@ -393,7 +393,7 @@ impl Parser {
     }
 }
 
-/// Parses one `.idl` file (docs/ANALYSIS.md, "IDL-generated interfaces").
+/// Parses one `.idl` file (docs/CXX.md, "IDL-generated interfaces").
 fn parse(text: &str) -> Result<File, ParseError> {
     let mut p = Parser {
         toks: lex(text)?,
@@ -747,7 +747,7 @@ fn header(
         }))
         .collect();
     let mut s = format!(
-        "// Synthesized by trace from {source_name} (docs/ANALYSIS.md, \"IDL-generated interfaces\").\n#ifndef {guard}\n#define {guard}\n"
+        "// Synthesized by trace from {source_name} (docs/CXX.md, \"IDL-generated interfaces\").\n#ifndef {guard}\n#define {guard}\n"
     );
     if let Some(inc) = include {
         s += &format!("#include \"{inc}\"\n");
@@ -929,7 +929,7 @@ pub(crate) fn synthesize_discovered(
 /// `<root>/.trace-idl-generated`; those of an IDL file in the test partition
 /// go one directory down, named after its test directory, so they stay in
 /// the partition. Production files come first, each group in sorted path
-/// order (docs/ANALYSIS.md, "IDL-generated interfaces").
+/// order (docs/CXX.md, "IDL-generated interfaces").
 ///
 /// A header is not rendered when a header of its name is already there for
 /// its includers — among `on_disk_headers` (for a production interface,
@@ -1500,7 +1500,7 @@ mod tests {
             ("iatm.h", "atm_proxy.h", "atm_stub.h")
         );
         assert_eq!(itext, "\
-// Synthesized by trace from IAtm.idl (docs/ANALYSIS.md, \"IDL-generated interfaces\").
+// Synthesized by trace from IAtm.idl (docs/CXX.md, \"IDL-generated interfaces\").
 #ifndef TRACE_IDL_IATM_H
 #define TRACE_IDL_IATM_H
 namespace OHOS {
@@ -1517,7 +1517,7 @@ public:
         assert_eq!(
             ptext,
             "\
-// Synthesized by trace from IAtm.idl (docs/ANALYSIS.md, \"IDL-generated interfaces\").
+// Synthesized by trace from IAtm.idl (docs/CXX.md, \"IDL-generated interfaces\").
 #ifndef TRACE_IDL_ATM_PROXY_H
 #define TRACE_IDL_ATM_PROXY_H
 #include \"iatm.h\"
@@ -1534,7 +1534,7 @@ public:
 "
         );
         assert_eq!(stext, "\
-// Synthesized by trace from IAtm.idl (docs/ANALYSIS.md, \"IDL-generated interfaces\").
+// Synthesized by trace from IAtm.idl (docs/CXX.md, \"IDL-generated interfaces\").
 #ifndef TRACE_IDL_ATM_STUB_H
 #define TRACE_IDL_ATM_STUB_H
 #include \"iatm.h\"
@@ -1608,7 +1608,7 @@ public:
         assert_eq!(
             itext,
             "\
-// Synthesized by trace from IFoo.idl (docs/ANALYSIS.md, \"IDL-generated interfaces\").
+// Synthesized by trace from IFoo.idl (docs/CXX.md, \"IDL-generated interfaces\").
 #ifndef TRACE_IDL_IFOO_H
 #define TRACE_IDL_IFOO_H
 #include \"ibase.h\"
@@ -1944,7 +1944,7 @@ public:
     /// resolution finds for production code, so it stands in for a
     /// generated header of its name as any on-disk header does; the
     /// partition of the analysis root does not reach into a dependency root
-    /// (docs/ANALYSIS.md, "IDL-generated interfaces").
+    /// (docs/CXX.md, "IDL-generated interfaces").
     #[test]
     fn mock_header_of_a_dependency_root_stands_in_for_a_generated_one() {
         let dir = tempfile::tempdir().unwrap();

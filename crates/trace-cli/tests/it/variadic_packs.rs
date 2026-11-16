@@ -1,5 +1,5 @@
 //! Arguments passed through a variadic template's parameter pack reach the
-//! formals the pack is forwarded to (docs/ANALYSIS.md, "Variadic parameter
+//! formals the pack is forwarded to (docs/POINTERS.md, "Variadic parameter
 //! packs").
 
 use crate::common;

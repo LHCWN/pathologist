@@ -734,7 +734,7 @@ fn like_escape(s: &str) -> String {
 }
 
 /// The function a site is written in, by the edge-scope rule
-/// (`docs/ANALYSIS.md`, "Where a value moves"): of the definitions whose line
+/// (`docs/POINTERS.md`, "Where a value moves"): of the definitions whose line
 /// range in the site's file holds its line, the innermost. When several
 /// definitions hold the line, the innermost one, which every other encloses,
 /// owns it if the line is strictly inside it (not its first or last line); a

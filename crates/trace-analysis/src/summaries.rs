@@ -3,7 +3,7 @@
 //! A model relates the parameters of one function to each other (and to its
 //! return value) so data flows through bodyless callees such as libc's
 //! `memcpy_s` or project-specific wrappers. Models are matched by function
-//! name at every resolved call site. See `docs/ANALYSIS.md` ("Function
+//! name at every resolved call site. See `docs/MODELS.md` ("Function
 //! models") for semantics and the configuration format.
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -16,11 +16,11 @@ pub enum Effect {
     /// `pts(param[dst]) ⊇ pts(param[src])` after the call.
     Alias { dst: u32, src: u32 },
     /// Bulk content copy `*dst <- *src` (memcpy family); realized as
-    /// [`Effect::Alias`] over-approximation (see docs/ANALYSIS.md).
+    /// [`Effect::Alias`] over-approximation (see docs/MODELS.md).
     MemCopy { dst: u32, src: u32 },
     /// `*param[ptr] = param[value]`.
     ContentStore { ptr: u32, value: u32 },
-    /// Register an event object in the epoll summary (see docs/ANALYSIS.md).
+    /// Register an event object in the epoll summary (see docs/MODELS.md).
     EpollRegister { param: u32 },
     /// Receive registered event objects into this buffer.
     EpollWait { param: u32 },
@@ -28,6 +28,12 @@ pub enum Effect {
     ReturnAlias { param: u32 },
     /// Returns a fresh storage location (malloc family; bodyless callees).
     ReturnHeap,
+    /// Return value may point at the named field of the object a pointer
+    /// parameter points at: `return &param[param]->field`, and, because a
+    /// load through the result reads that field, `return param[param]->field`
+    /// for a pointer-typed member (accessor/getter functions; bodyless
+    /// callees; docs/MODELS.md, "Accessor getters").
+    ReturnField { param: u32, field: String },
     /// Terminator: memory reachable via `param[param]` is zeroed by this
     /// call. Introduces no values; kills are not modeled (flow-insensitive).
     Clears { param: u32 },
@@ -58,13 +64,13 @@ pub enum Effect {
     /// an execution context of kind `context`, which no call site starts.
     Entry { context: ContextKind },
     /// A bodyless framework callee dispatches across IPC to this qualified
-    /// member or an in-tree implementation (docs/ANALYSIS.md, "OpenHarmony
+    /// member or an in-tree implementation (docs/MODELS.md, "OpenHarmony
     /// IPC bridges"). Call edges only; no parcel or pointer value flow.
     Ipc { target: String },
 }
 
 /// Where a callback an [`Effect::Invoke`] model runs executes, as the model
-/// states it (`docs/ANALYSIS.md`, "Execution contexts"). An IPC stub handler
+/// states it (`docs/MODELS.md`, "Execution contexts"). An IPC stub handler
 /// is an [`ContextKind::IpcHandler`] context without a model; either way,
 /// every IPC handler context is self-concurrent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -145,7 +151,7 @@ impl InvokeArgs {
     }
 }
 
-/// A test on the argument a call passes at `param` (`docs/ANALYSIS.md`,
+/// A test on the argument a call passes at `param` (`docs/MODELS.md`,
 /// "Function models"): whether it is (`is`) or is not a value of the class
 /// or enumeration `class`, as its recorded value's declared type says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +198,7 @@ fn starts(param: u32, args: InvokeArgs, context: ContextKind) -> Vec<Effect> {
 
 /// The effects of a model that only wraps one callback: the same
 /// [`Effect::Invoke`], which starts no execution context
-/// (`docs/ANALYSIS.md`, "Callable wrappers").
+/// (`docs/MODELS.md`, "Callable wrappers").
 fn wraps(param: u32, args: InvokeArgs) -> Vec<Effect> {
     invokes(param, args, None)
 }
@@ -208,7 +214,7 @@ fn invokes(param: u32, args: InvokeArgs, context: Option<ContextKind>) -> Vec<Ef
 }
 
 /// Whether the class a function is recorded under, `recorded`, may be the
-/// class `model` names (`docs/ANALYSIS.md`, "Model matching"). A class the
+/// class `model` names (`docs/MODELS.md`, "Model matching"). A class the
 /// tree declares is the class its name says. One it never
 /// declares is named as written, or, spelled bare, in the innermost namespace
 /// it is written in (`undeclared_class_guess` in lowering); C++ lookup from
@@ -282,7 +288,7 @@ impl FnModelSet {
     pub fn builtin() -> Self {
         let mut set = Self::default();
         let mut reg = |name: &str, effects: Vec<Effect>| set.register(FnModel::new(name, effects));
-        // Task, thread and timer primitives (`docs/ANALYSIS.md`, "Built-in
+        // Task, thread and timer primitives (`docs/MODELS.md`, "Built-in
         // models"): each runs one callback, in the context it states.
         use ContextKind::{PoolTask, SerialTask, Thread};
         // The callback alone.
@@ -361,7 +367,7 @@ impl FnModelSet {
         );
         // Wrappers that keep a callable reachable without running it where
         // they are built: the edge is the wrapping site's, since no value
-        // carries the callable on (`docs/ANALYSIS.md`, "Callable wrappers").
+        // carries the callable on (`docs/MODELS.md`, "Callable wrappers").
         reg("std::bind", wraps(0, InvokeArgs::Rest(1)));
         reg(
             "std::packaged_task::packaged_task",
@@ -420,7 +426,7 @@ impl FnModelSet {
     }
 
     /// The model named for the function or call named `name`
-    /// (`docs/ANALYSIS.md`, "Model matching", rules 1-3): the exact name;
+    /// (`docs/MODELS.md`, "Model matching", rules 1-3): the exact name;
     /// else the constructor's model for a class name, which is how a
     /// temporary is recorded when the unit never saw the class
     /// (`std::thread(f, x)`); else the last `::` segment, so `::dlsym` /
@@ -446,7 +452,7 @@ impl FnModelSet {
     }
 
     /// The model rules 1-3 name for the function or call named `name`, for
-    /// effects of `group` (`docs/ANALYSIS.md`, "Model matching"). Argument
+    /// effects of `group` (`docs/MODELS.md`, "Model matching"). Argument
     /// and return effects take only the exact name, written or after a
     /// leading `::` or `std::`, which name the same C library function; the
     /// other groups take [`Self::get_for_callee`]'s rules.
@@ -466,7 +472,7 @@ impl FnModelSet {
     }
 
     /// The matcher one analysis of `program` looks every model up through
-    /// (`docs/ANALYSIS.md`, "Model matching").
+    /// (`docs/MODELS.md`, "Model matching").
     pub fn lookup<'m>(&'m self, program: &'m Program) -> ModelLookup<'m> {
         ModelLookup {
             models: self,
@@ -557,14 +563,15 @@ impl FnModelSet {
 }
 
 /// Which part of the analysis applies an effect. A member model another
-/// class's member takes is chosen per group (`docs/ANALYSIS.md`, "Model
+/// class's member takes is chosen per group (`docs/MODELS.md`, "Model
 /// matching"): the first matching model with an effect of the group, so a
 /// nearer model that has none does not hide a farther one that has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectGroup {
     /// Argument effects, including epoll registration/receipt: at each resolved call.
     Args,
-    /// `return_alias`, `return_heap`: into a bodyless callee's call result.
+    /// `return_alias`, `return_heap`, `return_field`: into a bodyless callee's
+    /// call result.
     Return,
     /// `dlsym`.
     Dlsym,
@@ -586,7 +593,9 @@ impl Effect {
             | Self::EpollRegister { .. }
             | Self::EpollWait { .. }
             | Self::Clears { .. } => EffectGroup::Args,
-            Self::ReturnAlias { .. } | Self::ReturnHeap => EffectGroup::Return,
+            Self::ReturnAlias { .. } | Self::ReturnHeap | Self::ReturnField { .. } => {
+                EffectGroup::Return
+            }
             Self::Dlsym { .. } => EffectGroup::Dlsym,
             Self::Invoke { .. } => EffectGroup::Invoke,
             Self::Entry { .. } => EffectGroup::Entry,
@@ -603,7 +612,7 @@ impl FnModel {
 }
 
 /// The one matcher every model lookup of an analysis goes through
-/// (`docs/ANALYSIS.md`, "Model matching"): the model named for the function
+/// (`docs/MODELS.md`, "Model matching"): the model named for the function
 /// (`FnModelSet::named`), else the member models of a class the
 /// function's class may be or derive from, chosen per [`EffectGroup`]. The class rule's candidates for a name are
 /// computed once and kept, so the passes that look the same function up
@@ -617,6 +626,15 @@ pub struct ModelLookup<'m> {
 }
 
 impl<'m> ModelLookup<'m> {
+    pub(crate) fn has_return_fields(&self) -> bool {
+        self.models.iter().any(|model| {
+            model
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ReturnField { .. }))
+        })
+    }
+
     /// The model that gives the function named `name` its effects of
     /// `group`, if any.
     pub fn model(&self, name: &str, group: EffectGroup) -> Option<&'m FnModel> {
@@ -625,7 +643,7 @@ impl<'m> ModelLookup<'m> {
     }
 
     /// The `entry` model the function named `name` is the member of or an
-    /// override of, with the context it states (`docs/ANALYSIS.md`,
+    /// override of, with the context it states (`docs/MODELS.md`,
     /// "Execution contexts").
     pub fn entry(&self, name: &str) -> Option<(&'m FnModel, ContextKind)> {
         self.find(name, EffectGroup::Entry, |model| {
@@ -717,6 +735,7 @@ struct RawEffect {
     ptr: Option<u32>,
     value: Option<u32>,
     param: Option<u32>,
+    field: Option<String>,
     args: Option<Vec<u32>>,
     rest: Option<u32>,
     context: Option<String>,
@@ -739,6 +758,9 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
     };
     if raw.kind != "ipc" && raw.target.is_some() {
         return Err(format!("effect kind {:?} takes no `target`", raw.kind));
+    }
+    if raw.kind != "return_field" && raw.field.is_some() {
+        return Err(format!("effect kind {:?} takes no `field`", raw.kind));
     }
     if raw.kind != "invoke"
         && (raw.args.is_some()
@@ -778,7 +800,9 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
                 .iter()
                 .any(Option::is_some)
             {
-                return Err("effect kind \"ipc\" takes only `target`: it names no parameter".into());
+                return Err(
+                    "effect kind \"ipc\" takes only `target`: it names no parameter".into(),
+                );
             }
             let target = raw
                 .target
@@ -828,6 +852,34 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
             param: need(raw.param, "param", "return_alias")?,
         }),
         "return_heap" => Ok(Effect::ReturnHeap),
+        "return_field" => {
+            if [raw.dst, raw.src, raw.ptr, raw.value]
+                .iter()
+                .any(Option::is_some)
+            {
+                return Err(
+                    "effect kind \"return_field\" takes only `param` and `field`: \
+                     it names the object and its member"
+                        .into(),
+                );
+            }
+            let field = raw
+                .field
+                .as_deref()
+                .map(str::trim)
+                .filter(|field| {
+                    let mut chars = field.chars();
+                    chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
+                        && chars.all(|c| c == '_' || c.is_alphanumeric())
+                })
+                .ok_or_else(|| {
+                    "effect kind \"return_field\" requires `field`, a member name".to_string()
+                })?;
+            Ok(Effect::ReturnField {
+                param: need(raw.param, "param", "return_field")?,
+                field: field.into(),
+            })
+        }
         "invoke" => {
             let param = need(raw.param, "param", "invoke")?;
             let args = match (&raw.args, raw.rest) {
@@ -900,7 +952,8 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
         }),
         other => Err(format!(
             "unknown effect kind {other:?} (expected alias, mem_copy, content_store, \
-             epoll_register, epoll_wait, return_alias, return_heap, clears, dlsym, invoke, entry, ipc)"
+             epoll_register, epoll_wait, return_alias, return_heap, return_field, clears, \
+             dlsym, invoke, entry, ipc)"
         )),
     }
 }
@@ -1318,6 +1371,39 @@ effects = [{ kind = "invoke", param = 0, rest = 1 }]
             assert!(load(effect).is_err(), "{effect}");
         }
         assert!(load(r#"{ kind = "invoke", param = 0, rest = 1 }"#).is_ok());
+    }
+
+    #[test]
+    fn return_field_names_a_parameter_and_a_member() {
+        let load = |effect: &str| {
+            FnModelSet::from_toml_str(&format!(
+                "[[model]]\nname = \"get_ops\"\neffects = [{effect}]\n"
+            ))
+        };
+        let set = load(r#"{ kind = "return_field", param = 0, field = "ops" }"#)
+            .expect("a field-returning getter");
+        assert_eq!(
+            set.get("get_ops").unwrap().effects,
+            vec![Effect::ReturnField {
+                param: 0,
+                field: "ops".into()
+            }]
+        );
+        for effect in [
+            r#"{ kind = "return_field" }"#,
+            r#"{ kind = "return_field", param = 0 }"#,
+            r#"{ kind = "return_field", field = "ops" }"#,
+            r#"{ kind = "return_field", param = 0, field = "" }"#,
+            r#"{ kind = "return_field", param = 0, field = "a b" }"#,
+            r#"{ kind = "return_field", param = 0, field = "a.b" }"#,
+            r#"{ kind = "return_field", param = 0, field = "a->b" }"#,
+            r#"{ kind = "return_field", param = 0, field = "a::b" }"#,
+            r#"{ kind = "return_field", param = 0, field = "ops", dst = 1 }"#,
+            r#"{ kind = "return_heap", field = "ops" }"#,
+            r#"{ kind = "alias", dst = 0, src = 1, field = "ops" }"#,
+        ] {
+            assert!(load(effect).is_err(), "{effect}");
+        }
     }
 
     #[test]

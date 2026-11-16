@@ -49,7 +49,7 @@ time, and the remaining difference is the analyze phase (+0.6 s) and export
 `invoke` models of context `unknown` each match was exported as an
 `execution_contexts` row and drew an `async_start` boundary in call sequencing.
 Both now state `context = "none"`
-([Callable wrappers](ANALYSIS.md#callable-wrappers)): the call edges and the
+([Callable wrappers](MODELS.md#callable-wrappers)): the call edges and the
 argument wiring are unchanged, and nothing is exported as a context. Measured
 with `scripts/eval_check.py` on the four pinned corpora.
 
@@ -73,8 +73,8 @@ constructor site only for a class the unit declares, so a standard class
 (`std::packaged_task<void()>`, `std::thread`) built through one reached no
 constructor model, though `new std::thread(f)` and a local `std::thread t(f)`
 did. A factory now names an undeclared `std::` class as it is spelled
-([Factory construction](ANALYSIS.md#factory-construction),
-[Callable wrappers](ANALYSIS.md#callable-wrappers)). Measured with
+([Factory construction](CXX.md#factory-construction),
+[Callable wrappers](MODELS.md#callable-wrappers)). Measured with
 `scripts/eval_check.py` on the four pinned corpora.
 
 | Corpus | Count | Before | After |
@@ -127,7 +127,7 @@ edges out but cannot be written in the parser, which does not read the models.
 
 A parameter pack was not a formal and a pack expansion had no positions, so an
 argument passed through `Args &&...args` reached no formal
-([Variadic parameter packs](ANALYSIS.md#variadic-parameter-packs)). A pack is
+([Variadic parameter packs](POINTERS.md#variadic-parameter-packs)). A pack is
 now a formal that takes every argument from its position on, and an expansion
 serves every formal from its position on. Measured with `scripts/eval_check.py`
 on the four pinned corpora.
@@ -165,7 +165,7 @@ other corpus has a pack formal that moves a count.
 ## Callable wrappers: #250 — 2026-11-11
 
 `std::bind` and `std::packaged_task::packaged_task` are `invoke` models
-([Callable wrappers](ANALYSIS.md#callable-wrappers)), so a callable wrapped
+([Callable wrappers](MODELS.md#callable-wrappers)), so a callable wrapped
 by either keeps a call edge from the code that wraps it. Measured with
 `scripts/eval_check.py` on the four pinned corpora.
 
@@ -194,7 +194,7 @@ indirect edges from `std::bind` sites (14, 16, 16 and 1). No
   that reaches a declaration and its definition is two rows). Letting a
   wrapper add edges without one is tracked in #283.
 - Arguments passed through a variadic parameter pack were not followed then
-  (they are since #282, [Variadic parameter packs](ANALYSIS.md#variadic-parameter-packs)); whether the
+  (they are since #282, [Variadic parameter packs](POINTERS.md#variadic-parameter-packs)); whether the
   `packaged_task` constructor model fires through a factory is #284.
 - No baseline binary was run, so movement of the other global counts from
   this change is not separated out; they stay inside their existing bands.
@@ -211,7 +211,7 @@ single-threaded and raised its peak resident set by 64 MB. Two causes:
   in all), of which 740,000 (4.5%) were new to the destination. Each name was
   hashed and cloned before the destination rejected it, and every table held
   its own copy. The sets are now shared: a merge adds a reference to a set it
-  does not hold ([Conditional values](ANALYSIS.md#conditional-values)).
+  does not hold ([Conditional values](IR.md#conditional-values)).
 - **New lookups on every declaration and call.** A member prototype looked its
   return type up three times instead of once (return category, the new
   reference check, return cv), and every C++ call asked whether its callee is
@@ -470,7 +470,7 @@ at `mission_list_manager.cpp:2195` now supplies the captured receiver for
 direct edges to `PrintTimeOutLog` (2198) and `CompleteBackground` (2199).
 The exact corpus probe checks the raw graph: the public projection hides
 this lambda because its callback invocation path is unresolved. See
-[parenthesized initializer recovery](ANALYSIS.md#c-parse-input-normalization).
+[parenthesized initializer recovery](CXX.md#c-parse-input-normalization).
 
 The existing DataObsOption default-constructor probe also needs the raw graph
 to retain its intended count of 75. The public projection contains 74:
@@ -534,7 +534,7 @@ at 45 seconds; every reported query completed within that bound.
 
 `shared_from_this()` and `weak_from_this()` are typed as the deriving
 class's `shared_ptr` / `weak_ptr` and alias the object
-([`shared_from_this`](ANALYSIS.md#shared_from_this)), so a callback that
+([`shared_from_this`](IR.md#shared_from_this)), so a callback that
 captures the object (`auto self = shared_from_this(); [self] { self->F(); }`,
 `[weak = weak_from_this()] { weak.lock()->F(); }`) reaches its handler. On
 the pinned corpora only edges are added; none is removed. "Before" is the
@@ -594,7 +594,7 @@ include `RenderStateObserverProxy::OnRenderStateChanged`,
 `AbilitySchedulerProxy::ScheduleAbilityTransaction`, and
 `DataAbilityObserverProxy::OnChange`. Previously the transport helper counted
 as a sender, but its calling proxy methods did not. The matching contract is
-defined in [OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges).
+defined in [OpenHarmony IPC bridges](MODELS.md#openharmony-ipc-bridges).
 
 The reduced `ipc_transact_cmd` fixture checks seven bridges across unqualified,
 isolated `this->`, qualified, and template-keyword helper calls (through both
@@ -733,11 +733,11 @@ Issue #244: conditional arms parsed successfully but did not contribute their
 pointer or callback values to the result. Both arms now contribute to one
 shared expression value. Semantics, type inference and remaining modeling
 dependencies are defined in
-[Conditional values](ANALYSIS.md#conditional-values).
+[Conditional values](IR.md#conditional-values).
 
 These measurements validate the configured corpora and focused fixtures.
 They do not establish complete C/C++ expression coverage. The authoritative
-[implementation limitations](ANALYSIS.md#conditional-value-limitations) state
+[implementation limitations](IR.md#conditional-value-limitations) state
 the remaining type/conversion, storage-summary, library-model and traversal
 boundaries. Known extra targets below are precision debt, not recovered calls.
 
@@ -1008,8 +1008,8 @@ tests distinguish parenthesized lvalue returns from unparenthesized value
 returns and scalar expressions, cover trailing return syntax and selected or
 dereferenced references, and verify writes to the original returned cell.
 Rules and remaining dependencies are in
-[Conditional values](ANALYSIS.md#conditional-values) and
-[Return-value flow](ANALYSIS.md#return-value-flow).
+[Conditional values](IR.md#conditional-values) and
+[Return-value flow](IR.md#return-value-flow).
 
 Fresh pinned release comparisons against reviewed `eec1a45`, using the same
 options above, preserve every named call target, normalized argument-flow row,
@@ -1050,7 +1050,7 @@ site and the shared address destination; its two index calls retain separate
 source sites without pointer return destinations. The expanded fixture
 exports remain deterministic at jobs 1 and 4. All 23 focused conditional
 tests and all 2677 workspace tests pass. Semantics remain in
-[Conditional values](ANALYSIS.md#conditional-values).
+[Conditional values](IR.md#conditional-values).
 
 Fresh release comparisons against `79857a3` use the same clean pinned
 checkouts, minimal exports and solver budget above. All 119 checks pass at
@@ -1095,7 +1095,7 @@ address fact retains `static_cast<Callback&>(a)` as its operation provenance.
 
 All 24 focused conditional tests and all 2678 workspace tests pass, including
 the expanded full-fixture export comparison at jobs 1 and 4. Semantics are defined in
-[Conditional values](ANALYSIS.md#conditional-values).
+[Conditional values](IR.md#conditional-values).
 
 Fresh pinned release comparisons against `a6a4d9a`, with the options and
 solver budget above, preserve named call targets, global metrics, flow-node
@@ -1116,7 +1116,7 @@ their own site and return destination. Scope controls keep calls through a
 shadowing variable and a nearer namespace function intact.
 
 All 2679 workspace tests pass; the expanded full-fixture exports match at
-jobs 1 and 4. Rules are in [Conditional values](ANALYSIS.md#conditional-values).
+jobs 1 and 4. Rules are in [Conditional values](IR.md#conditional-values).
 
 Fresh pinned release analyses against `c66daff`, with the same options and
 solver budget above, preserve every named target, global metric, flow count
@@ -1150,8 +1150,8 @@ counts and source-origin rows. All 119 checks pass at jobs 1 and 8, and all
 Logical before/after exports differ only in the derived `database_identity`
 digest. Exported file-scope return wiring retains both arms' operation origins.
 Rules and the new file-scope `CallReferenceReturn` fact are documented in
-[Return-value flow](ANALYSIS.md#return-value-flow) and
-[Conditional values](ANALYSIS.md#conditional-values).
+[Return-value flow](IR.md#return-value-flow) and
+[Conditional values](IR.md#conditional-values).
 
 ### Configured-window test synchronization — 2026-11-05
 
@@ -1198,7 +1198,7 @@ flow nodes/edges and source origins are unchanged in all three corpora.
 Before/after logical exports differ only in the derived `database_identity`
 digest. No expectations are updated. Modeling rules and remaining container,
 field-layout and index-summary dependencies are documented in
-[Conditional values](ANALYSIS.md#conditional-values).
+[Conditional values](IR.md#conditional-values).
 
 ### Scoped cast lookup, complete returns and initializer effects — 2026-11-05
 
@@ -1229,9 +1229,9 @@ All 30 focused conditional tests and all 2684 workspace tests pass, including
 the existing pointer-reference return/prototype control. The added source
 passes a C++17 syntax check. The release fixture's 49 logical export relations
 match at jobs 1 and 4. Semantics and remaining modeling dependencies are in
-[Conditional values](ANALYSIS.md#conditional-values),
-[Return-value flow](ANALYSIS.md#return-value-flow) and
-[Argument flow](ANALYSIS.md#argument-flow).
+[Conditional values](IR.md#conditional-values),
+[Return-value flow](IR.md#return-value-flow) and
+[Argument flow](POINTERS.md#argument-flow).
 
 Fresh pinned HDF, HiView and Camera analyses use the revisions, options and
 solver budget above. All 119 checks pass at jobs 1 and 8. Named call targets,
@@ -1273,8 +1273,8 @@ re-entry. Fresh one-job release probes at depths 20, 64 and 256 complete
 without diagnostics. Depth 1024 also completes and retains `B::run`, with the
 existing 512-level body-walk warning. Type and category are checked separately
 to avoid repeated nested type probes. Rules and remaining modeling dependencies are in
-[Conditional values](ANALYSIS.md#conditional-values) and
-[Return-value flow](ANALYSIS.md#return-value-flow).
+[Conditional values](IR.md#conditional-values) and
+[Return-value flow](IR.md#return-value-flow).
 
 Fresh pinned release comparisons against rebuilt `1e4f78d`, using the
 revisions, options and solver budget above, preserve named targets, argument
@@ -1321,8 +1321,8 @@ remain separate; the unrelated overload never enters the callback result.
 Two link images also retain only their own getter callback definitions. Global
 member-address flows have return-operation provenance without synthetic call
 sites. Rules and modeling limits are in
-[Conditional values](ANALYSIS.md#conditional-values) and
-[Return-value flow](ANALYSIS.md#return-value-flow).
+[Conditional values](IR.md#conditional-values) and
+[Return-value flow](IR.md#return-value-flow).
 
 All 36 focused conditional tests and all 2690 workspace tests pass. The new
 fixtures pass `g++ -std=c++20 -fsyntax-only`; full release fixture exports
@@ -1390,8 +1390,8 @@ with no evaluated default initializer allocate no additional address value.
 An explicit walk stack enforces the existing 512-level AST limit: the
 40,000-term file initializer completes with one depth warning. The fixtures
 pass C++20 and C11 syntax checks. Rules and remaining modeling dependencies are
-in [Conditional values](ANALYSIS.md#conditional-values) and
-[Return-value flow](ANALYSIS.md#return-value-flow).
+in [Conditional values](IR.md#conditional-values) and
+[Return-value flow](IR.md#return-value-flow).
 
 All 43 focused conditional tests and all 2697 workspace tests pass. The final
 release fixture has no diagnostics and matches across all 49 logical relations
@@ -1785,8 +1785,8 @@ remain separate. Recognized aggregate-to-first-member casts project only that
 member. Nested GEP lookup now uses the subobject's declared type and the shared
 forward-tag resolver, rather than its root storage owner's type. No IR kind or
 SQLite schema changes are needed. The exact boundary of the structural alias
-model is documented in [Field sensitivity](ANALYSIS.md#field-sensitivity) and
-[Conditional value limitations](ANALYSIS.md#conditional-value-limitations).
+model is documented in [Field sensitivity](POINTERS.md#field-sensitivity) and
+[Conditional value limitations](IR.md#conditional-value-limitations).
 
 Conditional type results, including misses, are cached per syntax node and
 isolated across reparsed initializers. Materialization and type probes obey the
@@ -1857,7 +1857,7 @@ The private traversal shape distinguishes an omitted bound from an explicitly
 written bound the analyzer cannot compute. The latter stays conservative,
 including the regression using `sizeof(char[2])`. Exported array types are
 unchanged. These rules and the remaining unknown-bound imprecision are in
-[Conditional values](ANALYSIS.md#conditional-values).
+[Conditional values](IR.md#conditional-values).
 
 A unit regression confirms that merging a callable-reference flag into an
 already registered alias retains the independent flag, and a later unit without
@@ -1918,7 +1918,7 @@ C++20 syntax checks for the new sources and warnings-as-errors workspace Clippy.
 The fresh release fixture checks 31 indirect sites in 23 new caller cases.
 
 This is retained expression/value propagation, not complete C++ default evaluation.
-The [authoritative limitations](ANALYSIS.md#return-value-flow) cover dependent and
+The [authoritative limitations](IR.md#return-value-flow) cover dependent and
 block-local environments, unknown callees, late CFG ordering and conservative
 overload candidate defaults. Scalar/class alias-call parsing outside the covered
 pointer/reference forms remains documented separately; these measurements do
@@ -2006,7 +2006,7 @@ field projection before value-cast normalization. Initializers, returns,
 arguments, reads and indirect callees consume that cached address. The fixture
 reaches exactly `alpha` through each first-member consumer and only `beta`
 through the second member. This retains the structural alias boundary defined
-in [Field sensitivity](ANALYSIS.md#field-sensitivity); it does not establish
+in [Field sensitivity](POINTERS.md#field-sensitivity); it does not establish
 arbitrary reinterpret-cast or ABI layout semantics.
 
 A value-returning default bound to a reference now initializes a temporary cell
@@ -2030,7 +2030,7 @@ host event for evaluated defaults lowered after CFG construction. The reduced
 exports **partial** coverage with a gap at `take()`. Default calls do not yet
 have their own argument-order events. The regression checks that limitation
 explicitly instead of claiming complete sequencing; see
-[Return-value flow](ANALYSIS.md#return-value-flow).
+[Return-value flow](IR.md#return-value-flow).
 
 Address and array-decay expansion now share the value walk's AST depth budget.
 Function-designator representatives and lvalue categories memoize results,
@@ -2133,7 +2133,7 @@ reference and callable-return flags. Deferred nested defaults restore their
 declaration-time block environment. A declaration itself emits no evaluated default call, and a
 later prototype does not replace a definition's body-parameter storage.
 Semantics and remaining lookup/conversion/environment limitations are in
-[Return-value flow](ANALYSIS.md#return-value-flow).
+[Return-value flow](IR.md#return-value-flow).
 
 
 Fresh release comparisons after rebasing use local master `5555e9a` as the
@@ -2220,7 +2220,7 @@ Issue #247: accessing a callback through `p.get()->callback` lost the
 pointee alias that `p->callback` retained. The reduced bodyless-library
 fixture now resolves both callback sites to exactly `alpha`, excludes
 `unrelated`, and reports no diagnostics. Semantics and supported forms are
-defined in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap).
+defined in [Smart-pointer unwrap](IR.md#smart-pointer-unwrap).
 
 ### Corpus comparison
 
@@ -2403,7 +2403,7 @@ corpus, all 49 logical relations match exactly between jobs=1 and jobs=8,
 using `scripts/compare_analysis_databases.py`. Formatting and
 `git diff --check` pass.
 
-Remaining limits are documented in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap):
+Remaining limits are documented in [Smart-pointer unwrap](IR.md#smart-pointer-unwrap):
 alias templates and namespace aliases are not resolved here, and the mixed
 reference representation can admit an additional same-typed pointee. A
 separate reduced probe confirms `g.get()` and `val().get()` retain only `c`,
@@ -2476,7 +2476,7 @@ function counts, argument-flow totals, diagnostics, indirect/IPC counts and
 existing correctness probes are unchanged. Formatting and `git diff --check`
 pass.
 
-[Extraction limits](ANALYSIS.md#smart-pointer-unwrap) now explicitly cover
+[Extraction limits](IR.md#smart-pointer-unwrap) now explicitly cover
 alias templates, namespace aliases, unqualified wrappers without declarations,
 indirect reference-returned wrappers, same-typed reference imprecision and
 class-pointer arguments converted to `void *`. These cases are not claimed
@@ -2491,7 +2491,7 @@ extension `OpenFile` targets. This pins the class-import improvement that
 removes the undefined `OHOS::DataShare::MediaDataShareExtAbility::OpenFile`
 phantom identified by the fixture review. The changelog records this edge
 change. General move/forward and init-capture receiver typing is documented
-under [C++ support](ANALYSIS.md#c-support-first-step).
+under [C++ support](CXX.md#c-support-first-step).
 
 All 2,654 workspace tests pass, including the new assertion; full-workspace
 Clippy with all targets/features and `-D warnings`, formatting and
@@ -2510,7 +2510,7 @@ python3 scripts/compare_analysis_databases.py /tmp/get-j1.db /tmp/get-j8.db
 
 Calls in an operand the language never evaluates are tagged at lowering
 and get no call edge, argument or return flow
-([Unevaluated operands](ANALYSIS.md#unevaluated-operands)). On the pinned
+([Unevaluated operands](USAGE.md#unevaluated-operands)). On the pinned
 corpora only camera moves, by 9 edges, every one from a `decltype` operand:
 
 | Corpus | Count | Before | After |
@@ -2536,7 +2536,7 @@ unchanged on all three.
 What `trace analyze --sequencing` costs and what `trace inspect sequence`
 answers in, on the three pinned corpora (clean checkouts at the revisions in
 `scripts/eval_expected.json`) and the repository fixtures. Semantics live in
-[Call sequencing](ANALYSIS.md#call-sequencing-control-flow-sidecar); the
+[Call sequencing](USAGE.md#call-sequencing-control-flow-sidecar); the
 tables in [Call sequencing tables](SQLITE_SCHEMA.md#call-sequencing-tables).
 
 **Setup.** Linux x86-64, 8 vCPUs (Intel Xeon, Skylake), 11 GiB RAM, release
@@ -2677,7 +2677,7 @@ small, but the database grows by about a third.
 Baseline: `f9ac344`; candidate: the C++ call-site and callgraph fixes on
 `fix/cpp-callgraph-sites`. Rules:
 [Call source locations](ANALYSIS.md#call-source-locations),
-[Methods](ANALYSIS.md#c-support-first-step), and
+[Methods](CXX.md#c-support-first-step), and
 [callgraph query IDs](SQLITE_SCHEMA.md#call-site-export-filter).
 
 Focused regressions in
@@ -2878,7 +2878,7 @@ different sizes. The other +21.5 MiB is the execution-context call graph
 was still alive.
 
 **What the mirrors cost.** The membership mirrors
-([Membership mirrors and per-load merges](ANALYSIS.md#propagation-highlights))
+([Membership mirrors and per-load merges](POINTERS.md#propagation-highlights))
 assumed a numbering of a few thousand locations, true on HDF. Here it
 reaches 116k, so one flat mirror is about 14.5 KB while its set holds
 294 locations on average: 9,359 points-to mirrors and 6,798 cell mirrors
@@ -3183,9 +3183,9 @@ Git; the durable results are recorded here.
 
 ## Epoll event-data flow: #144 — 2026-10-11
 
-Rules: [Epoll event data](ANALYSIS.md#epoll-event-data),
-[Argument flow](ANALYSIS.md#argument-flow) and
-[Field sensitivity](ANALYSIS.md#field-sensitivity). The change adds epoll
+Rules: [Epoll event data](MODELS.md#epoll-event-data),
+[Argument flow](POINTERS.md#argument-flow) and
+[Field sensitivity](POINTERS.md#field-sensitivity). The change adds epoll
 registration/receipt summaries, preserves member addresses passed as
 arguments, and recovers array-element declarations whose nested snapshots
 were never separately interned. Fixture: `tests/fixtures/epoll/`.
@@ -3324,7 +3324,7 @@ subsequent pinned corpus recapture is recorded above.
 value's sources and down to its sinks, with the execution contexts (#202)
 that reach each node and a cross-context flag on edges where the value may
 change hands between threads, tasks or IPC requests. Rules:
-[Value slice](ANALYSIS.md#value-slice-inspect-slice); CLI:
+[Value slice](USAGE.md#value-slice-inspect-slice); CLI:
 [README.md](../README.md#trace-inspect-slice). The export adds a
 `flow_memory_access` table, the cells each load and store reaches read off
 the converged points-to sets (or a cell-less row when none is recorded), a
@@ -3332,7 +3332,7 @@ call through a pointer field (`cb_->OnError()`) records a read of the field,
 and `flow_origins` now also records a `return` statement's operations and a
 `new` expression's allocation; a memory access's sites are its load's or
 store's `flow_origins` rows, and `flow_edges` keeps its four columns and its
-constraint kinds ([Memory access edges](ANALYSIS.md#memory-access-edges),
+constraint kinds ([Memory access edges](POINTERS.md#memory-access-edges),
 schema v7).
 Fixture: `tests/fixtures/value_slice/`.
 
@@ -3402,9 +3402,9 @@ depths (6 and 6): `python3 scripts/slice_sizes.py <db> --sample 40`. Times
 are per CLI run, opening the database included. Every slice of the sample
 has the same node, edge, cross-context and context counts as before a site
 in a lambda body was attributed to the lambda
-([Where a value moves](ANALYSIS.md#where-a-value-moves)). Since an entry no
+([Where a value moves](POINTERS.md#where-a-value-moves)). Since an entry no
 call site starts (an IPC stub handler, a framework entry) is reached by its
-own contexts only ([Contexts](ANALYSIS.md#contexts)), the same slices have
+own contexts only ([Contexts](USAGE.md#contexts)), the same slices have
 the same nodes, edges and flags, and fewer contexts where an IPC handler or
 task called such an entry directly: hiview median 2 → 1.5, camera p90 39 →
 11 and max 230 → 144 (an edge touching memory of a self-concurrent handler
@@ -3427,7 +3427,7 @@ row describes different fields than before. camera's largest
 photo-proxy code that most IPC handlers reach. A context count of 1 is
 mostly `root` alone. `nullptr`, one node for the whole program, is a `null`
 source that stage 2 does not walk on from
-([Stage 1](ANALYSIS.md#stage-1-up-sources)); followed, it joined every null
+([Stage 1](USAGE.md#stage-1-up-sources)); followed, it joined every null
 assignment of camera (about 1,600 nodes per slice in the retro-test below).
 
 ### Camera race-fix retro-test
@@ -3472,7 +3472,7 @@ unchanged (re-run on the final binary with a fresh `--work` directory).
   whole-vector reads, both flagged against the IPC handlers that reach them;
   the element accesses through member calls (`.size()`, range-for,
   `push_back`, `erase`) are not value flow
-  ([Limits](ANALYSIS.md#limits)), and the script records them as expected
+  ([Limits](USAGE.md#limits)), and the script records them as expected
   misses.
 - **Slice sizes.** Each slice has 6–12 nodes (10 for `activeCameras_`);
   against the earlier implementation they also show the null stores of
@@ -3486,9 +3486,9 @@ unchanged (re-run on the final binary with a fresh `--work` directory).
 OpenHarmony's task, handler, pool, timer and work-queue APIs are now
 `invoke` models, and three virtual members a framework runs are `entry`
 models whose overrides are execution contexts; the list and the kind each
-states are in [docs/ANALYSIS.md](ANALYSIS.md#built-in-models), how a member
+states are in [MODELS.md](MODELS.md#built-in-models), how a member
 model meets a class the tree never declares or a subclass in
-[Model matching](ANALYSIS.md#model-matching). A member call site records
+[Model matching](MODELS.md#model-matching). A member call site records
 the variable it is made on, exported as `execution_contexts.receiver_var_id`
 with the context's `model`: two nullable columns added to the table under
 the additive v7 contract
@@ -3545,7 +3545,7 @@ export; recording the receiver at lowering costs nothing measurable), and
   [CPP_ROADMAP.md](CPP_ROADMAP.md)); the only C form, `ffrt_queue_submit` in
   `TriggerExportEngine::StartTask`, passes
   `ffrt::create_function_wrapper(taskFunc)`, whose return is not modelled
-  ([Documented imprecision](ANALYSIS.md#documented-imprecision)). The
+  ([Documented imprecision](MODELS.md#documented-imprecision)). The
   submitted lambdas of `FaultLogDatabase::SaveFaultLogInfo` and the five
   `PassthroughMonitor` handlers now have an edge from their submitter. The
   six named receivers are `std::thread` objects; every queue is a field. No
@@ -3566,7 +3566,7 @@ export; recording the receiver at lowering costs nothing measurable), and
   reach is under a self-concurrent context: the wrapper `OsalThreadCreate`
   is, which makes all 39 threads started at its `pthread_create` site
   `parent`, where none had evidence before. That is the wrapper's collapse
-  documented in [Execution contexts](ANALYSIS.md#execution-contexts), now
+  documented in [Execution contexts](MODELS.md#execution-contexts), now
   with roots that reach it; 79 of 83 contexts are self-concurrent.
 - **Entries.** `OnRemoteDied` overrides are `ipc_handler` contexts: HDF 1,
   hiview 5, camera 8, each a class deriving from
@@ -3579,7 +3579,7 @@ The new `execution_contexts` table lists where threads, tasks and IPC
 requests start running code: one row per resolved callback of an `invoke`
 model, then one per IPC stub handler, each with its kind and multi-instance
 evidence. The rules are in
-[docs/ANALYSIS.md](ANALYSIS.md#execution-contexts); the columns, and the
+[MODELS.md](MODELS.md#execution-contexts); the columns, and the
 table's place in the additive v7 contract, in
 [docs/SQLITE_SCHEMA.md](SQLITE_SCHEMA.md#execution_contexts). Fixture:
 `tests/fixtures/execution_contexts/` (`pthread_create`, `std::thread`,
@@ -3624,7 +3624,7 @@ included, is identical at `--jobs 1` and `--jobs 8`.
   calls the wrapper again, and the call graph cannot tell which entry that
   call starts. Cycles are found over ordinary calls only, and none of HDF's
   starts has evidence; the wrapper's collapsing of entries is described in
-  [Execution contexts](ANALYSIS.md#execution-contexts).
+  [Execution contexts](MODELS.md#execution-contexts).
 - **hiview.** The 12 `serial_task` rows are `ffrt::queue::submit`; the
   free `ffrt::submit` was not modelled yet, so most hiview tasks were
   still missing (modelled since #203, see
@@ -3650,7 +3650,7 @@ passes its 99 checks with the expectations unchanged.
 Where a value moves is recorded in `flow_origins`, which the source-level
 presentation (#196) already writes, so #204 adds no column and no row to the
 export: `flow_edges` keeps its four columns and one row per endpoint pair
-and kind ([Where a value moves](ANALYSIS.md#where-a-value-moves)). The
+and kind ([Where a value moves](POINTERS.md#where-a-value-moves)). The
 enclosing function of a site is looked up at query time, now as the
 innermost definition holding the line. Fixture:
 `tests/fixtures/flow_origin_sites/`.
@@ -3696,7 +3696,7 @@ the sites they show.
 
 Fixed the four follow-up constructor findings on top of `b1e33ac`, with local
 master still at `9dab736`. The rules and approximation limits are authoritative
-under [Ctors / dtors](ANALYSIS.md#c-support-first-step). Constant array extents
+under [Ctors / dtors](CXX.md#c-support-first-step). Constant array extents
 keep the correct initializer boundaries, unresolved extents retain possible
 following-member construction, inherited constructors initialize the remaining
 subobjects, cv/ref distinctions survive constructor imports, and parentheses
@@ -3746,7 +3746,7 @@ under `/tmp/issue207-four-final-validation/`; the driver is
 
 Addressed all nine constructor review findings on top of `13c7455`, already
 rebased onto local master `9dab736`. The construction rules are authoritative
-under [Ctors / dtors](ANALYSIS.md#c-support-first-step). Implicit outer
+under [Ctors / dtors](CXX.md#c-support-first-step). Implicit outer
 constructors still have no site of their own; their nontrivial subobjects
 retain construction and callback flow. Header imports retain scoped default
 member initializers and constructor signatures, and header variants retain
@@ -3812,7 +3812,7 @@ Rebased #207 onto local master `9dab736` (source-dataflow presentation, #140).
 Conflict resolution retains the shared argument collector's explicit-null
 value and origin recording, and records each member initializer's expression
 on its emitted constructor calls. Construction rules remain authoritative
-under [Ctors / dtors](ANALYSIS.md#c-support-first-step); the earlier #207
+under [Ctors / dtors](CXX.md#c-support-first-step); the earlier #207
 measurements below describe the pre-rebase tree.
 
 Fresh Linux release analyses compare the combined tree with the prior #207
@@ -3858,8 +3858,8 @@ production code. Earlier vector/membership compaction and optional return boxes
 ([the 67578b4 storage review](#provenance-storage-memory-reduction-after-67578b4-macos-arm64-2026-10-07))
 are already in af1b206; this work does not repeat those changes.
 The implementation and lifetime rules are authoritative in
-[Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation)
-and [flow-release lifecycle](ANALYSIS.md#post-solve-flow-release-lifecycle).
+[Source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation)
+and [flow-release lifecycle](POINTERS.md#post-solve-flow-release-lifecycle).
 
 ### Controlled baseline and responsible phase
 
@@ -4079,7 +4079,7 @@ release builds, eight jobs, minimal export and
 revisions pinned in `scripts/eval_expected.json`; the additional ability
 checkout is clean at `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`.
 The lowering rule is documented under
-[Ctors / dtors](ANALYSIS.md#c-support-first-step).
+[Ctors / dtors](CXX.md#c-support-first-step).
 
 | Corpus | Total edges, before → after | Direct | External | Arg-flow rows |
 |---|---:|---:|---:|---:|
@@ -4130,7 +4130,7 @@ signatures and their defaulting flags are registered, restores construction
 through a second header's types-only import. The fixture also covers deeper
 nesting, member class templates and an out-of-line constructor definition;
 defaulted and constructor-free nested classes still record no site. The
-authoritative rule remains under [Ctors / dtors](ANALYSIS.md#c-support-first-step).
+authoritative rule remains under [Ctors / dtors](CXX.md#c-support-first-step).
 
 On 2026-10-08, a fresh release build passes all 102 pinned evaluation checks.
 Every global metric for all four trees is unchanged by the nested-class
@@ -4185,7 +4185,7 @@ and value declarations distinct. The two original fixtures still contain no
 unresolved constructor sites.
 
 The configuration-dependent constructor limitation is retained explicitly
-in [Ctors / dtors](ANALYSIS.md#c-support-first-step): a class body visible in one
+in [Ctors / dtors](CXX.md#c-support-first-step): a class body visible in one
 unit can omit a declaration enabled only by another unit's macros. That
 requires deferring the negative decision until all variants and symbols merge;
 the shared `ctor_set_known` predicate used for copies and factories currently
@@ -4223,7 +4223,7 @@ At `02067f3`, `using Alias = Base;` followed by a derived class's
 calls to `Base::Base`. Constructor-import registration used tag-only lookup,
 so the alias did not match the canonical direct base. The existing alias-aware
 class lookup now resolves that base before recording the explicit import;
-the [construction rule](ANALYSIS.md#c-support-first-step) remains unchanged
+the [construction rule](CXX.md#c-support-first-step) remains unchanged
 for classes without an explicit import.
 
 The added regression fails before the fix and passes afterward. It checks
@@ -4264,7 +4264,7 @@ the pending site before that definition could merge. Unknown copies now
 retain their possible site. Types-only imports preserve own copy-constructor
 eligibility alongside default eligibility, distinguishing a real declared
 copy from an implicit base copy. The authoritative rules remain under
-[Ctors / dtors](ANALYSIS.md#c-support-first-step).
+[Ctors / dtors](CXX.md#c-support-first-step).
 
 Both regressions fail before the changes and pass afterward. The aggregate
 cases extend `cpp_member_initializer_review/`; `cpp_unknown_member_copy/`
@@ -4309,7 +4309,7 @@ on a forward-declared class produced an external edge named after the class.
 Lowering now types a bare, unresolvable C++ type name in a parameter, local,
 field or range-for position as the class of that name in the enclosing
 namespace, as a forward declaration there would; the rules, and what is not
-guessed, are in [docs/ANALYSIS.md](ANALYSIS.md#undeclared-receiver-classes).
+guessed, are in [CXX.md](CXX.md#undeclared-receiver-classes).
 Fixture: `tests/fixtures/cpp_undeclared_receiver/`; the merge relink is
 covered by `test_undeclared_receiver_member_call_relinks_to_defining_repo`
 in `crates/trace-merge/tests/merge_test.rs`.
@@ -4702,7 +4702,7 @@ below and match `scripts/eval_expected.json`.
 
 An object built by `std::make_shared<T>(args)`, `std::make_unique<T>(args)`
 or `sptr<T>::MakeSptr(args)` now reaches its constructor
-([Factory construction](ANALYSIS.md#factory-construction)). Baseline
+([Factory construction](CXX.md#factory-construction)). Baseline
 is `8c669a6` (master), built in a scratch worktree of that revision; both
 sides use the pinned, clean HDF (`cdc75a2`), hiview (`92408e2`) and camera
 (`8ffd69d`) corpora, release builds, eight jobs and
@@ -4800,8 +4800,8 @@ merge); a statement-position `new` gets its heap object;
 one-argument copy or move records no constructor site; a bare factory name
 that resolves to a project
 function, or that an inner using-declaration does not import from `std`, is
-not the standard factory (rules: [`NewHeap`](ANALYSIS.md#ir-flow-constraints-trace-ir),
-[Factory construction](ANALYSIS.md#factory-construction)). Against the
+not the standard factory (rules: [`NewHeap`](IR.md#ir-flow-constraints-trace-ir),
+[Factory construction](CXX.md#factory-construction)). Against the
 candidate figures above:
 
 | Corpus | call edges | direct edges | arg-flow edges | flow-graph nodes |
@@ -4824,11 +4824,11 @@ identical with `--jobs 1` and `--jobs 8`. Single runs, eight jobs: HDF
 
 Second follow-up (same day): a member initializer of a non-class member
 (`cb_(cb)`) stores its value as `this->cb_ = cb` does
-([C++ support](ANALYSIS.md#c-support-first-step)); `std::allocate_shared`
+([C++ support](CXX.md#c-support-first-step)); `std::allocate_shared`
 is recognised; a variant merge pairs temporaries by their recorded kind
 (`Variable::temp`), never by name; and a factory's object is no longer
 copied into the call's value, nor made by a file-scope factory
-([Factory construction](ANALYSIS.md#factory-construction)). Against the
+([Factory construction](CXX.md#factory-construction)). Against the
 first follow-up's figures:
 
 | Corpus | call edges | indirect edges | arg-flow edges | flow-graph nodes |
@@ -4896,7 +4896,7 @@ the graph and warm phases, which no code here touches either. The three pinned
 corpora are within their run-to-run ranges.
 
 Cleanup pass (same day): the copy-or-move rule moved from the heap paths to
-every constructor site ([`NewHeap`](ANALYSIS.md#ir-flow-constraints-trace-ir)),
+every constructor site ([`NewHeap`](IR.md#ir-flow-constraints-trace-ir)),
 factory calls in one function share one object per class, and literal or
 `bool`/floating member initializers store nothing. No edge was added;
 removed were constructor edges of a one-argument construction no constructor
@@ -4938,8 +4938,8 @@ identity survives header caching, parameter declarations and local bindings.
 A known aggregate copied from its own type gets no unresolved constructor;
 a missing definition, incomplete cached-header constructor lookup, or
 unknown parameter signature retains the possible edge. Rules remain in
-[`NewHeap`](ANALYSIS.md#ir-flow-constraints-trace-ir) and
-[Factory construction](ANALYSIS.md#factory-construction).
+[`NewHeap`](IR.md#ir-flow-constraints-trace-ir) and
+[Factory construction](CXX.md#factory-construction).
 
 Baseline is the previous PR head `2e17bd8`; both builds use the same clean,
 pinned corpus revisions above, release binaries, eight jobs and the 800,000
@@ -4988,7 +4988,7 @@ The second review follow-up to PR #206 pairs a factory's shared object by
 function and class, independent of the first call's source position. A
 conditional earlier same-class factory no longer duplicates the constructor
 edge at a retained call. Other temporary kinds keep their position-based
-identity. Rule: [variant merging](ANALYSIS.md#bounded-conditional-variant-exploration---explore).
+identity. Rule: [variant merging](USAGE.md#bounded-conditional-variant-exploration---explore).
 
 The regression previously produced two constructor edges at the retained
 factory and now produces one; it also checks distinct functions, a separate
@@ -5027,7 +5027,7 @@ merge resolves the site) or of a class whose definition is not indexed
 (the site stays unresolved). Before, such a factory call recorded nothing,
 while the `new` beside it kept its edge. The same conclusiveness test
 (`ctor_set_known`) now guards the copy-or-move rule and the factory's
-no-constructor rule. Rule: [Factory construction](ANALYSIS.md#factory-construction).
+no-constructor rule. Rule: [Factory construction](CXX.md#factory-construction).
 
 Baseline is the previous PR head `7cb4b1c`, built in a scratch worktree;
 both builds use the clean, pinned corpus revisions above, release binaries,
@@ -5109,7 +5109,7 @@ worker pool was tested and rejected: it raised ability's peak by about 80 MiB.
 The separate pools remain. On glibc, the ordered indexing window now returns
 unused parser/merge pages after every 64 consumed payloads, before admitting
 the next window slot. Unit order and ownership are unchanged. See
-[Call-record storage and merge lifetime](ANALYSIS.md#call-record-storage-and-merge-lifetime).
+[Call-record storage and merge lifetime](IR.md#call-record-storage-and-merge-lifetime).
 
 The final whole-process comparison uses Linux/glibc release binaries, eight
 workers, default minimal export, the default allocator, and kernel maximum RSS
@@ -5141,7 +5141,7 @@ identity equality has an Arc pointer fast path; call names compare with `str`,
 `&str` and `String` in both operand orders; redundant borrow parentheses are
 removed; and the macro test requires explicitly recorded occurrences before
 comparing their spans. Storage/lifetime rules remain in
-[Call-record storage and merge lifetime](ANALYSIS.md#call-record-storage-and-merge-lifetime).
+[Call-record storage and merge lifetime](IR.md#call-record-storage-and-merge-lifetime).
 
 The timeout reproduction uses 3,000 files, each with 600 `int vN_j = j;` lines,
 release builds and eight workers, with a fresh `TMPDIR` per invocation:
@@ -5185,7 +5185,7 @@ retained optimizations at `8aa0895`:
    merging and virtual expansion, including clones of call records.
 
 The Rust API migration and authoritative storage/lifetime rules are in
-[Call-record storage and merge lifetime](ANALYSIS.md#call-record-storage-and-merge-lifetime).
+[Call-record storage and merge lifetime](IR.md#call-record-storage-and-merge-lifetime).
 SQLite schema and C ABI are unchanged. The previously discarded disk-spool,
 sparse-line-map and header-retirement experiments remain absent.
 
@@ -5455,7 +5455,7 @@ Implemented after the [ownership research](#preprocessing-and-indexing-memory-re
 
 Storage rules are authoritative in [Preprocessor: role in the pipeline](PREPROCESSOR.md#role-in-the-pipeline)
 and [diagnostics](PREPROCESSOR.md#diagnostics-in-the-export); configuration-family
-semantics remain in [Analysis: compilation databases](ANALYSIS.md#compilation-databases-62).
+semantics remain in [Analysis: compilation databases](USAGE.md#compilation-databases-62).
 No analysis rules or SQLite schema changed. The Rust preprocessing result now
 holds `SharedDiagnostic = Arc<Diagnostic>` rather than owned diagnostic records;
 the record's fields remain available through dereferencing.
@@ -5878,7 +5878,7 @@ probes across all reference fixtures produce byte-identical output.
 A function started on a new thread is now reachable from the code that
 starts it: `pthread_create` and the `std::thread` constructor are `invoke`
 models that forward their arguments, under the rules in
-[Callback invocation](ANALYSIS.md#callback-invocation-invoke). Baseline is
+[Callback invocation](MODELS.md#callback-invocation-invoke). Baseline is
 `2f9a766` (master), built in a scratch worktree of that revision; both sides
 use the pinned, clean HDF (`cdc75a2`), hiview (`92408e2`) and camera
 (`8ffd69d`) corpora, release builds, eight jobs and
@@ -5934,7 +5934,7 @@ context whose fields the type-keyed summaries already served.
 
 Constructors and destructors of automatic C++ objects now reach the call
 graph, under the rules in
-[Automatic objects](ANALYSIS.md#automatic-objects). Baseline is `6810db2` (master), built in a
+[Automatic objects](CXX.md#automatic-objects). Baseline is `6810db2` (master), built in a
 scratch worktree of that revision; both sides use the pinned, clean HDF
 (`cdc75a2`), hiview (`92408e2`) and camera (`8ffd69d`) corpora, release
 builds, eight jobs and `TRACE_SOLVE_BUDGET_POPS=800000`, following
@@ -5976,7 +5976,7 @@ subclass's destructor is counted: dispatching them as `delete p` is would
 add 60 hiview and 3 camera destructor edges.
 
 The other edges move with range-for and catch variables, lowered and typed
-under [Automatic objects](ANALYSIS.md#automatic-objects). A declared class
+under [Automatic objects](CXX.md#automatic-objects). A declared class
 type resolves the calls through one: `catch (const std::logic_error &e) {
 e.what(); }` reaches `std::logic_error::what` (with
 `std::invalid_argument::what`), and camera's `for (Profile &profile :
@@ -6032,7 +6032,7 @@ thousands; the difference is within run-to-run spread.
 
 ## Nested call return arguments — 2026-10-02
 
-Rules are maintained in [Return-value flow](ANALYSIS.md#return-value-flow).
+Rules are maintained in [Return-value flow](IR.md#return-value-flow).
 Both versions use the same pinned, clean HDF (`cdc75a2`), hiview (`92408e2`), and camera
 (`8ffd69d`) corpora from `scripts/eval_expected.json`, release builds, eight
 jobs, and the existing eval solver settings. Measurements were taken using
@@ -6075,7 +6075,7 @@ c_utils' third singleton template, `DelayedRefSingleton<T>`, whose
 `GetInstance()` returns `T &`, is now recognised alongside `DelayedSingleton`
 and `Singleton` when the unit sees no definition of it; the rule is
 **Undefined singleton templates** in the
-[Templates bullet](ANALYSIS.md#c-support-first-step). Baseline is `bc5505f`
+[Templates bullet](CXX.md#c-support-first-step). Baseline is `bc5505f`
 (master), built in a scratch worktree of that revision; both sides use the
 pinned, clean HDF (`cdc75a2`), hiview (`92408e2`) and camera (`8ffd69d`)
 corpora, release builds, eight jobs and `TRACE_SOLVE_BUDGET_POPS=800000`,
@@ -6128,7 +6128,7 @@ the arguments of the newly bound calls.
 
 ## Explicit calls to overloaded operators — 2026-10-01
 
-Rules are maintained in [Explicit member operator calls](ANALYSIS.md#explicit-member-operator-calls).
+Rules are maintained in [Explicit member operator calls](CXX.md#explicit-member-operator-calls).
 Both versions use the same pinned, clean HDF (`cdc75a2`), hiview (`92408e2`), and camera
 (`8ffd69d`) corpora from `scripts/eval_expected.json`, release builds, eight
 jobs, and the existing eval solver settings. Measurements were taken using
@@ -6175,7 +6175,7 @@ errors, eliminating parse error diagnostics from both translation units (diagnos
 
 ## Struct compaction, expansion sharing, and lifecycle reclamation — 2026-10-01
 
-Rules and Rust API migrations are documented in [Type storage and TypeFields](ANALYSIS.md#typefields-and-layout-storage), [Constraint representation and accessors](ANALYSIS.md#constraint-representation-and-accessors), and [Post-solve flow-release lifecycle](ANALYSIS.md#post-solve-flow-release-lifecycle). High-level memory reductions are summarized in [Memory profile](MEMORY_PROFILE.md#implemented-follow-up-struct-compaction-expansion-sharing-and-lifecycle-reclamation).
+Rules and Rust API migrations are documented in [Type storage and TypeFields](IR.md#typefields-and-layout-storage), [Constraint representation and accessors](POINTERS.md#constraint-representation-and-accessors), and [Post-solve flow-release lifecycle](POINTERS.md#post-solve-flow-release-lifecycle). High-level memory reductions are summarized in [Memory profile](MEMORY_PROFILE.md#implemented-follow-up-struct-compaction-expansion-sharing-and-lifecycle-reclamation).
 
 ### Environment and revisions
 
@@ -6248,7 +6248,7 @@ database per run, took 6.87 / 6.29 / 6.31 seconds before and
 Medians were 6.31 versus 6.38 seconds (+1.1%), within the observed spread;
 these runs do not establish a repeatable performance change.
 
-Rules are maintained in [C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+Rules are maintained in [C++ parse-input normalization](CXX.md#c-parse-input-normalization).
 The local branch is `fix/issues-167-169-170-cpp-type-syntax`, baseline
 `18303d6a6aa228a9f0ea1a65ca3bc72de58d9bba` (master). Both sides use the pinned,
 clean HDF (`cdc75a2`), hiview (`92408e2`) and camera (`8ffd69d`) corpora from
@@ -6380,7 +6380,7 @@ measured.
 
 ## Attributed friend operator declarations — 2026-09-30 (#166)
 
-Rules are maintained in [Friend declarations and operator attributes](ANALYSIS.md#c-support-first-step).
+Rules are maintained in [Friend declarations and operator attributes](CXX.md#c-support-first-step).
 The local branch is `fix/issue-166-attributed-friend-operators`. Both versions
 use the same pinned, clean HDF (`cdc75a2`), hiview (`92408e2`), and camera
 (`8ffd69d`) corpora from `scripts/eval_expected.json`, release builds, eight
@@ -6504,7 +6504,7 @@ targets keep their per-image members and their weak selection.
 
 ## IDL-generated interfaces — 2026-09-29 (#123)
 
-Rules are maintained in [IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces)
+Rules are maintained in [IDL-generated interfaces](CXX.md#idl-generated-interfaces)
 and, for the preprocessor, in PREPROCESSOR.md ("Parallel discovery", "An
 expansion that cannot be stored", "Access-specifier renames"). The local
 branch is
@@ -6777,7 +6777,7 @@ but their syntax is not fully represented by the current parser.
 
 The same 11 C++ headers were reparsed after the declaration-only
 pointer-to-member approximation described in
-[Compilation databases](ANALYSIS.md#compilation-databases-62). Innermost
+[Compilation databases](USAGE.md#compilation-databases-62). Innermost
 unrecovered tree-sitter error nodes fell from **1,090 to 636**. `<vector>` fell
 from 186 to 89 and `<memory>` from 173 to 76. The parse-diagnostic outcome
 remains **1/11 clean** (`<cstdint>`), because other declaration grammar gaps
@@ -7080,7 +7080,7 @@ descriptors needed for later merges, that path reads only type order, aliases,
 and class declaration sets from each header table. It now discards the
 lowering-only structures and the header's flow ownership range maps. Normal
 TU and configured-build type tables are unchanged. The consumer contract for
-compacted cached headers is in [Type storage](ANALYSIS.md#type-storage).
+compacted cached headers is in [Type storage](IR.md#type-storage).
 
 Release build, standard Linux/glibc allocator, `--jobs 8`, minimal export,
 same corpus checkout and settings. `ru_maxrss` is the child process peak;
@@ -7211,8 +7211,7 @@ The solver now:
 2. Decouples `loc_changed` and `summary_changed` in `apply_store_to_targets`, ensuring
    only memory cells that actually gained new locations requeue their holders.
 
-Rules: [Propagation highlights](ANALYSIS.md#propagation-highlights) and **`StringConst`**
-in `docs/ANALYSIS.md`.
+Rules: [Propagation highlights](POINTERS.md#propagation-highlights) and **[`StringConst`](IR.md#ir-flow-constraints-trace-ir)**.
 
 ### Evaluation
 
@@ -7252,8 +7251,8 @@ members, and a name-paired proxy and stub whose interfaces are declared and unre
 longer bridged (#122). A cached header expansion records the variant that holds its
 declarations, so a unit that replays a header another unit expanded first still sees its classes,
 and a C++ prototype with C linkage meets its definition by arity. Rules: **Templates** and
-[Template-parameter bases](ANALYSIS.md#template-parameter-bases) in `docs/ANALYSIS.md`,
-[OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges), and "Which variant a record
+[Template-parameter bases](CXX.md#template-parameter-bases) in `docs/CXX.md`,
+[OpenHarmony IPC bridges](MODELS.md#openharmony-ipc-bridges), and "Which variant a record
 names" in `docs/PREPROCESSOR.md`.
 
 Baseline: `master` at `c4a2424b61a8ea5a91aa490f7354ae323d4b0540`. Candidate: branch
@@ -7435,8 +7434,8 @@ containing `::`) on file and line.
 
 ## Dereferenced operands and template-parameter bases — 2026-09-25 (#151, #150)
 
-The rules are defined in [Dereferenced operands](ANALYSIS.md#dereferenced-operands)
-(#151) and [Template-parameter bases](ANALYSIS.md#template-parameter-bases)
+The rules are defined in [Dereferenced operands](IR.md#dereferenced-operands)
+(#151) and [Template-parameter bases](CXX.md#template-parameter-bases)
 (#150). This section records what the two changes moved. Both are measured
 together; each move is attributed to one of them by site, from SQL diffs of
 the baseline and candidate databases.
@@ -7582,7 +7581,7 @@ resolves on `master` (#146). Wiring its three callees' parameters pulls about
 
 The solver now answers the hub's repeated membership tests from bit mirrors
 and merges a load's new locations in one step
-([Membership mirrors and per-load merges](ANALYSIS.md#propagation-highlights)).
+([Membership mirrors and per-load merges](POINTERS.md#propagation-highlights)).
 The mirrors number a few thousand locations on HDF, against tens of thousands
 in all, so a mirror is a few hundred bytes.
 The exported database is byte-identical to the unoptimized branch on all three
@@ -7671,7 +7670,7 @@ All three are assigned to the recipient callback in the corpus, so these edges a
 
 ## Function pointer member declarator classification and member call fallback — 2026-09-25 (#147)
 
-The rules are defined in [Member function pointer declarator classification](ANALYSIS.md#member-function-pointer-declarator-classification) and [Sound handling for unresolved member field calls](ANALYSIS.md#sound-handling-for-unresolved-member-field-calls).
+The rules are defined in [C++ support](CXX.md) and [Sound handling for unresolved member field calls](POINTERS.md#sound-handling-for-unresolved-member-field-calls).
 This change fixes a bug where struct function-pointer fields were misclassified as member functions in AST lowering and unresolved member field calls erroneously mutated into direct calls to same-named free functions.
 
 ### Problem & Fix
@@ -7717,7 +7716,7 @@ Evaluated with `python3 scripts/eval_check.py --bin target/release/trace --outdi
 
 ## Implicit this member variable access and assignments — 2026-09-24 (#145)
 
-The rules are defined in [Implicit this member variable access](ANALYSIS.md#implicit-this-member-variable-access).
+The rules are defined in [Implicit this member variable access](POINTERS.md#implicit-this-member-variable-access).
 This change fixes a bug where unqualified variable accesses inside C++ instance methods
 referring to class member fields were dropped during AST lowering.
 
@@ -7758,8 +7757,8 @@ Evaluated with `python3 scripts/eval_check.py --bin target/release/trace --outdi
 
 ## Smart-pointer value flow — 2026-09-24 (#141)
 
-The rules are defined in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap)
-and [Weak-pointer promotion](ANALYSIS.md#weak-pointer-promotion). This section
+The rules are defined in [Smart-pointer unwrap](IR.md#smart-pointer-unwrap)
+and [Weak-pointer promotion](IR.md#weak-pointer-promotion). This section
 records what the change moved and what it cost.
 
 Baseline: `master` at `58a81a8315bc8c5cf3aad384ae50af2572bb4e4e`. Candidate:
@@ -7939,12 +7938,12 @@ commits changed that, each without changing any result:
   variable ends in. A profile had traced camera's +0.3 s index phase to those
   walks.
 - `4f1c7e6` builds a PAG node and location only for globals that some fact
-  names (see [Program Assignment Graph](ANALYSIS.md#program-assignment-graph-pag)).
+  names (see [Program Assignment Graph](POINTERS.md#program-assignment-graph-pag)).
   The header static member declarations each unit repeats no longer cost a
   node, a location and a self points-to fact apiece; camera's export phase is
   0.1 s faster.
 - `ca337f8` makes a store write only its value's new locations into
-  existing targets (see [Propagation highlights](ANALYSIS.md#propagation-highlights)).
+  existing targets (see [Propagation highlights](POINTERS.md#propagation-highlights)).
   hdf's solve drops from about 1.8 s to 0.8 s, which also pays for the flow
   this branch recovers. All 1,039,526 points-to rows and every call edge on
   hdf, and camera's, are identical before and after.
@@ -8273,7 +8272,7 @@ declarations (see "What remains").
 
 Noise macro filtering allows opting out of call sites, flow constraints, and local variables
 introduced by boilerplate logging and diagnostic macros (e.g., `TAG_LOG*`, `HILOG_*`).
-The mechanism is documented in [ANALYSIS.md](ANALYSIS.md#noise-macro-filtering---ignore-macro---ignore-logging-noise)
+The mechanism is documented in [USAGE.md](USAGE.md#noise-macro-filtering---ignore-macro---ignore-logging-noise)
 and the preprocessor provenance contract in [PREPROCESSOR.md](PREPROCESSOR.md#macro-expansion-provenance-and-attribution).
 
 Evaluated on a clean checkout of `ability_ability_runtime` at revision `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`.
@@ -8313,7 +8312,7 @@ Comparing Base vs. Head (default), all 15 non-metadata SQLite tables are 100% bi
 
 ## Pointer cells and `&x` arguments — 2026-09-21 (#127)
 
-The rules are defined in [ANALYSIS.md](ANALYSIS.md): the load guard under
+The rules are defined in [POINTERS.md](POINTERS.md): the load guard under
 "Signature-guarded function-value propagation", `&x` arguments under
 "Argument flow", variable-cell synchronization and the pointer-static seed
 under "Variable cells", and declaration-keyed field summaries under "Field
@@ -8543,7 +8542,7 @@ of it on the cell → node direction: through a global's self-location seed,
 filled field summaries past `SUMMARY_MEM_CAP` in a different order. The
 address-taken gate closed that route for globals whose address is never
 taken. D closes it for the rest by not seeding pointer statics. Both rules
-are in [ANALYSIS.md](ANALYSIS.md), "Variable cells"; the regression tests
+are in [POINTERS.md](POINTERS.md), "Variable cells"; the regression tests
 are `store_through_value_copy_does_not_write_the_global` and
 `address_taken_global_keeps_value_copies_apart`.
 
@@ -8598,7 +8597,7 @@ corpus counts unchanged.
 ## Solver work budget — 2026-09-21 (#119)
 
 The budget formula, the precedence of the override knobs and the recording of
-a truncated run are defined in [Work budget](ANALYSIS.md#work-budget), not
+a truncated run are defined in [Work budget](POINTERS.md#work-budget), not
 repeated here. This section records the measurements that sized the linear
 term of `default_pops_budget` (`crates/trace-analysis/src/solver.rs`;
 `800 000 + 6 × PAG constraints` pops).
@@ -8646,7 +8645,7 @@ so the pinned gate stays byte-identical.
 ## Analyze-phase performance — 2026-09-21 (#117)
 
 What the solver now does about allocation and store filtering is defined in
-[Propagation highlights](ANALYSIS.md#propagation-highlights); name-lookup
+[Propagation highlights](POINTERS.md#propagation-highlights); name-lookup
 ordering is in [Shared header functions](ANALYSIS.md#shared-header-functions).
 
 Baseline: `8f5af325b4c739a9499020c24c824d482b83b376`. Candidate: the commit
@@ -8723,7 +8722,7 @@ edges, 757 indirect on both). Each unit of work simply got cheaper.
 ### What changed
 
 Three replacements, each a no-op-for-no-op substitution (see
-[Propagation highlights](ANALYSIS.md#propagation-highlights)):
+[Propagation highlights](POINTERS.md#propagation-highlights)):
 
 1. Reusable buffers (`Scratch`) in place of a per-step vector, everywhere
    propagation allocates.
@@ -8914,7 +8913,7 @@ covering flows introduced by both base configurations and variants.
 
 ## C++ caller edges — 2026-09-18 (#113)
 
-Measurements for the missing-caller fix. The design is in `docs/ANALYSIS.md` ("C++ support") and
+Measurements for the missing-caller fix. The design is in `docs/CXX.md` ("C++ support") and
 `docs/PREPROCESSOR.md` (the `HWTEST_F` fallback macro).
 
 **Setup.** Release builds of origin/master (`aab086d`) and of this change, on the same machine in
@@ -9111,7 +9110,7 @@ clashes only moved indices, which provisional handles absorb.
 ## `auto` locals from declared return types — 2026-09-14 (#87, C1)
 
 The single record of what #87 changed on the pinned corpora. The inference
-rules and their limits are in `docs/ANALYSIS.md` ("`auto` local types").
+rules and their limits are in `docs/CXX.md` ("`auto` local types").
 
 **Setup.** Release builds of origin/master (`22d36cd`, the tree of
 `e24a7f3`), of the first C1 build (`e20e4aa`), and of the final build; macOS,
@@ -10601,7 +10600,7 @@ larger raw edge counts include separate call records for differing variant facts
 so they must not be read as equivalent gains in source-level coverage. Distinct
 source edges group by caller, callee, source file/line/column and resolution.
 Conditional signatures and multi-define/nested activation remain the documented
-[analysis limitations](ANALYSIS.md#limits-of---explore).
+[analysis limitations](USAGE.md#limits-of---explore).
 
 Reproduce the default check with
 `python3 scripts/eval_check.py --corpus-base /private/tmp/corpora` after rebuilding
@@ -11071,7 +11070,7 @@ world of scopes and asserts the two things the naming exists to do — all
 spellings of one type name one member, and no two types name the same one.
 It found the fifth defect (`H::T` from inside `n::H`) on its first run.
 
-Two shapes were deliberately left alone, both recorded in `docs/ANALYSIS.md`.
+Two shapes were deliberately left alone, both recorded in `docs/CXX.md`.
 An annotated *data* member (`int a_ GUARDED_BY(mu_);`) still contributes one
 phantom `Cls::GUARDED_BY`: it parses as type field, `ERROR`,
 `function_declarator` — the identical shape to a *function* behind a leading
@@ -11334,7 +11333,7 @@ qualified target behind a leading macro (`MACRO operator ::ns::S() const;`) is
 not: it is the one recovery that parks its `ERROR` at class-body level rather
 than inside the member, out of the member walk's reach, and repairing it means
 reading recovery marks at a level that reads none today. It is recorded in
-`docs/ANALYSIS.md` and pinned as the single exclusion of the new invariant
+`docs/CXX.md` and pinned as the single exclusion of the new invariant
 test, which asserts that all four macro spellings of fourteen target kinds name
 one member and no phantom — the shape of test that would have caught the four
 defects review found by hand.
@@ -11348,7 +11347,7 @@ the same reason the target-canonicalization fixes above moved nothing, and the
 reason review had to reach for a scratch integration test rather than the
 corpora to find these.
 
-Review also corrected a claim in `docs/ANALYSIS.md`: `operator int(*)(char)`
+Review also corrected a claim in `docs/CXX.md`: `operator int(*)(char)`
 and `operator int(*)(long)` were said to collide under one name because the
 name keeps the `(*)` but not what follows it. The name runs to the *member's*
 own parameter list, so it keeps the target's — the two are distinct members.
@@ -13981,7 +13980,7 @@ per-unit cost is the documented configured-path limit
 ## Dataflow presentation validation (2026-10-02)
 
 Validated a fresh release analysis of `drivers_hdf_core` at
-`cdc75a20bb8f1a046cd22e189405a20d602d0521`. The presentation rules are documented in [Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`. The presentation rules are documented in [Source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation).
 
 | Query (file:line:column, depth) | Result |
 |---|---|
@@ -14018,7 +14017,7 @@ endpoint pairs in presentation and merging operation origins once per distinct
 unit constraint. Call occurrence identity continues to come from the existing
 TU-remapped `CallSiteId` and exported `flow_return_calls`; no IDs or graph
 semantics are changed. The authoritative rules are in
-[Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+[Source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation).
 
 Two generated single-TU C workloads isolate the costs:
 
@@ -14203,7 +14202,7 @@ attribution, and first-seen order. Formatting and diff checks pass.
 The checkout began at `0694be6` on `issue-140`; GitHub's open PR still named
 `cb24452`. Existing local fixes and untracked fixtures were preserved. The
 cross-file transition sorting suggestion was excluded. The behavior rules live
-in [Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+in [Source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation).
 
 Measurements below use a freshly rebuilt release CLI on macOS 26.6.2 arm64,
 Rust 1.98.1, and the clean HDF checkout at pinned revision
@@ -14434,7 +14433,7 @@ call occurrence and text includes every transition selected by visible depth.
 No display limits were restored. Source ordering remains scope traversal order,
 then line/column, with path only as a tie-breaker; path-first cross-file sorting
 remains excluded. The authoritative rules remain in
-[Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+[Source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation).
 That section now documents comment handling and corrects a stale claim that
 call-target labels include occurrence IDs: structured/diagram PAG node IDs
 distinguish occurrences, while call-site IDs remain internal.
@@ -14486,7 +14485,7 @@ trace or complete source evaluator.
 
 This comparison uses unmodified **67578b4** as the baseline. It measures the
 storage changes described in [Source-level dataflow
-presentation](ANALYSIS.md#source-level-dataflow-presentation), without changing
+presentation](USAGE.md#source-level-dataflow-presentation), without changing
 expressions, occurrence identity, source attribution, resolution, or inspection.
 
 ### Allocation owners and implementation
@@ -14701,7 +14700,7 @@ validation and return `TRACE_ERR_INVALID_ARG`; Rust lookup retains its positive,
 missing-column database. Ranking is unchanged: identifier coverage on the
 requested line, other declarations on that line, then nearby lines. The JSON
 contract now identifies itself with `schema: "dataflow-source-v1"`. Authoritative
-rules are in [source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation)
+rules are in [source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation)
 and [C API inspection](CAPI.md#inspect-details).
 
 An isolated release build restores the unmodified `ad584c6` lowering file
@@ -15067,7 +15066,7 @@ distinct (widened constraint, original constraint) pairs in first-seen order
 before snapshotting, then reuses one `OriginMembership` per destination.
 All snapshots precede destination mutations. Overload candidates, repeated flow
 occurrences and their ordering remain intact; the rules are documented in
-[source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+[source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation).
 
 The existing real-CLI regression now covers repeated scalar assignments and
 array entries, including the same expression at distinct columns, exact source
@@ -15169,7 +15168,7 @@ and titles. The parent implementation used `flows-to`/`flows-from` in
 Thus schema-aware consumers can distinguish the contracts already; adding a
 second version field or replacing the documented v1 labels is unnecessary.
 The authoritative compatibility rules and migration mapping now appear in
-[source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+[source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation).
 
 Consumer audit: the measurement script consumes current `nodes` and does not
 branch on emitted direction labels; the C API uses numeric direction enums and
@@ -15219,7 +15218,7 @@ once, and lazily indexes character-to-byte offsets for recovered Unicode lines.
 ASCII columns use byte offsets directly, without allocating per-column tables.
 Line bounds, token-equivalence validation, original comments/spacing and macro
 fallback behavior are retained; the authoritative rules remain in
-[source-level presentation](ANALYSIS.md#source-level-dataflow-presentation).
+[source-level presentation](USAGE.md#source-level-dataflow-presentation).
 
 The shared deferred schema adds
 `idx_functions_file_range(file_id,is_defined,line_start,line_end)` in both
@@ -15516,7 +15515,7 @@ log: `/tmp/trace-diagnostics-workspace.log`.
 ## GNU visibility before C linkage — 2026-10-19
 
 The parse-input adaptation described in
-[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization)
+[C++ parse-input normalization](CXX.md#c-parse-input-normalization)
 recovers the attribute/linkage order isolated in "Inspect diagnostics" above
 (#234).
 Regression fixtures cover both orders, declarations and definitions, external
@@ -15556,7 +15555,7 @@ python3 scripts/eval_check.py --jobs 8 --outdir /tmp/trace-visibility-eval
 
 This addresses the IDL syntax finding in [Inspect diagnostics](#inspect-diagnostics--2026-10-14).
 The supported dialect and remaining limitations are maintained in
-[IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces).
+[IDL-generated interfaces](CXX.md#idl-generated-interfaces).
 Return/status conventions, package names and generated class bases were
 checked against hdi-gen's emitters in the pinned HDF checkout
 `cdc75a20bb8f1a046cd22e189405a20d602d0521`, including its checked-in
@@ -15629,7 +15628,7 @@ not committed.
 
 Four review findings are covered by five additional regression tests. The
 authoritative behavior is documented in
-[IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces):
+[IDL-generated interfaces](CXX.md#idl-generated-interfaces):
 
 - Versioned interfaces with on-disk headers exercise a defined descendant
   proxy and a subclass of that proxy. Neither becomes a service endpoint;
@@ -15677,7 +15676,7 @@ That variant fails on `7754ca5`: the V1_0 proxy bridges to the V1_1 proxy
 and its `DerivedTransport` subclass instead of the interface declaration.
 The updated role index also uses indexed broker bases; the behavior and
 remaining layout limit are maintained in
-[IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces).
+[IDL-generated interfaces](CXX.md#idl-generated-interfaces).
 
 The regression passes six scenarios: both `IProxyBroker` and `IRemoteProxy`
 with missing stub headers, and `IProxyBroker` with both stub headers present,
@@ -15801,7 +15800,7 @@ header, or in a distinct project header per TU. GDB sampling located repeated
 tree-sitter parsing and declaration lowering in the direct layout. The common
 header layout already amortizes that work through the existing header IR.
 
-The candidate adds [indexing syntax reuse](ANALYSIS.md#indexing-syntax-reuse).
+The candidate adds [indexing syntax reuse](CXX.md#indexing-syntax-reuse).
 The baseline was rebuilt directly from `5336d8a`; both executables use the
 workspace release profile, without PGO. An earlier saved executable was
 discarded after differing source-column behavior was detected; the figures
@@ -15928,9 +15927,9 @@ using commit `175c5ba` as the baseline. The changes address three repeated costs
   by a walk of just the expression's mappings. Equal-offset entries and the
   half-open end boundary retain their previous behavior.
 
-Contracts: [indexing syntax reuse](ANALYSIS.md#indexing-syntax-reuse),
+Contracts: [indexing syntax reuse](CXX.md#indexing-syntax-reuse),
 [shared header functions](ANALYSIS.md#shared-header-functions) and
-[construction rules](ANALYSIS.md#c-support-first-step).
+[construction rules](CXX.md#c-support-first-step).
 
 Both release executables are built from their own source trees; the baseline
 uses an isolated Cargo target directory to prevent reuse of candidate library
@@ -16061,7 +16060,7 @@ Named types and malformed declarations keep the existing path, as do unknown
 base types that must register a substitution-blocking return fact. Virtual-flag
 queries skip the recursive walk only when a well-formed declaration has none
 of `virtual`, `override` or `final` before its body. Contracts:
-[C++ template and virtual support](ANALYSIS.md#c-support-first-step).
+[C++ template and virtual support](CXX.md#c-support-first-step).
 
 The benchmark adds `templates`: each of 20 TUs includes the six installed
 standard headers and declares a class template with aliases and 256 methods.
@@ -16154,7 +16153,7 @@ The profile still spends substantial time in parsing, but also samples spill
 writes and repeated function-versus-field classification in class passes.
 The candidate coalesces spill reads/writes with bounded 256 KiB I/O buffers
 and reuses syntax-only member classifications within the live tree. Contracts:
-[indexing syntax reuse](ANALYSIS.md#indexing-syntax-reuse) and
+[indexing syntax reuse](CXX.md#indexing-syntax-reuse) and
 [preprocessing pipeline](PREPROCESSOR.md#role-in-the-pipeline).
 
 The classification cache follows the existing per-tree lifetime: scratch
@@ -16799,7 +16798,7 @@ error-containing predecessors, retries an incremental result containing errors
 with a fresh parse, and retains only error-free trees. Large-input C/C++ tests
 compare full node structure, coordinates and S-expressions against fresh
 parsing. The authoritative rule is in
-[Indexing syntax reuse](ANALYSIS.md#indexing-syntax-reuse).
+[Indexing syntax reuse](CXX.md#indexing-syntax-reuse).
 
 The same review found libc++ cleanup `_Pragma` operators reached boundary
 tracking as ordinary syntax. A later re-review confirmed the fix enables
@@ -17012,7 +17011,7 @@ Lowering moves the imported sets into its working context and returns them to
 IR afterward. The metadata includes the binding, type-layer, address and
 reference-return facts, keeping the reference representations consistent. It
 survives preamble cloning and is released with indexing merge state. The rule
-is documented in [Dereferenced operands](ANALYSIS.md#dereferenced-operands).
+is documented in [Dereferenced operands](IR.md#dereferenced-operands).
 
 The integration regression compares exported caller/source/destination/edge-kind
 rows across capacities 0/8 and jobs 1/3, both with direct system inclusion and
@@ -17242,8 +17241,8 @@ The media library is indexed alone at `ad09a5f888ed78c2c46f5c218fa144ef6774e8e9`
 with eight jobs and `--ignore-logging`, without SDK/system headers or compilation
 commands. HDF, hiview and camera use the clean revisions and options pinned in
 `scripts/eval_expected.json`. Rules and imprecision are specified in
-[OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges) and
-[Undeclared receiver classes](ANALYSIS.md#undeclared-receiver-classes).
+[OpenHarmony IPC bridges](MODELS.md#openharmony-ipc-bridges) and
+[Undeclared receiver classes](CXX.md#undeclared-receiver-classes).
 
 The required consecutive path reaches a **defined** extension method:
 
@@ -17706,7 +17705,7 @@ constructor/ADL checks, and duplicate inherited linking call facts in overlappin
 merges. Both are fixed. Reconstructed edges receive stable identities, and a
 new regression checks reordered, staged and overlapping merges. The behavior
 contract is in [linking rules](ANALYSIS.md#invariants-and-linking-rules) and
-[IPC model configuration](ANALYSIS.md#openharmony-ipc-bridges).
+[IPC model configuration](MODELS.md#openharmony-ipc-bridges).
 
 ### Measurement setup
 

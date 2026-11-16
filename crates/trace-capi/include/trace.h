@@ -575,7 +575,7 @@ trace_status trace_db_call_chains(trace_db *db,
  * entities and counting visible transitions after collapsing technical nodes. The same
  * starting symbol and depth need not yield identical graphs or truncation. This raw
  * representation and the C ABI remain unchanged. See the authoritative contract:
- * [Source-level dataflow presentation](../../../docs/ANALYSIS.md#source-level-dataflow-presentation)
+ * [Source-level dataflow presentation](../../../docs/USAGE.md#source-level-dataflow-presentation)
  * Each `roots[i].kind` is validated (#TRACE_ERR_INVALID_ARG on an out-of-band value).
  *
  * @param[in]  db          Database handle. Must not be NULL.

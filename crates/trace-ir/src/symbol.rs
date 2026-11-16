@@ -35,7 +35,7 @@ pub struct Variable {
     pub span: Span,
     /// The variable's value is an address: a raw or function pointer, a
     /// synthesized pointer temporary, or a smart pointer (set after merging;
-    /// see `docs/ANALYSIS.md`, "Smart-pointer unwrap").
+    /// see `docs/IR.md`, "Smart-pointer unwrap").
     pub is_pointer: bool,
     /// True for a global definition, including C tentative definitions.
     pub is_defined: bool,
@@ -72,7 +72,7 @@ pub struct Variable {
     /// The kind of an intermediate value lowering synthesized (`_ret12`,
     /// `$make7`); `None` for every declared variable. A variant merge pairs
     /// temporaries by this kind and their position, never by name (see
-    /// `docs/ANALYSIS.md`, "Bounded conditional-variant exploration
+    /// `docs/USAGE.md`, "Bounded conditional-variant exploration
     /// (`--explore`)", on locals and temporaries).
     pub temp: Option<TempKind>,
 }
@@ -89,6 +89,8 @@ pub enum TempKind {
     Load,
     /// A call's return value, or another value temporary.
     Ret,
+    /// The call occurrence in a direct `return callee()` fact.
+    ReturnedCall,
     /// The pointee-typed receiver an overloaded `->` yields.
     Recv,
     /// A pointer extraction result whose type is its compatibility filter.
@@ -109,6 +111,7 @@ impl TempKind {
             TempKind::Gep => "_gep",
             TempKind::Load => "_load",
             TempKind::Ret => "_ret",
+            TempKind::ReturnedCall => "_returned_call",
             TempKind::Recv => "_recv",
             TempKind::Unwrap => "_unwrap",
             TempKind::New => "$new",
@@ -193,7 +196,7 @@ pub struct Function {
     /// The parameter list ends in a parameter pack (`Args &&...args`), which
     /// `explicit_arity` does not count: it takes any number of arguments,
     /// none included. A definition's pack is the last of `params`; a
-    /// prototype has no `params` (docs/ANALYSIS.md, "Variadic parameter
+    /// prototype has no `params` (docs/POINTERS.md, "Variadic parameter
     /// packs").
     pub has_pack_param: bool,
     /// A constructor declared `= default` or `= delete` in its class body. It
@@ -238,7 +241,7 @@ pub struct Function {
     /// others: `false` for `...`, the pack's own for a parameter pack. A
     /// prototype records it as a definition does, so a call can tell a
     /// reference parameter from a value one before any body is seen
-    /// (docs/ANALYSIS.md, "Dereferenced operands").
+    /// (docs/IR.md, "Dereferenced operands").
     pub reference_params: Vec<bool>,
     /// Declared `virtual` (C++ methods). Virtual dispatch expansion treats a
     /// method as virtual if *any* entry with its qualified name carries this
@@ -312,14 +315,14 @@ pub struct CallSite {
     /// condition or update, not a `for` init-statement or a range-for's
     /// range, and not the body of a lambda written in the loop (that is a
     /// function of its own). Evidence for execution contexts started here
-    /// (`docs/ANALYSIS.md`, "Execution contexts"); not part of the merge
+    /// (`docs/MODELS.md`, "Execution contexts"); not part of the merge
     /// identity, and a merged record is in a loop when any copy is.
     pub in_loop: bool,
     /// The call is in an operand the language never evaluates (the
     /// operand of `noexcept` or a `requires` expression, the controlling
     /// expression of `_Generic`, a call operand of `sizeof`, `alignof`,
     /// `decltype` or GNU `typeof`): it never runs, so it has no call edge
-    /// and no argument flow (`docs/ANALYSIS.md`, "Unevaluated operands").
+    /// and no argument flow (`docs/USAGE.md`, "Unevaluated operands").
     /// Part of the merge identity.
     pub unevaluated: bool,
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
@@ -340,7 +343,7 @@ pub struct CallSite {
     /// name (`queue.submit(f)`, `handler->PostTask(f)`, `this->Run()`, the
     /// object a constructor builds); `None` for a field, a call result or any
     /// other expression, and for a free function. Identity only: it is not
-    /// bound to the callee's `this` (`docs/ANALYSIS.md`, "Execution
+    /// bound to the callee's `this` (`docs/MODELS.md`, "Execution
     /// contexts").
     pub receiver: Option<VarId>,
     /// Originating translation unit, recorded by merge. Absent before merge.
@@ -782,7 +785,7 @@ pub fn spelled_alike(
         return true;
     }
     // What lowering reads a type it could not resolve as: `int`, or since
-    // #193 a class it guessed from the name (`docs/ANALYSIS.md`, "Undeclared
+    // #193 a class it guessed from the name (`docs/CXX.md`, "Undeclared
     // receiver classes"), which stands in wherever the `int` did.
     let stand_in = |t: &TypeDesc| matches!(t, TypeDesc::Int) || types.is_guessed_class(t);
     // `size_t` beside such a stand-in, as `may_name_same_type` reads `int`.
@@ -874,7 +877,7 @@ fn c_linkage_pair(a: &Function, b: &Function) -> bool {
 }
 
 /// Whether one side is what lowering reads an unresolved name as -- the
-/// `int` stand-in, or a class guessed from the name (`docs/ANALYSIS.md`,
+/// `int` stand-in, or a class guessed from the name (`docs/CXX.md`,
 /// "Undeclared receiver classes") -- and the other a function pointer that
 /// name may be a typedef of (a callback parameter, `OnChange cb`, which
 /// lowers as a pointer to `FnPtr`).
@@ -1932,7 +1935,7 @@ impl SymbolTable {
                     // whose types differ at all (`int`, `long`, `sptr<A>`,
                     // `sptr<B>`) are two entries; the fallback pass reads a
                     // definition's types as spelled alike
-                    // (docs/ANALYSIS.md, "Templates").
+                    // (docs/CXX.md, "Templates").
                     let theirs = self.explicit_params_with(existing, None);
                     let ours = self.explicit_params_with(func, param_types);
                     return theirs.zip(ours).is_none_or(|(theirs, ours)| {
@@ -2565,7 +2568,7 @@ impl SymbolTable {
     /// Resolve the callee of `dst = name()`. With a caller this is
     /// [`return_flow_candidates`](Self::return_flow_candidates); without one
     /// (a file-scope initializer) `dst`'s own file serves as both the unit
-    /// and the lookup file. Policy: `docs/ANALYSIS.md`, "Return-value flow".
+    /// and the lookup file. Policy: `docs/IR.md`, "Return-value flow".
     pub fn call_return_candidates(
         &self,
         caller: Option<FnId>,
@@ -2936,7 +2939,7 @@ impl SymbolTable {
     /// A missing header may import the receiver from another namespace.
     /// Keep its external leaf, but recover definitions of the same class
     /// spelling using the shared type comparison and name resolver. See
-    /// docs/ANALYSIS.md, "Undeclared receiver classes".
+    /// docs/CXX.md, "Undeclared receiver classes".
     fn undeclared_receiver_definitions(
         &self,
         cs: &CallSite,
