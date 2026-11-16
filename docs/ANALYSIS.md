@@ -144,12 +144,7 @@ own function bodies declaration-only. Cached project-header units import
 system prerequisites as declarations too, including callable return shapes
 needed by inferred initializers. Imports between cached project-header units
 retain the existing types-only path; system bundles import prerequisite
-declarations regardless of their origin. Canonical project headers replaying
-consumer lookup syntax also import prerequisite callable declarations, as
-described in the [preprocessor contract](PREPROCESSOR.md#shared-system-header-bundles).
-These imports preserve global variable types and parameters of retained functions;
-they do not recursively import bodies or orphan excluded functions' parameters.
-File-static/anonymous-namespace storage dependencies retain the inline fallback.
+declarations regardless of their origin.
 Function dependencies of initializer constraints include selected reference
 getter declarations. Missing function IDs are filtered before remapping, and
 TU replay follows these dependencies. Replayed internal functions' returned
@@ -338,7 +333,11 @@ search paths or basename fallback.
 
 An excluded definition must not erase its caller's external edge. External
 synthesis uses the shared resolver across all contributing translation units,
-including internal callees reached from header macros. An external synthesized
+including internal callees reached from header macros. A call site the
+contextual call resolver already binds, for example to an internal-linkage
+function visible from its unit or from any unit contributing a shared header
+call, is never bound to a synthesized external, so a header-static function
+declared nowhere in the unit's lowered text still resolves. An external synthesized
 after that lookup retains its result; it does not expand again by name into
 a different production overload.
 Unscoped C definitions in different inferred partitions also retain separate
@@ -5939,10 +5938,11 @@ headers use one fallback compiler for the project. GCC is preferred when it
 supplies both C and C++ search lists; otherwise Clang is tried. Reached
 external system headers have dependency ownership. Probe flag and executable
 path rules are specified in [Compilation database options](PREPROCESSOR.md#compilation-database-options-62).
-Bare-tree indexing can additionally use one shared compiler-default prelude
-with `--canonical-system-headers`; see
-[Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md) for its
-precision tradeoffs and the current whole-tree limitation.
+Bare-tree indexing can instead lower the compiler-default standard headers once,
+as one shared prelude, with `--canonical-system-headers`: project headers then
+follow the default sharing rules and translation units never hold standard
+text. See [Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md) for
+its precision tradeoffs and measurements.
 For C++ dependency headers, the parse input approximates simple
 pointer-to-member types (`T C::*`) as ordinary pointers (`T *`). This spelling
 confuses the tree-sitter C++ grammar, while dependency bodies are

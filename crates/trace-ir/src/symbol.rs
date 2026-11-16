@@ -1013,6 +1013,10 @@ pub struct SymbolTable {
     /// two sets is smaller only if both directions are indexed. Unordered,
     /// unlike its forward twin: nothing reads it but a membership test.
     includers_of: FxHashMap<FileId, FxHashSet<FileId>>,
+    /// Headers every file sees as if it included them: the standard headers
+    /// a canonical prelude read, whose macros start every preprocessing run
+    /// (`--canonical-system-headers`). Empty otherwise.
+    prelude_headers: FxHashSet<FileId>,
     file_by_path: FxHashMap<PathBuf, FileId>,
     /// Canonical dependency roots (`--dep`); empty for a single-tree run.
     dep_roots: Vec<PathBuf>,
@@ -1138,6 +1142,13 @@ impl SymbolTable {
         tu: crate::FileId,
     ) -> Option<&std::collections::BTreeSet<crate::FileId>> {
         self.headers_of.get(&tu)
+    }
+
+    /// Register a header every file sees, as one a canonical standard prelude
+    /// read: its macros reach every unit from the first line, so its
+    /// internal-linkage entities resolve in every unit too.
+    pub fn register_prelude_header(&mut self, header: crate::FileId) {
+        self.prelude_headers.insert(header);
     }
 
     pub fn add_function(&mut self, func: Function) -> FnId {
@@ -2306,10 +2317,16 @@ impl SymbolTable {
         if let Some(&(_, value)) = file_run(entries, file).1.iter().find(|(_, v)| accept(*v)) {
             return Some(value);
         }
-        let headers = self.headers_of.get(&file)?;
+        let headers = self.headers_of.get(&file);
+        if headers.is_none() && self.prelude_headers.is_empty() {
+            return None;
+        }
         entries
             .iter()
-            .find(|(f, v)| headers.contains(f) && accept(*v))
+            .find(|(f, v)| {
+                (headers.is_some_and(|h| h.contains(f)) || self.prelude_headers.contains(f))
+                    && accept(*v)
+            })
             .map(|(_, v)| *v)
     }
 
@@ -2323,7 +2340,11 @@ impl SymbolTable {
         let headers = self.headers_of.get(&file);
         let mut seen: Vec<(FileId, T)> = entries
             .iter()
-            .filter(|(f, _)| *f == file || headers.is_some_and(|h| h.contains(f)))
+            .filter(|(f, _)| {
+                *f == file
+                    || headers.is_some_and(|h| h.contains(f))
+                    || self.prelude_headers.contains(f)
+            })
             .copied()
             .collect();
         seen.sort_by_key(|(f, _)| (*f != file, *f));
@@ -2428,7 +2449,7 @@ impl SymbolTable {
     /// tree is tested against the few units that include the querying file
     /// rather than the other way round.
     fn any_unit_sees(&self, tus: &std::collections::BTreeSet<FileId>, file: FileId) -> bool {
-        if tus.contains(&file) {
+        if tus.contains(&file) || (!tus.is_empty() && self.prelude_headers.contains(&file)) {
             return true;
         }
         let Some(includers) = self.includers_of.get(&file) else {
@@ -2451,6 +2472,7 @@ impl SymbolTable {
                 .headers_of
                 .get(&file)
                 .is_some_and(|headers| headers.contains(&other))
+            || self.prelude_headers.contains(&other)
     }
 
     /// [`SymbolTable::file_sees`] widened by `file`'s includers: code in

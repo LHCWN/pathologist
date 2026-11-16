@@ -18169,6 +18169,12 @@ the coverage checker's 12 Python tests pass.
 
 ## System-include probe reuse and standard-header sharing - 2026-11-12
 
+The cross-directory probe reuse described here was later withdrawn: a compiler
+wrapper can choose an SDK relative to its working directory while printing
+absolute paths, so every working directory keeps its own probe again (see
+[Canonical prelude at default-mode cost](#canonical-prelude-at-default-mode-cost-2026-11-16)).
+The directory measurements below describe the withdrawn reuse.
+
 `--system-includes` with a compilation database asked the compiler once per
 distinct command directory. The probe answers for the same executable and
 target/sysroot/standard flags are identical when the compiler prints absolute
@@ -18198,6 +18204,11 @@ measured change. The tracked synthetic layouts (`direct`, `shared`, `unique`)
 also match exactly across 45,237-45,269 rows with the same release build.
 
 ### Standard headers after project declarations
+
+Withdrawn in review of the canonical-prelude change: ordinary indexing keeps
+the declaration/preamble gate for compiler-default roots again (see
+[Canonical prelude at default-mode cost](#canonical-prelude-at-default-mode-cost-2026-11-16)).
+The measurements below describe the withdrawn relaxation.
 
 Bare-tree indexing used to keep every system header inline once a project
 declaration or project-header preamble preceded it. No cache entry was made, so
@@ -18341,6 +18352,9 @@ python scripts/bench_system_includes.py --baseline /path/to/old/trace \
 ```
 
 ### Canonical header reuse finalization (2026-11-15)
+
+Superseded by [Canonical prelude at default-mode cost](#canonical-prelude-at-default-mode-cost-2026-11-16),
+which replaces this design; the figures below describe the replaced design.
 
 The final design is documented in [Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md),
 with authoritative lookup/storage rules in
@@ -18513,3 +18527,189 @@ probe suite reports nine passes and two `.EXE` versus `.exe` casing assertion
 failures in executable-lookup tests. No new whole-tree performance measurement
 was made for these review corrections; the table above remains a measurement
 of the preceding finalized configuration.
+
+### Canonical prelude at default-mode cost (2026-11-16)
+
+The canonical mode was redesigned so that standard headers never reach a
+translation unit and project headers follow the default sharing rules. The
+design and the investigation of the previous canonical implementation are in
+[Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md); the contract is
+[Canonical system preamble](PREPROCESSOR.md#canonical-system-preamble).
+
+Setup: `ability_ability_runtime` at `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`
+(3,331 TUs, 2,992 headers), bare tree, Ubuntu GCC 15.2 installed headers, an
+8-vCPU Linux VM (Xeon Skylake, 11 GiB), release builds, `--jobs 8`, `TMPDIR`
+on the home volume. The default runs use master `2a51d50`, the previous
+canonical design is `bcb4469`, and the new design is this change. Default and
+new runs alternate, three each; the previous design ran twice. Wall time and
+peak RSS come from `/usr/bin/time -v`; phases are the CLI's wall times.
+
+| Complete tree | Default (no system headers) | Previous canonical | New canonical |
+|---|---:|---:|---:|
+| Wall time, median | 157.4 s | 520.7 s | **162.9 s** |
+| Wall time, samples | 155.3 / 157.4 / 157.5 s | 517.3 / 524.1 s | 154.9 / 162.9 / 163.1 s |
+| Index, median | 106.5 s | 452.8 s | 109.8 s |
+| Preprocess | 13.7 s | 92.3-93.6 s | 14.8 s |
+| Header units (PCH) | 11.9 s, 2,410 units | 75.2-77.4 s, 1,332 units | 11.8 s, 2,410 units |
+| Translation units | 60.4 s | 147.2-152.1 s | 59.4 s |
+| Analyze / export | 10.9 / 36.9 s | 14.9 / 46.6-51.9 s | 12.3 / 38.5 s |
+| User CPU, median | 543.9 s | 2,054 s (second run) | 562.3 s |
+| Peak RSS, median | 1,781 MiB | 2,761 MiB | 1,782 MiB |
+
+The new mode takes **3.5% longer** than default indexing at the median, with
+the same peak memory; the previous canonical design took 3.3 times as long.
+Its indexing counters match default indexing's (summed across workers, single
+`TRACE_PROFILE_INDEX=1` runs):
+
+| Counter | Default | Previous canonical | New canonical |
+|---|---:|---:|---:|
+| `source-lower` | 8,404 calls, 214.4 s | 5,632 calls, 848.6 s | 8,404 calls, 217.9 s |
+| `syntax-parse` | 93.5 s | 400.7 s | 95.1 s |
+| `ast-lower` | 112.5 s | 400.7 s | 114.9 s |
+| `preamble-build` | 89 calls, 3.1 s | 3,247 calls, 220.8 s | 89 calls, 3.2 s |
+| `merge-symbols` | 336,111 calls, 134.7 s | 517,124 calls, 224.9 s | 336,111 calls, 136.3 s |
+| System bundles refused | 0 | 2,414 not at boundary, 29 incomplete | 0 |
+
+The remaining wall-time difference is the prelude run (preprocessing about
+0.5 s on the critical path; its 2.9 s of lowering overlaps the warm pass), a
+warm pass about 2.5 s slower because every run starts from a 7,835-binding
+standard macro table and standard macros now expand in project headers, and
+analysis/export of the additional standard declarations and edges.
+
+Output, as summarized by the CLI:
+
+| Complete tree | Default | Previous canonical | New canonical |
+|---|---:|---:|---:|
+| Functions (external) | 82,301 (13,653) | 90,719 (22,093) | 90,856 (22,207) |
+| Call edges | 688,898 | 829,327 | 731,030 |
+| Direct / indirect | 351,910 / 1,849 | 449,555 / 1,846 | 350,910 / 1,847 |
+| External / IPC | 333,377 / 1,762 | 376,161 / 1,765 | 376,511 / 1,762 |
+| Argument-flow edges | 476,232 | 656,104 | 548,141 |
+| Overload-tie call sites (`name::<id>`) | 6,719 | 97,310 | 6,719 |
+| External edges to standard declarations | 134 | 88,096 | 88,094 |
+| Diagnostics | 16,590 | 12,847 | 11,794 |
+
+Comparing distinct (caller, callee, call-site file) triples per resolution
+with default indexing, the new mode keeps all 163,048 distinct direct edges
+and adds none. Its 1,000 fewer direct occurrences are overload ties in
+`JSUtils::Convert2Value` / `Convert2JSValue` that standard macros now
+disambiguate; the previous design lost the same ties. It differs in 2 + 2
+indirect triples and gains 134 / loses 48 external triples, all through
+standard macros (`errno` as `__errno_location`, `va_start`/`va_end` as their
+builtins, glibc's `strerror_r` redirect). The previous design lost 479 and
+gained 629 distinct direct triples, and its 94,024 extra direct occurrences
+were mostly duplicate overload-tie sites of the same calls.
+
+The 236-TU `services/abilitymgr` subset, same setup, medians of three
+alternating runs (ordinary `--system-includes` once):
+
+| Subset | Wall | Peak RSS | Direct edges | Distinct direct triples vs default |
+|---|---:|---:|---:|---|
+| Default | 7.59 s | 192 MiB | 10,183 | 8,506 |
+| Ordinary `--system-includes` | 85.01 s | 872 MiB | 6,549 | 3,121 lost, 17 new |
+| Previous canonical | 19.48 s | 279 MiB | 10,401 | identical |
+| New canonical | 9.30 s | 345 MiB | 10,183 | identical |
+
+On the subset the one-time prelude is a larger share of the work. Its lowering
+overlaps the short warm and discovery passes there, which raises the subset's
+peak by about 120 MiB; on the complete tree it finishes during the warm pass
+and the peak is unchanged. Ordinary
+`--system-includes` loses most of its direct edges through member calls on
+`std::shared_ptr` receivers that its per-unit standard typing cannot follow,
+so it is not a precision reference for the project call graph.
+
+Validation:
+
+- The new design's complete-tree output is identical with four and eight
+  workers, across builds that lower the prelude on the main thread or on its
+  own thread with a private graph, and with `--canonical-system-headers`
+  alone or together with `--system-includes`: **9,286,412 analysis rows**,
+  excluding `analysis_run` and `database_identity`. The corpus checkout has
+  no untracked files afterwards.
+- The subset exports **567,165 identical rows** with one and eight workers.
+- Default indexing with this change exports all **8,889,011** analysis rows of
+  master `2a51d50` unchanged on the complete tree (`database_identity` differs
+  only through the version string in `analysis_run`).
+- Regressions: `canonical_prelude_seeds_every_run_and_skips_only_the_headers_it_read`
+  (closure from the first line, project overrides after it, covered and
+  uncovered standard headers, per-configuration seeding, live/frozen/deferred
+  cache modes), `canonical_mode_lowers_project_headers_like_default_indexing`
+  (equal call sites to default indexing with one and three workers, no
+  duplicate sites), and the existing `canonical_system_tests` and
+  scratch-file tests.
+
+Review follow-up: each language now gets its own preamble from the units and
+headers it preprocesses, searched under its compiler-default roots without
+explicit `-isystem` trees, and its prelude unit is identified as
+`.trace-canonical-std-c.prelude` / `.trace-canonical-std-cpp.prelude` under
+the first such root, so the identity is dependency-owned and the two
+languages' units are distinct. On the complete tree (C++ only) this changes
+exactly one exported row: the prelude's `files` entry, now at
+`/usr/include/c++/15/.trace-canonical-std-cpp.prelude` with `is_dep = 1`
+instead of `<root>/.trace-canonical-std.tmp` with `is_dep = 0`. All other
+9,286,411 rows are unchanged, and the output is identical with four and eight
+workers. The mixed-language regression
+`mixed_trees_build_one_prelude_per_language` covers a root shared by C and
+C++. A second round makes a prelude lowering failure an error (indexing has
+already started from the closure by then), treats `-idirafter` roots as
+explicit like `-isystem`, and shares one probe classification
+(`apply_probed_search`) between bare-tree and compilation-database indexing,
+so caller-declared compiler roots survive both; none of these changes the
+complete-tree output. A third round classifies include-environment
+directories (`CPATH`, `C_INCLUDE_PATH`, …) as user configuration rather than
+compiler defaults, admits only plain relative preamble spellings that stay
+inside their root (and falls back to ordinary indexing if the prelude reads
+a file outside the roots), validates the prelude's headers but not its
+scratch file under `--require-local-inputs`, and lets the library option
+discover compiler roots like the CLI flag. The corpus sets no include
+environment variables and has no such spellings, so its complete-tree output
+is again unchanged. A fourth round keeps the environment provenance when
+macro discovery copies the host fallback's search list, and imports the
+prelude's own diagnostics once, naming the prelude by its stable identity:
+covered headers never run again, so their reports had been lost. On the
+complete tree this adds six `diagnostics` rows (11,788 to 11,794, as in the
+output table): five `unknown directive #include_next` warnings in libstdc++
+and GCC headers (`cstdlib`, `cmath`, `bits/std_abs.h`, `stdint.h`,
+`syslimits.h`) and the prelude unit's parse-error summary. All 9,286,418
+rows are identical with four and eight workers. A fifth round makes covered
+headers' `static` functions resolve in every consuming unit (the prelude
+holds the header texts, every unit of the language registers the covered
+headers, and a site that sees an internal function of its callee name is not
+bound to a synthesized external) and shares a probe across build directories
+only after a second directory confirmed the same absolute answer. On the
+complete tree this registers 33 extensionless standard headers as unit
+includes, so the `files` table has 6,783 rows and file IDs are renumbered;
+`compare_semantics` finds all 3,283,442 normalized rows and every call edge
+unchanged, the export is identical with four and eight workers (9,286,451
+rows), and default indexing still matches master row for row. A sixth round
+withdraws cross-directory probe reuse altogether (two matching directories
+do not prove a third answers the same), and lets shared project-header
+bodies bind covered `static` functions: instead of registering 437 covered
+headers in every unit, which cost about 8 s of indexing and 190 MiB of peak
+memory once header units took part, the symbol table keeps one set of prelude
+headers every file sees, and synthesized externals defer to the contextual
+call resolver (`Program::callees_of`). A seventh round withdraws the first
+version's sharing of compiler-default headers after project declarations in
+ordinary `--system-includes` indexing. On `services/abilitymgr` it had changed
+248 project signatures and lost 14 distinct direct edges against master,
+without a speedup (88.9 s against 82.9 s); with it withdrawn, ordinary
+indexing of that subset exports master's 646,088 rows exactly. An eighth
+round keeps C++ library headers out of a C prelude (a header reached only
+through a macro counts as C++ in a mixed tree, and the C preamble admits only
+`.h` spellings) and applies the closure after the complete command-line seed
+and the builtin fallbacks, in the prelude run's order, so a standard header's
+redefinition of a `-D` macro or `#undef` of a builtin name holds in every
+consumer. A ninth round runs the prelude preprocessing on a thread with the
+indexing stack size, so a self-including standard header reaches the
+include-depth limit and the fallback instead of overflowing a small caller
+stack, and corrects the `compiler_system_include_paths` API docs.
+
+Reproduce:
+
+```bash
+cargo build -p trace-cli --release
+TMPDIR=/path/with/space target/release/trace analyze /path/to/ability_ability_runtime \
+  --jobs 8 --timeout-secs 3600 -o /tmp/default.db
+TMPDIR=/path/with/space target/release/trace analyze /path/to/ability_ability_runtime \
+  --canonical-system-headers --jobs 8 --timeout-secs 3600 -o /tmp/canonical.db
+```

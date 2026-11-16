@@ -6,35 +6,40 @@ All notable changes to `trace` are documented in this file.
 
 ### Preserve files and directory context during system-header indexing
 
-Canonical preambles now use exclusively created, run-owned temporary files,
-preserving existing files and links and separating concurrent analyses. Their
+Canonical preambles now use exclusively created, run-owned temporary files in
+the system temporary directory, never in the analyzed tree, preserving
+existing files and links and separating concurrent analyses. Their
 synthetic IR identity stays stable for reproducible exports. Compiler probes
-with relative or empty environment include paths remain scoped to the command
-directory even when the compiler omits those paths from its printed search list.
+stay scoped to their command directory: a wrapper can choose an SDK relative to
+its working directory while printing absolute paths, so a probe is never reused
+for another directory.
 
-### Index compiler standard headers as one canonical preamble
+### Index compiler standard headers as one canonical prelude
 
 Bare-tree `--system-includes` re-lowered standard headers for every
-translation unit. `--canonical-system-headers` now builds one canonical
-compiler-default header environment, lowers one shared prelude `UnitIndex`
-per language, and merges it into the final program once. Translation units no
-longer clone the prelude; project and external source headers keep their own
-units. The mode is opt-in and ignored with configured indexing.
+translation unit. `--canonical-system-headers` (which implies
+`--system-includes`) preprocesses the tree's standard includes once, inline,
+lowers them to one shared prelude per language, and merges it into the final
+program after the translation units. The same run yields the prelude's macro
+closure: every preprocessing run starts from it, and an include of a header the
+prelude read contributes nothing. Standard headers therefore never reach a
+translation unit, and project headers follow exactly the default sharing rules.
+Each language's prelude reads only the standard spellings its own units reach,
+under its compiler-default roots, and is exported as a dependency-owned unit.
+Directories from include environment variables such as `CPATH`, and explicit
+`-isystem`/`-idirafter` trees, are searched but never treated as compiler
+defaults, by either bare-tree or compilation-database probing. Ordinary
+`--system-includes` and default indexing keep their previous output.
 
-The follow-up applies the canonical macro closure at the first standard include,
-preserves project lookup syntax at its include position, and reuses bounded
-project preambles. Prerequisite declaration imports preserve variable/function
-ownership and implicit initializer dependencies; file-static storage and unsafe
-scope cases retain the inline fallback. Include-graph updates avoid repeated
-canonicalization and quadratic duplicate checks. Explicit system roots retain
-normal configuration-sensitive caching.
-
-The complete-tree cost is substantially lower than the initial implementation,
-but default-mode parity is not established. This remains a deliberate trade in
-macro configuration, overload and standard-library typing precision. See the
-[final design and investigation](docs/CANONICAL_SYSTEM_PRELUDE.md),
-[measurements and validation](docs/EVAL_REPORT.md#canonical-header-reuse-finalization-2026-11-15),
-and [preprocessor contract](docs/PREPROCESSOR.md#shared-system-header-bundles).
+On the complete `ability_ability_runtime` tree (Linux, eight workers) the mode
+takes about 3.5% longer than default indexing, with the same peak memory,
+instead of 3.3 times as long. Its call graph keeps every distinct default-mode
+direct edge and binds standard calls to the prelude's declarations. The mode
+is opt-in, an explicit trade in standard-library configuration and typing
+precision, and ignored with configured indexing. See the
+[design and investigation](docs/CANONICAL_SYSTEM_PRELUDE.md),
+[measurements](docs/EVAL_REPORT.md#canonical-prelude-at-default-mode-cost-2026-11-16)
+and [preprocessor contract](docs/PREPROCESSOR.md#canonical-system-preamble).
 
 ### Look up call sites by ID with a binary search
 

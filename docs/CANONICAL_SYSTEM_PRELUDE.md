@@ -1,29 +1,25 @@
 # Canonical system-header prelude
 
-Status: experimental, opt-in with `--canonical-system-headers`. The follow-up
-reduces complete-tree cost substantially, but does not establish parity with
-default indexing. This document describes the final design and investigation;
-the [evaluation report](EVAL_REPORT.md#canonical-header-reuse-finalization-2026-11-15)
-holds the current measurements and validation results. Historical measurements
-below describe earlier implementations, not the final performance claim.
+Status: experimental, opt-in with `--canonical-system-headers` (which implies
+`--system-includes`). On the complete `ability_ability_runtime` tree it indexes
+the host compiler's standard headers at about 3.5% over default-mode wall time
+and the same peak memory, instead of 3.3 times the default time; the [evaluation report](EVAL_REPORT.md#canonical-prelude-at-default-mode-cost-2026-11-16)
+holds the measurements. The [preprocessor contract](PREPROCESSOR.md#canonical-system-preamble)
+is authoritative for the rules summarized here.
 
 ## Motivation
 
 Bare-tree `--system-includes` asks the host compiler for its default search
-paths and then indexes the reached standard-library headers.  Those headers
+paths and then indexes the reached standard-library headers. Those headers
 are large and every translation unit reaches a similar closure, so the same
-tokens are preprocessed, parsed, lowered and merged repeatedly.  On the
-`services/abilitymgr` subset this was the dominant cost:
+tokens are preprocessed, parsed, lowered and merged repeatedly. Ordinary
+`--system-includes` takes 83-91 s on the 236-TU `services/abilitymgr` subset
+against 7.6 s without it, and historically about 750 s and 6.5 GiB on the
+complete tree.
 
-| Mode | Wall time | Peak RSS |
-|---|---:|---:|
-| Bare tree, no system includes | 4.5 s | - |
-| `--system-includes` | 90.8 s | 580 MiB |
-| `--system-includes --canonical-system-headers` | 21.5 s | ~300 MiB |
-
-The target was to remove the per-translation-unit standard-library work while
-keeping the existing project-header indexing behavior and dependency ownership
-rules.
+The goal is the default mode's cost and project behavior, plus standard-library
+macros and declarations: what the default mode would see if the standard
+headers it cannot find were available once, in one configuration.
 
 ## Design
 
@@ -31,20 +27,31 @@ rules.
 
 - `trace analyze --canonical-system-headers` sets
   `PreprocessOptions::canonical_system_headers` (builder:
-  `with_canonical_system_headers`).
-- The mode is only built by the bare-tree (`build_program_inner`) path.  With a
+  `with_canonical_system_headers`) and turns on `--system-includes`. The
+  library option discovers the compiler roots the same way unless the caller
+  declared them with `with_compiler_system_include` and set no `compiler`.
+- Only the bare-tree (`build_program_inner`) path builds a prelude. With a
   compilation database, shared command configuration, or link-target
   configured indexing the flag is ignored with a warning; each command has its
   own macro configuration and cannot share one prelude.
-- `TRACE_CANONICAL_SYSTEM_HEADERS` is an internal experiment hook.  It is not a
-  supported user-facing option.
 
 ### Preamble discovery
 
-`canonical_system_preamble` scans every discovered source and project header
-text (raw source cache when available, otherwise the file), collects the
-spellings of `#include <...>` whose file exists under a compiler-default root,
-sorts and deduplicates them, and writes:
+Each language gets its own preamble. `canonical_prelude_sources` assigns every
+discovered source and project header to the languages the indexer will
+preprocess it as: translation units by extension, a header to every language
+whose units reach it (C++ for C++ header spellings). A header the static
+include graph does not reach may still be included through a macro by a unit
+of either language, so it counts as C only in a tree without C++ units: a C++
+prelude reading a C header is harmless, while a C prelude reading a C++
+header would change every C unit. The C preamble also admits only `.h`
+spellings, since C's standard and platform headers all use that extension and
+a raw scan sees `#ifdef __cplusplus` arms too. A C prelude therefore never
+reads a C++ library header, even when one root serves both languages.
+`canonical_system_preamble` scans those files (raw source cache when
+available, otherwise the file), collects the spellings of `#include <...>`,
+deduplicates them, keeps the plain relative spellings that resolve inside the
+language's compiler-default roots, and writes:
 
 ```c
 #include <algorithm>
@@ -52,241 +59,239 @@ sorts and deduplicates them, and writes:
 ...
 ```
 
-to an exclusively created `.trace-canonical-std-<random>.tmp` file in the target
-root. Each indexing run owns a `NamedTempFile`, including cleanup on failure;
-concurrent runs cannot truncate or remove each other's preambles. An existing
-`.trace-canonical-std.tmp` file, symlink or hard link is never opened for writing
-or removed. The extension avoids discovery as a source/header. The file-probe
-epoch is advanced after writing so later `is_file` checks see the new file.
-Before the prelude enters the final program, its private scratch path is mapped
-to the stable synthetic IR identity `.trace-canonical-std.tmp`. Random names
-therefore do not change exported file identities across runs or worker counts.
+to an exclusively created `.trace-canonical-std-<random>.tmp` file in the
+system temporary directory. Indexing never writes into the analyzed tree, so a
+run stopped by a signal or by the `--timeout-secs` watchdog cannot leave the
+file there. Each indexing run owns a `NamedTempFile`, including cleanup on
+failure; concurrent runs cannot truncate or remove each other's preambles,
+and an existing file, symlink or hard link is never opened for writing or
+removed. In the final program the scratch path has a stable synthetic
+identity per language, `.trace-canonical-std-c.prelude` or
+`.trace-canonical-std-cpp.prelude` under the language's first
+compiler-default root, so random names never change exported file
+identities, the two languages' preludes are distinct units, and the
+identity has the dependency ownership of the headers it stands for. Each
+distinct spelling is probed once through the shared directory-listing cache.
 
-Spellings are deduplicated **before** searching the roots, including spellings
-that do not resolve there. Each distinct spelling is probed once through the
-shared directory-listing cache, rather than issuing filesystem probes for
-every occurrence in every source/header.
+The scan reads raw lines, before preprocessing, so it over-approximates: an
+include in an inactive `#if` arm, in a block comment or in a configuration the
+tree never builds still enters the preamble. The prelude then lowers
+declarations no unit includes, and the closure carries those headers' macros
+and include guards into every unit, even one that never included them. A spelling such as
+`<../project/own.h>` or an absolute path is never admitted: its first match
+must stay inside the root it was found in, so a project header cannot become
+a symbols-only prelude member. If the prelude run nevertheless reads a file
+outside the compiler-default roots (a symlink out of a root, a relative
+include climbing out), indexing falls back to ordinary `--system-includes`.
 
-The roots include every path reported by the compiler probe
-(`project_compiler_paths`) and explicitly supplied
-`compiler_system_include_paths`.  Explicit `-isystem`/`-idirafter` paths are
-not added by this step; a project can place aliases there, so those headers
-keep the existing per-consumer gate.
+The roots are the language's compiler-default roots: the probe's search list
+without explicit `-isystem`/`-idirafter` trees or directories the include
+environment variables (`CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`, …)
+supplied (see `apply_probed_search`), followed by any
+`compiler_system_include_paths` the caller supplied. Explicit and environment
+roots are left out because a project can place aliases there. With
+`--require-local-inputs`, the headers the prelude reads are validated like
+any other input; the scratch preamble itself is the indexer's own file and is
+not.
 
-### One expansion per compiler-default header
+### One prelude run per language
 
-Canonical mode uses a fixed configuration for compiler-default system paths:
+For each language present in the tree, the preamble is preprocessed once,
+inline (`inline_include_bodies`, no expansion cache, enlarged limits: 512 MiB
+output, 200M expanded tokens, include depth 128, 256 expansions per file).
+That run searches only the language's compiler-default roots, with no
+project, explicit system, inferred or basename search and no forced includes,
+so neither a project mock of a standard spelling nor an explicit system tree
+enters the shared state. It produces three things:
 
-- `PreprocessorState::canonical_system` recognizes a path under the system
-  compiler-default roots that is not in `separate_header_paths`.
-- `matching_variant` returns the first stored variant and ignores the macro
-  dependency fingerprint for those paths.
-- `publish_variant` is first-wins for them and returns variant 0 even when the
-  one-variant journal budget is full.
-- `ExpansionJournal` takes a canonical one-variant cap only under compiler-default
-  roots. Project headers and explicit system roots retain the normal cap
-  (`with_project_cap`/`cap_for`).
-- `is_cacheable_header` relaxes the project-preamble and boundary gates for
-  canonical bundles, including nested system headers and headers reached after
-  project declarations.
-- Completion refusals (`uncovered`, context-sensitive, conservative preamble)
-  are not applied to canonical bundles.
+1. **Declarations.** The output is lowered as one header `UnitIndex` and
+   compacted (merge descriptors, header-merge type compaction, no flow or
+   initializer ranges). Lowering runs on its own thread with the indexing
+   stack size while the sequential warm pass proceeds; it needs only the
+   dependency roots and path interning, so it uses a private graph instead of
+   the growing project graph. The unit is merged into the final `Program`
+   once, after project headers and translation units, so it never enlarges
+   the dedup tables those merges consult. Its diagnostics (`#warning`s,
+   missing nested includes) are imported with it, once: covered headers
+   never run again, so the prelude is the only place they can report.
+2. **Macro closure.** `PreprocessOptions::record_macro_ops` captures the
+   directives the run executed, excluding the initial predefined, compiler
+   and command-line definitions. `CanonicalSystemPrelude::new` keeps each
+   name's last directive, in order.
+3. **Covered headers.** The files the run read.
 
-A cache-priming pass records the macro closure and first standard variants
-before discovery, separately from the inline preprocessing/lowering pass below.
-Covered includes use the lazy closure; uncovered paths retain canonical variants.
+If the run hits a resource limit or fails, indexing warns and falls back to
+ordinary `--system-includes` for the whole tree, rather than mixing a partial
+prelude with per-consumer standard headers. Every limit (output size, token
+budget, include depth, expansions per file) clears `PreprocessResult::complete`.
+The run executes on its own thread with the indexing stack size, since its
+include depth is twice the ordinary one and each level recurses: on the
+caller's stack (1 MiB on a Windows main thread) the depth limit could
+overflow before it falls back. Lowering finishes only after
+indexing has started from the closure, so a lowering failure stops the
+analysis with an error that suggests rerunning without the flag; a database
+with standard macros but without their declarations would be neither mode.
 
-#### Lazy standard macro closure
+### Every run starts from the closure
 
-The indexer records the canonical preamble's
-executed macro directives (`PreprocessOptions::record_macro_ops`, returned in
-`PreprocessResult::macro_ops`). Initial compiler/command definitions are excluded.
-The resulting language-specific closure is applied only when a consumer first
-reaches a canonical standard header at a declaration boundary, never at TU startup.
-Covered standard includes then contribute no per-consumer declaration records:
-their IR is already in the final prelude. Replaying those records would repeatedly
-copy standard-header dependency closures into project entries. Only files covered
-by the matching language's lowered prelude can take this shortcut; unscanned
-standard headers retain ordinary declaration units. Project entries which install
-the closure retain its ordered operation log and mark that replay supplies the
-same macro environment. Fingerprint checking
-for project headers remains enabled. Incoming cold/primed state participates
-in fingerprints and deferred journal validation, so a cached cold entry cannot
-reset project overrides made after an earlier standard include. The state check
-also prevents an entry built after installation from skipping installation in a
-cold consumer, even when that header itself never reads a standard macro.
+`PreprocessOptions::canonical_system_preludes` carries the per-language
+preludes into indexing. Every preprocessing run of that language — warm,
+discovery, settle, orphan headers and translation units — starts from the
+closure, applied in the prelude run's own order: after the predefined,
+compiler and command-line definitions (including compilation-command macro
+operations) and the builtin fallback macros. A run seeded only by
+predefined, compiler and `-D` definitions depends on nothing else, so its
+starting table (with the fallback names) is built once per configuration
+(`canonical_base_key`) and cloned; a run with compilation-command macros
+applies the closure once its seed is complete: the C++ closure of `ability_ability_runtime`
+has 7,835 bindings, and the warm pass alone has 2,451 sequential runs. The closure
+is the run's baseline: it is not recorded in the deferred-publication history
+or in any cache entry's operation log.
 
-This intentionally exposes the complete canonical standard macro closure at
-the first covered include, rather than the per-header portion. Conditional
-project code after that include can therefore differ from the original
-experimental canonical mode. It is part of the explicit canonical option; ordinary
-`--system-includes` retains per-include expansion. Forced includes,
-conditional recording/exploration, or project files reached by the preamble
-retain the existing path; project guards must never enter this closure.
+An `#include` that resolves to a covered header then contributes nothing to
+the run: no text, no directives (they are already in the closure), no cache
+entry, wherever it occurs — at file scope, inside `extern "C"`, or in the
+middle of a project header. Its declarations are in the prelude. A standard
+header that the prelude did not read, such as one reached only through a
+macro-spelled include, is found through the same search paths and expanded
+where it is included, under dependency ownership.
 
-### Prelude lowering and merge
+Indexing keeps `separate_system_headers` off. Standard headers therefore never
+become expansions, system bundles, PCH units or parts of a translation unit's
+text, and project headers are shared by exactly the default bare-tree rules.
+The PCH set, header-unit planning, preamble reuse and expansion-cache variant
+caps are the default ones.
 
-For each language present in the tree:
+### Why the closure is installed eagerly
 
-1. Build a `PreprocessOptions` with `separate_system_headers = false`,
-   `inline_include_bodies = true`, no expansion cache, and enlarged limits
-   (512 MiB output, 200M expanded tokens, 128 include depth, 256 expansions
-   per file).
-2. Preprocess the run's private preamble inline and lower it as one header
-   unit with `lower_prepared_source(..., LoweringUnit::Header, ...)`.
-3. Compact the resulting `UnitIndex`: merge descriptors, header-merge type
-   compaction, drop flow ranges and global initializer ranges, and shrink the
-   vectors.
+An earlier design applied the closure lazily, at a unit's first standard
+include at a declaration boundary, so project code before that include did not
+see standard macros. That made each project-header cache entry depend on
+whether its consumer was already "primed", required a cold/primed bit in macro
+fingerprints and deferred-journal validation, and made entries that first
+installed the closure carry its whole operation log for replay. Eager
+installation gives every run of a configuration the same starting table, so
+project-header fingerprints see stable bindings and none of that bookkeeping
+is needed. The observable difference is confined to project code that tests
+or redefines a standard macro before its first standard include; a real
+compilation of such code would reach the standard header later and see its
+definitions from then on.
 
-The prelude is merged into the final `Program` **once**, after project headers
-and translation units have been merged, using `merge_unit_symbols`.  Doing it
-before those merges made every later merge consult a much larger dedup table.
-Translation units do not clone the prelude.
+## Precision
 
-Canonical consumers also use the existing bounded reusable-preamble planner
-for project-only header lists. Ordinary system indexing admits lists that
-contain dependency units; that gate alone would disable reuse once canonical
-mode removes system units from the lists. Planning and lowering use the same
-admission rule. The existing limit of sixteen snapshots and ordered header
-identity remain unchanged; standard-library IR is still absent from them.
-The [follow-up measurements](EVAL_REPORT.md#canonical-project-preamble-reuse-follow-up-2026-11-13)
-show fewer symbol imports with unchanged normalized semantics, but no established
-end-to-end subset speedup.
+This mode is an explicit speed-for-precision trade relative to per-command
+standard headers, not a more precise model:
 
-Project and external source headers keep their own PCH units. Only headers
-under compiler-default roots actually covered by the matching language's
-prelude are removed from the PCH set. Macro-spelled or otherwise unscanned
-standard includes retain their declaration units. Dropping every
-non-project file (including external source headers) lost about 8,000 project
-call edges on the subset and was rejected.
+- **One standard-library configuration.** Each standard header is
+  preprocessed once, under the preamble's environment. Project macros that
+  would change a standard-library `#if` arm, a typedef or a declaration set
+  are not represented per unit, and `--explore` cannot vary them.
+- **Standard macros from the first line.** See above.
+- **No standard declarations while a unit is lowered.** The prelude joins the
+  program after the translation units. Member typing that needs a standard
+  type (for example `std::shared_ptr<T>::operator->`) follows the default
+  mode's heuristics instead. Calls to standard functions resolve by name
+  afterwards. The prelude holds each covered header's text, so a header's
+  `static` functions belong to that header, and every file sees the covered
+  headers (`SymbolTable::register_prelude_header`), as their macros reach every
+  unit from the first line. A call
+  to a header-static function therefore binds it in each unit; when another
+  unit also defines an external function of the same name, the name lookup
+  keeps both as may-candidates, where ordinary indexing binds the static one
+  while lowering.
+- **Project headers follow default sharing.** Using-declarations, file-static
+  data and namespace context of a shared project header have the default
+  mode's [shared-header approximation](ANALYSIS.md#shared-header-functions),
+  not the ordinary `--system-includes` mode's inline fallbacks.
+- **Configured indexing is unsupported.** The flag is ignored with
+  compilation-database or link-target configuration.
 
-### Project lookup and storage context
+Against default bare-tree indexing the mode only adds information: standard
+macros expand (`assert`, `NULL`, integer limits, format macros), and calls to
+standard functions bind to the prelude's declarations instead of external
+placeholders. On the complete tree it keeps every distinct default-mode direct
+call edge. The ordinary `--system-includes` mode is not a better reference for
+the project call graph: on the `services/abilitymgr` subset it loses 3,121 of
+the default mode's 8,506 distinct direct edges, mostly member calls through
+`std::shared_ptr` whose standard-library typing it cannot follow.
 
-The authoritative sharing rules are in
-[Shared system header bundles](PREPROCESSOR.md#shared-system-header-bundles).
-Their consequences for this mode are:
+## Investigation of the previous canonical design
 
-- Class-member `using Base::method` imports already have IR metadata and do
-  not require the whole header to stay inline. An include inside an existing
-  class, namespace or unfinished declaration still stays inline, including a
-  standalone-warmed fragment reached later in that scope.
-- Global and namespace/linkage using-declarations need syntax at the original
-  include position. A shared project header retains a `ConsumerContext`
-  projection containing those declarations, namespace aliases and the original
-  namespace/linkage wrappers. Inline namespace ownership and LineMap origins
-  survive. This prevents an import after a function from changing that earlier
-  function's lookup. Macro-expanded imports retain their original provenance.
-- Weak pragmas, malformed or unclassified scopes, and TU-specific data keep
-  the conservative inline fallback. File-static data and anonymous namespace
-  dependencies propagate through live includes, cached replays and guard skips.
-  Class static members and proven static function definitions do not by
-  themselves require this fallback. The fallback preserves callbacks through
-  file-static variables; declarations alone cannot supply their TU storage.
-- Project headers with a projection import prerequisite types, their own
-  callable declarations and global data declarations for body/result typing.
-  They do not recursively import prerequisite function bodies. Literal name
-  searches conservatively limit callable imports; constructors, destructors,
-  operators and templated names remain candidates, as do names used by stored
-  member initializers and default arguments. Substring matches may retain
-  extra prototypes and never select a single overload.
-- Parameters are imported only for functions retained in that declaration
-  import. Filtering functions while retaining their parameters turns those
-  parameters into ownerless entries and causes explosive growth through nested
-  headers. The regression test checks this ownership boundary directly.
-- An external header getter's return binding to an internal C++ function is
-  retained during TU replay even when its duplicate body was already merged.
-  The existing shared resolver and merger remain responsible for identity,
-  linkage and target selection; the projection does not introduce a resolver.
+The first complete design (`bcb4469` on `perf/canonical-system-prelude`)
+took 517-524 s on the complete tree on Linux, 3.3 times the default mode's
+155-157 s, with a 2.7 GiB peak against 1.7 GiB. It applied the closure lazily, kept per-variant canonical bundles in
+the expansion cache with a one-variant journal cap, and replaced the inline
+fallback for project headers with *consumer-context projections*: a project
+header whose only consumer effects were using-declarations shared its IR and
+replayed a syntax projection of those declarations at each include position.
+Headers with file-static data, anonymous namespaces, weak pragmas or unclear
+scopes stayed inline in every consumer.
 
-The [shared-project-header approximation](ANALYSIS.md#shared-header-functions)
-still applies to implicit incoming declarations. This is not an immutable base
-symbol table or a complete C++ module implementation.
+Instrumenting each lowered unit's text and inline headers showed where the
+time went:
 
-### Bookkeeping and cache lifetime
+- **Project headers stayed inline in most translation units.** Translation
+  units held 541 MiB of preprocessed text in total. Headers such as
+  `extension_ability_info.h`, `ability_info.h`, `configuration.h` and
+  `hilog_tag_wrapper.h` were inline in 1,500-2,100 units each: the static-data
+  fallback propagates to every cache frame that includes such a header, so
+  one logging header with a `static` helper disqualified most of the tree.
+  Summed `syntax-parse` and `ast-lower` were 401 s each, against 94 s and
+  112 s for default indexing; `preamble-build` ran 3,247 times for 221 s,
+  against 89 times for 3 s.
+- **Standard headers were not the problem.** They were inline only 585 times
+  across all units.
+- **The sequential warm pass took 87 s**, against 6 s for default indexing.
+- **Duplicate call sites.** A header both inline in a unit and imported
+  through its preamble produced overload ties between two copies of the same
+  function. The database had 97,310 overload-tie call sites against 6,719 for
+  default indexing; every `TAG_LOG*` expansion produced two sites calling
+  `GetTagInfoFromDomainId`. Most of that design's extra 94,000 direct call
+  edges were these duplicates, not additional precision.
 
-Warm runs use fresh local macro tables with normal compiler/CLI precedence.
-The former accumulating warm table was written but never consumed by later
-TUs; removing it avoids unnecessary macro-table locking without introducing a
-union of project macros. Cached entries still replay their ordered directives.
+The redesign drops the projection, the static-data fallback, the lazy closure
+and the canonical cache policy, and lets project headers follow the default
+rules. The default mode already accepts their approximation; the canonical
+mode's purpose is to add standard-library knowledge to it, not to change how
+project headers are shared.
 
-Include-graph updates trust paths already interned in either canonical file
-set and use a membership set for large edge lists. New edges retain input
-append order; hash iteration never controls exported order. This avoids
-quadratic duplicate checks when preprocessing reports transitive closures.
+### Rejected or superseded in this redesign
 
-Header expansion retirement, orphan settlement, bounded source admission and
-the sixteen-snapshot preamble limit retain their existing phase order. The
-follow-up does not replace the custom preprocessor or weaken project macro
-fingerprints to manufacture cache hits.
+- **Rebuilding the closure in every run.** Replaying its 7,835 bindings
+  through the ordinary macro mutation path (journal records, hashing) made
+  the sequential warm pass 12.5 s, and a bulk insertion 11.6 s, against 6.4 s
+  for default indexing. Cloning one seeded table per configuration brings it
+  to 8.3-9.2 s; the remainder is mostly the standard macros now expanding in
+  project headers.
+- **Lowering the prelude before the warm pass** added its 2.9 s to the
+  critical path; it now overlaps the sequential warm pass. Lowering it with a
+  private graph produced all 567,165 subset and 9,286,412 complete-tree
+  analysis rows unchanged.
+- **Reusable project-only preambles** (planned when canonical mode removed
+  system units from preamble keys) are not used: with default sharing the
+  default admission rule applies and preamble building costs what it does in
+  default indexing.
 
-### Why the final program is merged late
+## Compile-commands companion change
 
-The earlier design inserted the prelude into every translation unit's selected
-header list.  That matched per-consumer standard-library typing more closely
-(18,403 project direct edges against 18,428 for ordinary system indexing) but
-cloned the prelude program for every unit.  On the subset it peaked near
-405 MiB; on the full tree it was 478 s and 2,710 MiB.  The final merge removes
-the per-unit clone and lowers the subset to 21.5 s / ~300 MiB, at the cost of
-not having standard declarations available while a translation unit is
-lowered.  Project smart-pointer typing can therefore move toward the no-system
-result; the full-tree output has more project edges (765,893 vs 705,900), not
-fewer.
-
-### Deliberate precision loss
-
-This mode is an explicit speed-for-precision trade, not a more precise model.
-The accepted losses are:
-
-- **One macro configuration for all translation units.** A standard header is
-  expanded once, under the preamble's macro environment. Project macros that
-  change a standard-library `#if` arm, a typedef spelling, an inline overload,
-  or a declaration set are not represented per unit. This can change function
-  signatures, add or remove declarations, and change which overload a call
-  binds to.
-- **No standard declarations during translation-unit lowering.** The prelude
-  is merged into the final `Program` after project headers and TUs. Code that
-  needs a standard type to infer a member call (notably
-  `std::shared_ptr<T>::operator->` and related smart-pointer unwrapping) can
-  lower differently or lose a member call. The subset gained project edges
-  (18,428 -> 22,949) rather than losing them, but that is a movement toward the
-  no-system result, not evidence of greater accuracy.
-- **Conditional variants are collapsed.** The first stored expansion wins for
-  compiler-default roots. `#if` arms, feature macros, and ABI/type differences
-  selected by project defines are not explored; `--explore` cannot recover
-  them for these paths.
-- **The result is not semantically equivalent to ordinary
-  `--system-includes`.** On the subset, functions changed from 17,149 to
-  14,905, project direct edges from 18,428 to 22,949, and 154,019 normalized
-  semantic rows were deterministic between canonical runs but not equal to the
-  ordinary run. Treat this mode as a faster approximate graph, not as a
-  replacement when system-header typing matters.
-- **Configured indexing is unsupported.** Compilation database commands carry
-  different macro configurations; the flag is ignored there rather than
-  silently mixing configurations.
-- **Default-mode parity is not established.** Complete-tree processing is
-  substantially faster than the first canonical implementation, but still
-  processes more declarations and macro context than default indexing. Use the
-  current evaluation table rather than the historical timings below.
-
-Use the mode when a bare-tree call graph is needed quickly and approximate
-standard-library typing is acceptable. Do not use it when overload identity,
-ABI-sensitive typedefs, conditional standard-library behavior, or per-command
-configurations are part of the question. The existing
-`--system-includes` mode remains the conservative choice.
-
-### Compile-commands companion change
-
-The same branch also improves the configured path. The include probe now
-records compiler-default roots in
+The include probe records compiler-default roots in
 `PreprocessOptions::compiler_system_include_paths` (with
-`with_compiler_system_include`) so compiler-default headers may be separated
-after project declarations and a project-header preamble. Explicit `-isystem`
-roots keep the declaration/preamble gate because a project can interpose
-aliases there. Probe results are cached across build directories when the
-compiler printed absolute search entries and environment include paths are
-absolute too (see the [probe cache contract](PREPROCESSOR.md#compilation-database-options-62)). A bare driver name is resolved
-once per run. A database with many `directory` values therefore no longer
-starts the compiler once per directory.
+`with_compiler_system_include`), which the canonical prelude is built from, and
+a bare driver name is resolved once per run. Two further parts of the first
+version were withdrawn in review, so the rows below that measured them no
+longer apply:
+
+- Sharing compiler-default headers after project declarations and a
+  project-header preamble in ordinary `--system-includes` indexing (the
+  `own_first` row). On `services/abilitymgr` it changed 248 project
+  signatures and lost 14 distinct direct call edges against master, with no
+  speedup (88.9 s against 82.9 s on Linux). Ordinary indexing keeps master's
+  gate for every system root again and exports master's rows exactly.
+- Reusing a probe across build directories when the compiler printed only
+  absolute paths (the 120/240-directory rows). A wrapper can pick an SDK by
+  working directory and still print absolute paths, so every working directory
+  keeps its own probe (see the
+  [probe cache contract](PREPROCESSOR.md#compilation-database-options-62)).
 
 Measured on release builds with one worker and synthetic projects:
 
@@ -298,18 +303,23 @@ Measured on release builds with one worker and synthetic projects:
 | 120 command directories | 20.159 s | 0.564 s | all analysis tables and `database_identity` match |
 | 240 command directories | 41.170 s | 0.739 s | all analysis tables and `database_identity` match |
 
-This part is independent of canonical mode and is safe for configured
-indexing. Regressions:
-`compiler_default_system_headers_share_after_project_declarations`,
-the absolute/relative probe tests, and the project-alias refusal test.
+Regressions: `compiler_default_system_headers_keep_the_declaration_gate`,
+`each_command_directory_is_probed_for_its_own_answer` and the project-alias
+refusal test.
 
-## Historical measurements before the reuse follow-up
+## History
+
+The sections below describe the previous canonical design and the experiments
+behind it. Their measurements are Windows observations of that design, not of
+the current one.
+
+### Historical measurements before the reuse follow-up
 
 All measurements below use Windows x64, MSYS2 MinGW-w64 GCC 15.2 headers and
 `--jobs 8`.  Times are wall-clock observations, not repeated medians unless
 stated.
 
-### `services/abilitymgr` (236 TUs)
+#### `services/abilitymgr` (236 TUs)
 
 | Mode | Wall | Peak RSS | Functions | Project direct edges |
 |---|---:|---:|---:|---:|
@@ -322,7 +332,7 @@ Canonical final-merge phases: preprocessing 1.5-2.2 s, PCH 2.1-3.0 s over 100
 units, TU parse 5.4-8.5 s, index 19-24 s.  Two runs exported 154,019 identical
 normalized semantic rows.
 
-### Complete `ability_ability_runtime` (3,456 TUs, 3,110 headers)
+#### Complete `ability_ability_runtime` (3,456 TUs, 3,110 headers)
 
 Master `2a51d50` was built in a clean worktree with a separate target directory.
 
@@ -356,9 +366,9 @@ that is replayed.  It is the project/external header lowering and repeated
 cache misses: canonical mode has fewer units but each is much more expensive.
 Suppressing or skipping the replayed system text changed little (see below).
 
-## Approaches tried and rejected
+### Approaches tried and rejected before the redesign
 
-### Context relaxation for compiler-default roots
+#### Context relaxation for compiler-default roots
 
 Allowing compiler-default standard headers to share after project declarations
 reported 43-150 cache keys across configurations, reduced skipped
@@ -367,28 +377,28 @@ subset).  It changed type spelling, so it was not kept as a general rule.  The
 canonical mode now deliberately accepts a single configuration instead of
 generalizing this relaxation to ordinary indexing.
 
-### Declaration-signature dedup of PCH units
+#### Declaration-signature dedup of PCH units
 
 Deduplicating 402 units to 329 by declaration signature/text saved about
 1-1.5% and regressed types (`size_t` became `int` instead of `long`).  Rejected.
 
-### Larger variant budget plus context relaxation
+#### Larger variant budget plus context relaxation
 
 `max_expansion_variants = 32` with context relaxation produced 1,407 units,
 475 s, and 22 GB peak.  Rejected on both time and memory.
 
-### Smaller index window / byte budget
+#### Smaller index window / byte budget
 
 Changing the index-window divisor from 32 to 8 with an 8 MiB cap gave about 8%
 on a small run with no memory growth, but the 1/32 policy is validated on
 Linux and needs full-corpus RSS before changing.  Reverted.
 
-### Forced canonical preamble in every translation unit
+#### Forced canonical preamble in every translation unit
 
 A forced include of a generated standard-header preamble took 26 s to
 preprocess, 116 s to parse, and 205 s total on the subset.  Rejected.
 
-### One PCH unit per system header in a canonical batch
+#### One PCH unit per system header in a canonical batch
 
 An earlier experiment lowering 359 canonical units at once failed with
 `memory allocation of 27917287424 bytes failed` (27.9 GB).  Per-header units
@@ -398,40 +408,40 @@ design is inherently unviable: a later, separate project-header experiment
 produced the same allocation size because excluded functions' parameters were
 still imported. See the follow-up diagnosis below.
 
-### Per-translation-unit prelude insertion
+#### Per-translation-unit prelude insertion
 
 Kept the prelude in each unit's selected headers.  It matched ordinary system
 indexing more closely but cloned the prelude per unit: full tree 478 s / 2.7
 GiB.  Replaced by the final merge.
 
-### Suppress replayed system text in consuming units
+#### Suppress replayed system text in consuming units
 
 Added a preprocessor option that truncates the output of a canonical system
 header after processing it, preserving macro side effects.  On the full tree it
 was still 535 s / 2.7 GiB; the output changed by a few dozen functions.  PCH
 text was already only ~2.2 MiB, so this could not remove the dominant cost.
 
-### Skip uncached canonical system expansion
+#### Skip uncached canonical system expansion
 
 Short-circuited any canonical system include to a cache lookup and emitted
 nothing on a miss.  Discovery rose to 102.9 s, total 458 s, and output changed
 (93,527 functions).  Rejected because it saved neither time nor the project
 header work and weakened macro fidelity.
 
-### Filter PCH down to discovered project files
+#### Filter PCH down to discovered project files
 
 The first canonical filter kept only `include_graph.project_files` in the PCH
 set, dropping project-owned external headers.  The subset lost about 8,000
 project call edges.  The final filter removes only compiler-default roots.
 
-### Journal cap tuning
+#### Journal cap tuning
 
 Using the normal variant cap in the canonical journal, instead of one, made no
 visible difference on the subset and did not fix the full tree.  The
 one-variant cap is now restricted to compiler-default paths; explicit system
 roots and project headers retain the normal cap and fingerprint checks.
 
-## Investigation findings and remaining work
+### Findings of the previous design
 
 The earlier whole-tree regression came mainly from project-header reuse and
 lookup context, not the small amount of stored system text. A sampled fuzzer
@@ -475,7 +485,7 @@ typing must be retained. Another option is measuring preamble admission by
 actual import cost. Neither is part of this implementation, and the flag stays
 explicit.
 
-### Original profile that motivated the follow-up
+#### Original profile that motivated the follow-up
 
 The full-tree regression is in project/external header processing, not in
 system text:
@@ -508,47 +518,28 @@ ideas are not required for this change:
 
 ## Reproduction
 
-Subset:
-
 ```bash
 cargo build -p trace-cli --release
-target/release/trace analyze \
-  /path/to/ability_ability_runtime/services/abilitymgr \
-  --system-includes --canonical-system-headers --jobs 8 \
-  --timeout-secs 900 -o /tmp/abilitymgr-canonical.db
-```
-
-Full tree and master baseline:
-
-```bash
-# master without options in a clean worktree
-git worktree add --detach /tmp/trace-master 2a51d50
-CARGO_TARGET_DIR=/tmp/trace-master-target \
-  cargo build --manifest-path /tmp/trace-master/Cargo.toml -p trace-cli --release
-
-/tmp/trace-master-target/release/trace analyze \
-  /path/to/ability_ability_runtime --jobs 8 --timeout-secs 3600 \
-  -o /tmp/full-master.db
-
+# default bare-tree indexing
+target/release/trace analyze /path/to/ability_ability_runtime --jobs 8 \
+  --timeout-secs 3600 -o /tmp/default.db
+# canonical standard prelude
 target/release/trace analyze /path/to/ability_ability_runtime \
-  --system-includes --canonical-system-headers --jobs 8 \
-  --timeout-secs 7200 -o /tmp/full-canonical.db
+  --canonical-system-headers --jobs 8 --timeout-secs 3600 -o /tmp/canonical.db
 ```
 
-Normalized semantic comparison can be done with
-`scripts/bench_system_includes.py` (`compare_semantics`), as used for the
-154,019-row determinism check.
+Run them sequentially and set `TMPDIR` to a volume with room for the
+preprocessing spill. `TRACE_PROFILE_INDEX=1` prints the summed indexing
+counters. Compare exact analysis rows with `compare_databases` from
+`scripts/bench_system_includes.py` for worker-count determinism.
 
 ## File map
 
 | Area | Location |
 |---|---|
 | CLI flag | `crates/trace-cli/src/main.rs` |
-| Option/API | `crates/trace-preproc/src/options.rs` |
-| Canonical cache and journal policy | `crates/trace-preproc/src/preprocessor.rs`, `crates/trace-preproc/src/journal.rs` |
-| Consumer lookup projection and storage classification | `crates/trace-preproc/src/preprocessor/consumer_context.rs` |
-| Preamble generation, lowering, PCH filter, final merge | `crates/trace-parse/src/lower.rs` |
-| Declaration/parameter ownership and TU callback return replay | `crates/trace-parse/src/merge.rs` |
-| Ordered include-graph membership updates | `crates/trace-parse/src/deps.rs` |
-| Regression fixtures | `tests/fixtures/preproc/lookup_context/`, `tests/fixtures/preproc/member_imports/` |
+| Option/API, `CanonicalSystemPrelude` | `crates/trace-preproc/src/options.rs` |
+| Closure seeding and covered-include skip | `crates/trace-preproc/src/preprocessor.rs` (`apply_canonical_prelude`, `canonical_base_key`, `process_file`) |
+| Preamble generation, prelude run, lowering thread, final merge | `crates/trace-parse/src/lower.rs` |
+| Regression tests | `canonical_prelude_seeds_every_run_and_skips_only_the_headers_it_read` (preprocessor), `canonical_system_tests` (`lower.rs`), `canonical_mode_lowers_project_headers_like_default_indexing` and `canonical_scratch_names_do_not_change_exported_analysis` (`system_header_units.rs`) |
 | User docs | `README.md`, `docs/PREPROCESSOR.md`, `docs/EVAL_REPORT.md`, `CHANGELOG.md` |
