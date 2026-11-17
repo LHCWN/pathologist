@@ -23,7 +23,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,7 +33,7 @@ use trace_ir::{
     FieldId, FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow, ScalarKind, Span,
     StorageClass, TempKind, TypeDesc, VarId, Variable,
 };
-use trace_preproc::{macro_table_from_defines, Language, MacroTable, PreprocessOptions};
+use trace_preproc::{Language, PreprocessOptions};
 use tree_sitter::Node;
 
 /// Nested AST walk cap. Pathological left-deep trees (comma-operator
@@ -584,6 +584,21 @@ fn build_program_inner(
     retain_merge_state: bool,
 ) -> Result<Program, String> {
     let jobs = jobs.max(1);
+    // A canonical prelude needs the compiler's default roots. Unless the
+    // caller declared them itself, discover them as `--system-includes` does.
+    let discovering;
+    let opts = if opts.canonical_system_headers
+        && !opts.system_includes
+        && (opts.compiler_system_include_paths.is_empty() || opts.compiler.is_some())
+    {
+        discovering = PreprocessOptions {
+            system_includes: true,
+            ..opts.clone()
+        };
+        &discovering
+    } else {
+        opts
+    };
     // Include resolution memoizes `is_file` for the run (`is_file_cached`);
     // start from what the tree looks like now, not from what a previous run in
     // this process saw.
@@ -766,6 +781,7 @@ fn build_program_inner(
     let mut system_roots: Vec<PathBuf> = opts
         .system_include_paths
         .iter()
+        .chain(&opts.compiler_system_include_paths)
         .chain(&opts.after_include_paths)
         .map(|path| trace_ir::canonicalize(path))
         .collect();
@@ -853,10 +869,20 @@ fn build_program_inner(
         || database.has_shared_configuration()
         || (!links.targets.is_empty() && !links.unscoped_inference)
     {
+        // The canonical preamble is built from one bare-tree configuration;
+        // per-command configurations need their own indexing.
+        let mut configured_opts = opts.clone();
+        if configured_opts.canonical_system_headers {
+            eprintln!(
+                "warning: --canonical-system-headers is ignored with configured indexing; \
+                 standard headers follow each command's configuration"
+            );
+            configured_opts.canonical_system_headers = false;
+        }
         return configured::build(
             program,
             root,
-            opts,
+            &configured_opts,
             jobs,
             &files,
             &headers,
@@ -897,10 +923,240 @@ fn build_program_inner(
     eff_opts.separate_header_paths = Some(Arc::new(include_graph.project_files.clone()));
     eff_opts.separate_system_headers = opts.system_includes
         || !opts.system_include_paths.is_empty()
+        || !opts.compiler_system_include_paths.is_empty()
         || !opts.after_include_paths.is_empty();
     let bundle_profile = crate::index_profile::enabled()
         .then(|| Arc::new(trace_preproc::SystemBundleProfile::default()));
     eff_opts.system_bundle_profile = bundle_profile.clone();
+    // Canonical standard prelude: one inline preprocessing per language
+    // yields the macro closure every later run starts from; lowering its
+    // declarations overlaps the sequential warm pass on its own thread and is
+    // merged once after the translation units.
+    let mut preludes: Vec<(Language, Arc<[PathBuf]>, PreludeLowering)> = Vec::new();
+    if opts.canonical_system_headers {
+        let mut prepared = Vec::new();
+        for (language, sources) in
+            canonical_prelude_sources(&include_graph, &files, &headers, eff_opts.language)
+        {
+            let mut inline = eff_opts.clone().with_language(language);
+            inline = with_project_system_paths(inline, language, project_compiler_paths.as_ref());
+            // The prelude is the compiler's own library: only the spellings
+            // this language's units write, resolved under its compiler-default
+            // roots alone. No project, explicit `-isystem`, inferred or
+            // basename search and no forced includes, so neither a project
+            // mock of a standard spelling nor an explicit system tree enters
+            // the shared declarations or the macro closure.
+            let roots = inline.compiler_system_include_paths.clone();
+            let Some((preamble, scratch)) =
+                canonical_system_preamble(&include_graph, &sources, &roots, language)
+            else {
+                continue;
+            };
+            inline.include_paths.clear();
+            inline.quote_include_paths.clear();
+            inline.system_include_paths.clear();
+            inline.after_include_paths.clear();
+            inline.inferred_include_paths.clear();
+            inline.inference_root = None;
+            inline.basename_index = None;
+            inline.forced_includes.clear();
+            inline.strict_include_search = true;
+            inline.canonical_system_headers = false;
+            inline.canonical_system_preludes = None;
+            inline.separate_system_headers = false;
+            inline.inline_include_bodies = true;
+            inline.include_expansion_cache = None;
+            inline.record_conditionals = false;
+            inline.record_macro_ops = true;
+            inline.max_output_bytes = 512 * 1024 * 1024;
+            inline.max_expanded_tokens = 200_000_000;
+            inline.max_include_depth = 128;
+            inline.max_file_expansions = 256;
+            inline.dep_roots = include_graph.dep_roots.clone();
+            inline.dep_roots.push(preamble.clone());
+            // The scratch preamble is the indexer's own file, not an analysis
+            // input; the headers it reads are recorded once it is accepted.
+            inline.input_boundary = None;
+            let canonical_roots: Vec<PathBuf> = roots
+                .iter()
+                .map(|root| trace_ir::canonicalize(root))
+                .collect();
+            // The prelude run allows twice the ordinary include depth, and
+            // each level recurses: it gets the indexing workers' stack rather
+            // than the caller's (1 MiB on a Windows main thread), so a limit
+            // ends in the fallback below instead of a stack overflow.
+            let preprocessed = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .name("canonical-prelude-preprocess".into())
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn_scoped(scope, || {
+                        trace_preproc::preprocess_file(&preamble, &inline)
+                            .map_err(|error| error.to_string())
+                    })
+                    .map_err(|error| error.to_string())
+                    .and_then(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    })
+            });
+            match preprocessed {
+                Ok(result) => {
+                    // Every read header's guards and macros enter the closure,
+                    // so a file outside the compiler roots (a symlink out of
+                    // them, a relative include climbing out) would vanish from
+                    // the units that own its bodies.
+                    let outside = result.included_headers.iter().find(|path| {
+                        **path != preamble
+                            && !canonical_roots.iter().any(|root| path.starts_with(root))
+                    });
+                    let refusal = if !result.complete {
+                        Some("hit a preprocessing limit".to_string())
+                    } else {
+                        outside.map(|path| {
+                            format!(
+                                "reads {} outside the compiler-default roots",
+                                path.display()
+                            )
+                        })
+                    };
+                    if let Some(refusal) = refusal {
+                        eprintln!(
+                            "warning: canonical {language:?} prelude {refusal}; using ordinary system-header indexing"
+                        );
+                        prepared.clear();
+                        break;
+                    }
+                    prepared.push((language, inline, result, roots, preamble, scratch));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: canonical prelude preprocessing failed ({error}); using ordinary system-header indexing"
+                    );
+                    prepared.clear();
+                    break;
+                }
+            }
+        }
+        let mut closures = rustc_hash::FxHashMap::default();
+        for (language, inline, mut result, roots, preamble, scratch) in prepared {
+            if let Some(boundary) = &eff_opts.input_boundary {
+                for path in result.included_headers.iter().filter(|p| **p != preamble) {
+                    boundary.record(path);
+                }
+            }
+            let covered: HashSet<PathBuf> = result
+                .included_headers
+                .iter()
+                .filter(|path| **path != preamble)
+                .cloned()
+                .collect();
+            let mut held: Vec<PathBuf> = covered.iter().cloned().collect();
+            held.sort();
+            let held: Arc<[PathBuf]> = held.into();
+            let covered_headers = Arc::clone(&held);
+            let closure = trace_preproc::CanonicalSystemPrelude::new(
+                std::mem::take(&mut result.macro_ops),
+                covered,
+            );
+            index_progress(format!(
+                "canonical-prelude: {language:?} {} standard headers, {} macro bindings",
+                closure.files.len(),
+                closure.ops.len()
+            ));
+            closures.insert(language, Arc::new(closure));
+            let mut replayed: rustc_hash::FxHashMap<PathBuf, Vec<usize>> = Default::default();
+            for (path, variant) in std::mem::take(&mut result.replayed_variants) {
+                replayed.entry(path).or_default().push(variant);
+            }
+            for variants in replayed.values_mut() {
+                variants.sort_unstable();
+                variants.dedup();
+            }
+            let pre = Arc::new(PreprocessedSource {
+                text: Arc::from(result.output),
+                line_map: Arc::new(result.line_map),
+                included_headers: Arc::new(result.included_headers),
+                inlined_headers: result.inlined_headers.into(),
+                language: result.language,
+                cpp_standard: result.cpp_standard,
+                replayed_variants: Arc::new(replayed),
+                diagnostics: result.diagnostics,
+                conditionals: result.conditionals,
+            });
+            // Only the dependency classification and path interning of the
+            // graph reach this unit; the project graph keeps growing meanwhile.
+            let graph = IncludeGraph {
+                root: include_graph.root.clone(),
+                test_partition: include_graph.test_partition.clone(),
+                dep_roots: inline.dep_roots.clone(),
+                ..IncludeGraph::default()
+            };
+            let root = root.to_path_buf();
+            let identity = canonical_prelude_identity(&roots, language);
+            let lowering = std::thread::Builder::new()
+                .name("canonical-prelude".into())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    // The scratch file outlives every read of it.
+                    let _scratch = scratch;
+                    let mut program = unit_program(&root, &inline);
+                    let origins = lower_prepared_source(
+                        &mut program,
+                        &preamble,
+                        &graph,
+                        pre,
+                        language,
+                        false,
+                        true,
+                        None,
+                        &HeaderOrder::default(),
+                    )?;
+                    let mut unit = program_into_unit(preamble.clone(), program, origins);
+                    // The prelude holds each standard header's text, so what a
+                    // header declares belongs to that header, as in a header
+                    // unit holding inlined fragments: internal-linkage entities
+                    // stay visible to every unit that sees the header.
+                    unit.held_headers = held;
+                    // The physical scratch name is private to this run. Keep
+                    // its IR identity stable across runs and worker counts,
+                    // in report texts as well as in the file table.
+                    for file in &mut unit.files {
+                        if *file == preamble {
+                            *file = identity.clone();
+                        }
+                    }
+                    let (scratch_name, identity_name) = (
+                        preamble.display().to_string(),
+                        identity.display().to_string(),
+                    );
+                    for diagnostic in &mut unit.diagnostics {
+                        if diagnostic.message.contains(&scratch_name) {
+                            diagnostic.message =
+                                diagnostic.message.replace(&scratch_name, &identity_name);
+                        }
+                    }
+                    unit.path = identity;
+                    unit.merge_descs = crate::merge::merge_descs_of(&unit.types);
+                    unit.types.compact_for_header_merge();
+                    unit.function_flow_ranges = HashMap::default();
+                    unit.global_initializer_ranges = HashMap::default();
+                    unit.shrink_to_fit();
+                    Ok(unit)
+                });
+            match lowering {
+                Ok(handle) => preludes.push((language, covered_headers, handle)),
+                Err(error) => return Err(format!("canonical prelude thread: {error}")),
+            }
+        }
+        if !closures.is_empty() {
+            // Standard headers are neither expanded nor shared per consumer:
+            // the prelude supplies their declarations once and the closure
+            // their macros. Project headers keep the default sharing rules.
+            eff_opts.separate_system_headers = false;
+            eff_opts.canonical_system_preludes = Some(Arc::new(closures));
+        }
+    }
     let eff_opts = eff_opts.with_record_conditionals(opts.explore || opts.record_conditionals);
 
     let gn_candidates = if opts.explore && opts.explore_budget > 0 {
@@ -958,7 +1214,7 @@ fn build_program_inner(
     // ud-suffixes are one token in C++, identifier + literal in C). The
     // first language listed is the one the header is parsed as (C++ when a
     // C++ TU can reach it, as `index_language` decides) and feeds the source
-    // cache; any other only fills the expansion cache and its union table.
+    // cache; any other only fills the expansion cache.
     // An explicit `PreprocessOptions::with_language` lexes everything as
     // that language.
     //
@@ -1040,22 +1296,14 @@ fn build_program_inner(
                 second_language_diagnostics.remove(path);
             }
             let mut failed = false;
-            let mut warmed: Vec<(Language, Arc<std::sync::RwLock<MacroTable>>)> = Vec::new();
             for (k, language) in languages.iter().copied().enumerate() {
-                let mut seed_defines = opts.compiler_defines.clone();
-                if let Some((c, cpp)) = &project_compiler_paths {
-                    let search = if language == Language::C { c } else { cpp };
-                    seed_defines.extend(search.target_defines.iter().cloned());
-                }
-                seed_defines.extend(opts.defines.iter().map(|(k, v)| (k.clone(), v.clone())));
-                let header_macros: Arc<std::sync::RwLock<MacroTable>> = Arc::new(
-                    std::sync::RwLock::new(macro_table_from_defines(&seed_defines, language)),
-                );
-                let header_prep_opts = eff_opts
-                    .clone()
-                    .with_shared_macros(Arc::clone(&header_macros))
-                    .with_accumulate_macros(true)
-                    .with_language(language);
+                // No later phase reads a warm run's final macro table. Use
+                // the normal fresh constructor/precedence and retain only
+                // its expansions and source result, without locking a second
+                // table for every replayed standard-library definition.
+                let mut header_prep_opts = eff_opts.clone().with_language(language);
+                header_prep_opts.shared_macros = None;
+                header_prep_opts.accumulate_macros = false;
                 let header_prep_opts = with_project_system_paths(
                     header_prep_opts,
                     language,
@@ -1086,7 +1334,6 @@ fn build_program_inner(
                     failed = true;
                     break;
                 }
-                warmed.push((language, header_macros));
             }
             source_cache.check_load_errors()?;
             if failed {
@@ -1815,6 +2062,37 @@ fn build_program_inner(
         }
     }
 
+    // System declarations join the final program once, after project headers
+    // and TUs are merged: the standard-library IR then never enlarges the
+    // dedup tables those merges consult. Translation units did not clone it.
+    // Every run already started from the closure and skipped the covered
+    // headers, so a missing prelude would leave standard macros without their
+    // declarations: neither canonical nor ordinary system-header indexing.
+    for (language, covered, lowering) in preludes {
+        match lowering.join() {
+            Ok(Ok(prelude)) => {
+                // Covered headers never run again, so the prelude is the only
+                // place their `#warning`s and missing nested includes report.
+                merge_unit_symbols(&mut program, &prelude);
+                merge_unit_diagnostics(&mut program, &prelude, true);
+                // The closure reaches every unit from its first line, so every
+                // file sees the covered headers: their `static` functions
+                // resolve wherever they are called, as included ones would.
+                for header in covered.iter() {
+                    let id = program.symbols.add_file_interned(header);
+                    program.symbols.register_prelude_header(id);
+                }
+            }
+            Ok(Err(error)) => {
+                return Err(format!(
+                    "canonical {language:?} standard prelude could not be lowered ({error}); \
+                     rerun without --canonical-system-headers"
+                ))
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     // TU parsing and merging are complete. Drop the cached header IR and any
     // remaining include expansions before program finalization begins.
     drop(header_ir);
@@ -2352,6 +2630,22 @@ fn finalize_extern_callees(program: &mut Program) {
         if program.symbols.resolve_function(name).is_some() {
             continue;
         }
+        // A site the contextual resolver already binds (an internal-linkage
+        // function visible from its unit, or from any unit contributing a
+        // shared header call) is left to that resolver too: a placeholder
+        // would hide the function it calls.
+        let sites: Vec<usize> = sites_by_name[name.as_str()]
+            .iter()
+            .copied()
+            .filter(|&i| {
+                program
+                    .callees_of(&program.symbols.call_sites[i])
+                    .is_empty()
+            })
+            .collect();
+        if sites.is_empty() {
+            continue;
+        }
         let fid = program.symbols.alloc_fn_id();
         // The entry has no source location: it was never declared in the
         // tree. After `names.sort()` + dedup the retained file is the
@@ -2396,7 +2690,7 @@ fn finalize_extern_callees(program: &mut Program) {
             is_final: false,
             tu: None,
         });
-        for &i in &sites_by_name[name.as_str()] {
+        for i in sites {
             let cs = &mut program.symbols.call_sites[i];
             cs.is_direct = true;
             cs.callee_fn_id = Some(fid);
@@ -2466,6 +2760,20 @@ fn finalize_target_extern_callees(program: &mut Program) {
             })
             .collect();
     for ((name, target), sites) in missing {
+        // As in the whole-program pass, a site the contextual resolver binds
+        // is left to it. Inferred sites were already checked that way.
+        let sites: Vec<usize> = sites
+            .into_iter()
+            .filter(|&i| {
+                inferred
+                    || program
+                        .callees_of(&program.symbols.call_sites[i])
+                        .is_empty()
+            })
+            .collect();
+        if sites.is_empty() {
+            continue;
+        }
         // Synthesized externals were never declared in the tree, so they have
         // no source location: keep the first call site's file as a scope
         // fallback but export line 0, so call-graph consumers do not present
@@ -2988,6 +3296,173 @@ fn project_preprocess_opts(
     eff
 }
 
+fn angle_includes(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter_map(|line| {
+        let line = line.trim_start();
+        let rest = line.strip_prefix("#include")?.trim_start();
+        let inner = rest.strip_prefix('<')?;
+        let end = inner.find('>')?;
+        Some(inner[..end].trim())
+    })
+}
+
+/// The translation units and headers of each language present, as the
+/// indexer will preprocess them: a header in every language whose units reach
+/// it (C++ for C++ header spellings). A header the static include graph does
+/// not reach may still be included through a macro, by a unit of either
+/// language; it counts as C only in a tree without C++ units, because a C++
+/// prelude reading a C header is harmless while a C prelude reading a C++
+/// header would change every C unit.
+/// A language's prelude unit, lowered on its own thread.
+type PreludeLowering = std::thread::JoinHandle<Result<UnitIndex, String>>;
+
+fn canonical_prelude_sources(
+    graph: &IncludeGraph,
+    files: &[PathBuf],
+    headers: &[PathBuf],
+    forced: Option<Language>,
+) -> Vec<(Language, Vec<PathBuf>)> {
+    let mut c_sources = Vec::new();
+    let mut cpp_sources = Vec::new();
+    let mut add = |language: Language, path: &PathBuf| match language {
+        Language::C => c_sources.push(path.clone()),
+        Language::Cpp => cpp_sources.push(path.clone()),
+    };
+    if let Some(language) = forced {
+        files
+            .iter()
+            .chain(headers)
+            .for_each(|path| add(language, path));
+    } else {
+        let (cpp_units, c_units): (Vec<PathBuf>, Vec<PathBuf>) = files
+            .iter()
+            .cloned()
+            .partition(|path| crate::discover::is_cpp_path(path));
+        let from_cpp = graph.reachable_from(&cpp_units);
+        let from_c = graph.reachable_from(&c_units);
+        c_units.iter().for_each(|unit| add(Language::C, unit));
+        cpp_units.iter().for_each(|unit| add(Language::Cpp, unit));
+        for header in headers {
+            let canonical = graph.intern_path(header);
+            let cpp = crate::discover::is_cpp_header_path(header) || from_cpp.contains(&canonical);
+            let c = from_c.contains(&canonical);
+            if c {
+                add(Language::C, header);
+            }
+            if cpp {
+                add(Language::Cpp, header);
+            }
+            if !c && !cpp {
+                let orphan = if cpp_units.is_empty() {
+                    Language::C
+                } else {
+                    Language::Cpp
+                };
+                add(orphan, header);
+            }
+        }
+    }
+    [(Language::C, c_sources), (Language::Cpp, cpp_sources)]
+        .into_iter()
+        .filter(|(_, sources)| !sources.is_empty())
+        .collect()
+}
+
+/// The stable IR identity of a language's prelude unit. The file does not
+/// exist; naming it under the language's first compiler-default root gives it
+/// dependency ownership like every header it stands for.
+fn canonical_prelude_identity(roots: &[PathBuf], language: Language) -> PathBuf {
+    let name = match language {
+        Language::C => ".trace-canonical-std-c.prelude",
+        Language::Cpp => ".trace-canonical-std-cpp.prelude",
+    };
+    roots
+        .first()
+        .map(|root| trace_ir::canonicalize(root))
+        .unwrap_or_default()
+        .join(name)
+}
+
+fn canonical_system_preamble(
+    graph: &IncludeGraph,
+    sources: &[PathBuf],
+    roots: &[PathBuf],
+    language: Language,
+) -> Option<(PathBuf, tempfile::NamedTempFile)> {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|path| trace_ir::canonicalize(path))
+        .collect();
+    if roots.is_empty() {
+        return None;
+    }
+    let mut spellings: BTreeSet<String> = BTreeSet::new();
+    for file in sources {
+        let canonical = graph.intern_path(file);
+        let text = match graph.source_cache.get(&canonical) {
+            Some(text) => Arc::clone(text),
+            None => match std::fs::read_to_string(file) {
+                Ok(text) => Arc::from(text),
+                Err(_) => continue,
+            },
+        };
+        for spelling in angle_includes(&text) {
+            if !spelling.is_empty() {
+                spellings.insert(spelling.to_string());
+            }
+        }
+    }
+    // Probe each distinct spelling once, including misses. Large trees repeat
+    // the same standard includes in thousands of files; probing while scanning
+    // made this serial phase scale with occurrences times search roots. Only
+    // a plain relative spelling whose first match stays inside its root
+    // names a compiler header: `<../project/own.h>` or an absolute spelling
+    // can reach a project file, whose bodies a symbols-only prelude drops.
+    spellings.retain(|spelling| {
+        let path = Path::new(spelling);
+        // C's standard and platform headers are all `.h`; an extensionless
+        // or other spelling under a shared root is a C++ library header that
+        // a C prelude must not read (a raw scan also sees `#ifdef
+        // __cplusplus` arms).
+        if language == Language::C
+            && !path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("h"))
+        {
+            return false;
+        }
+        path.components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+            && roots
+                .iter()
+                .find(|root| trace_ir::is_file_in(root, path))
+                .is_some_and(|root| trace_ir::canonicalize(&root.join(path)).starts_with(root))
+    });
+    if spellings.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for spelling in &spellings {
+        text.push_str("#include <");
+        text.push_str(spelling);
+        text.push_str(">\n");
+    }
+    // A private temporary file, never one in the analyzed tree: a run stopped
+    // by a signal or the watchdog cannot leave it behind there. Exclusive
+    // creation never follows an existing link and gives concurrent runs
+    // independent files and cleanup lifetimes.
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix(".trace-canonical-std-")
+        .suffix(".tmp")
+        .tempfile()
+        .ok()?;
+    file.write_all(text.as_bytes()).ok()?;
+    let path = trace_ir::canonicalize(file.path());
+    trace_ir::start_file_probe_epoch();
+    Some((path, file))
+}
+
 fn with_project_system_paths(
     mut opts: PreprocessOptions,
     language: Language,
@@ -2999,7 +3474,10 @@ fn with_project_system_paths(
     if let Some((c, cpp)) = paths {
         let searched = if language == Language::C { c } else { cpp };
         if !searched.paths.is_empty() {
-            opts.system_include_paths.clone_from(&searched.paths);
+            // Only roots the compiler supplied on its own are standard. An
+            // explicit `-isystem` path keeps the conservative gate even though
+            // the probe echoes it back in the ordered search list.
+            crate::compiler_includes::apply_probed_search(&mut opts, searched);
         }
         opts.compiler_defines
             .extend(searched.target_defines.iter().cloned());
@@ -3895,7 +4373,6 @@ fn process_indexed_file(
 }
 
 /// Lower already-preprocessed text into a fresh `program`.
-///
 /// No files may have been interned: dependency roots must be installed before
 /// file classification or preamble merging. Callers create one Program per unit.
 #[allow(clippy::too_many_arguments)]
@@ -32359,5 +32836,622 @@ mod spelled_cv_tests {
         );
         assert_eq!(standard_callee_name("move"), (false, "move".into()));
         assert_eq!(standard_callee_name("n::move"), (false, "n::move".into()));
+    }
+}
+
+#[cfg(test)]
+mod canonical_system_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_preamble_files_are_exclusive_and_owned_by_each_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let system = dir.path().join("system");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&system).unwrap();
+        let source = root.join("main.cpp");
+        std::fs::write(&source, "#include <api>\n").unwrap();
+        std::fs::write(system.join("api"), "void Api();\n").unwrap();
+        let victim = dir.path().join("unrelated.txt");
+        std::fs::write(&victim, "keep this content").unwrap();
+        let legacy = root.join(".trace-canonical-std.tmp");
+        std::fs::hard_link(&victim, &legacy).unwrap();
+        let files = vec![source];
+        let graph = IncludeGraph::build(&root, &files, &[]);
+        let roots = vec![system];
+        let (first, first_guard) =
+            canonical_system_preamble(&graph, &files, &roots, Language::Cpp).unwrap();
+        let (second, second_guard) =
+            canonical_system_preamble(&graph, &files, &roots, Language::Cpp).unwrap();
+        assert_ne!(first, second);
+        assert!(!first.starts_with(trace_ir::canonicalize(&root)));
+        assert!(!second.starts_with(trace_ir::canonicalize(&root)));
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "#include <api>\n");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep this content"
+        );
+        drop(first_guard);
+        assert!(!first.exists());
+        assert!(second.exists());
+        drop(second_guard);
+        assert!(!second.exists());
+        assert!(legacy.exists());
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "keep this content"
+        );
+        let opts = PreprocessOptions::new()
+            .with_compiler_system_include(&roots[0])
+            .with_canonical_system_headers(true);
+        let program = build_program_with_jobs(&root, &opts, 1).unwrap();
+        assert!(program
+            .symbols
+            .functions
+            .iter()
+            .any(|function| function.name == "Api"));
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep this content"
+        );
+        // Indexing writes nothing into the analyzed tree.
+        let mut entries: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, [".trace-canonical-std.tmp", "main.cpp"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_preamble_does_not_follow_legacy_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.cpp");
+        let api = dir.path().join("api");
+        let victim = dir.path().join("unrelated.txt");
+        std::fs::write(&source, "#include <api>\n").unwrap();
+        std::fs::write(&api, "void Api();\n").unwrap();
+        std::fs::write(&victim, "keep this content").unwrap();
+        let legacy = dir.path().join(".trace-canonical-std.tmp");
+        std::os::unix::fs::symlink(&victim, &legacy).unwrap();
+        let files = vec![source];
+        let graph = IncludeGraph::build(dir.path(), &files, &[]);
+        let (_, guard) =
+            canonical_system_preamble(&graph, &files, &[dir.path().to_path_buf()], Language::Cpp)
+                .unwrap();
+        drop(guard);
+        assert!(legacy.is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(victim).unwrap(),
+            "keep this content"
+        );
+    }
+
+    #[test]
+    fn canonical_preamble_keeps_standard_headers_reached_only_through_macros() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let system = dir.path().join("system");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&system).unwrap();
+        std::fs::write(system.join("first"), "#pragma once\nint First();\n").unwrap();
+        std::fs::write(
+            system.join("extra"),
+            "#pragma once\nstruct Extra { void Touch(); };\nExtra *GetExtra();\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("main.cpp"), "#include <first>\n#define EXTRA <extra>\n#include EXTRA\nvoid Run() { GetExtra()->Touch(); }\n").unwrap();
+        let mut opts = PreprocessOptions::new()
+            .with_compiler_system_include(&system)
+            .with_canonical_system_headers(true);
+        opts.dep_roots.push(system);
+        for jobs in [1, 3] {
+            let program = build_program_with_jobs(&root, &opts, jobs).unwrap();
+            let getter = program
+                .symbols
+                .functions
+                .iter()
+                .find(|f| f.name == "GetExtra")
+                .unwrap();
+            assert!(
+                matches!(program.types.get(getter.return_type).desc.as_ref(),
+                TypeDesc::Ptr(inner) if matches!(inner.as_ref(), TypeDesc::Struct { name, .. } if name == "Extra"))
+            );
+            assert!(program
+                .symbols
+                .call_sites
+                .iter()
+                .any(|site| site.callee_name == "Extra::Touch"));
+        }
+    }
+
+    /// A header a C++ unit reaches only through a macro-spelled include is
+    /// invisible to the static include graph. Its standard includes must not
+    /// reach the C prelude, whose macros start every C unit: with one root
+    /// serving both languages, `<vector>`'s macro would otherwise flip a C
+    /// unit's `#ifdef`.
+    #[test]
+    fn macro_reached_headers_keep_cpp_headers_out_of_the_c_prelude() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let sys = dir.path().join("sys");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sys).unwrap();
+        std::fs::write(sys.join("vector"), "#pragma once\n#define USE_BAD 1\n").unwrap();
+        std::fs::write(sys.join("cstub.h"), "#pragma once\nint Stub(void);\n").unwrap();
+        std::fs::write(root.join("api.h"), "#pragma once\n#include <vector>\n").unwrap();
+        std::fs::write(
+            root.join("b.cpp"),
+            "#define API \"api.h\"\n#include API\nint B() { return 0; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("a.c"),
+            "#include <cstub.h>\nvoid Good(void);\nvoid Bad(void);\n\
+             #ifdef USE_BAD\nvoid Run(void) { Bad(); }\n#else\nvoid Run(void) { Good(); }\n#endif\n",
+        )
+        .unwrap();
+        let mut opts = PreprocessOptions::new().with_canonical_system_headers(true);
+        opts.compiler_system_include_paths = vec![sys];
+        for jobs in [1, 3] {
+            let program = build_program_with_jobs(&root, &opts, jobs).unwrap();
+            let calls: Vec<_> = program
+                .symbols
+                .call_sites
+                .iter()
+                .filter(|site| program.symbols.function(site.caller).name == "Run")
+                .map(|site| site.callee_name.to_string())
+                .collect();
+            assert_eq!(calls, ["Good"], "jobs={jobs}");
+        }
+    }
+
+    /// Probing keeps the caller's own compiler roots standard and leaves out
+    /// probe entries that belong to an explicit `-isystem` tree.
+    #[test]
+    fn probed_roots_keep_declared_compiler_roots_and_drop_explicit_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("usr/include");
+        let sdk = dir.path().join("opt/sdk");
+        let declared = dir.path().join("toolchain/include");
+        for path in [&probe, &sdk.join("include"), &declared] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let search = crate::compiler_includes::CompilerSearch {
+            paths: vec![probe.clone(), sdk.join("include")],
+            ..Default::default()
+        };
+        let opts = PreprocessOptions::new()
+            .with_system_include(&sdk)
+            .with_compiler_system_include(&declared);
+        let opts =
+            with_project_system_paths(opts, Language::Cpp, Some(&(search.clone(), search.clone())));
+        assert_eq!(opts.compiler_system_include_paths, vec![probe, declared]);
+        assert_eq!(opts.system_include_paths, search.paths);
+    }
+
+    /// A spelling that climbs out of, or bypasses, the compiler roots can name
+    /// a project header. It stays an ordinary include, so its bodies keep
+    /// their calls instead of becoming symbols-only prelude declarations.
+    #[test]
+    fn spellings_reaching_outside_compiler_roots_stay_project_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let sys = dir.path().join("sys");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sys).unwrap();
+        std::fs::write(sys.join("api"), "#pragma once\nint Api();\n").unwrap();
+        std::fs::write(
+            root.join("own.h"),
+            "#pragma once\nvoid Leaf();\ninline void Helper() { Leaf(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("abs.h"),
+            "#pragma once\nvoid Deep();\ninline void Absolute() { Deep(); }\n",
+        )
+        .unwrap();
+        let absolute = trace_ir::canonicalize(&root.join("abs.h"));
+        std::fs::write(
+            root.join("main.cpp"),
+            format!(
+                "#include <api>\n#include <../project/own.h>\n#include <{}>\n\
+                 void Run() {{ Api(); Helper(); Absolute(); }}\n",
+                absolute.display()
+            ),
+        )
+        .unwrap();
+        let files = vec![trace_ir::canonicalize(&root.join("main.cpp"))];
+        let graph = IncludeGraph::build(&root, &files, &[]);
+        let (preamble, _guard) =
+            canonical_system_preamble(&graph, &files, std::slice::from_ref(&sys), Language::Cpp)
+                .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(preamble).unwrap(),
+            "#include <api>\n"
+        );
+
+        let opts = PreprocessOptions::new()
+            .with_compiler_system_include(&sys)
+            .with_canonical_system_headers(true);
+        let program = build_program_with_jobs(&root, &opts, 1).unwrap();
+        let calls: Vec<_> = program
+            .symbols
+            .call_sites
+            .iter()
+            .map(|site| {
+                (
+                    program.symbols.function(site.caller).name.clone(),
+                    site.callee_name.to_string(),
+                )
+            })
+            .collect();
+        for (caller, callee) in [
+            ("Run", "Api"),
+            ("Run", "Helper"),
+            ("Helper", "Leaf"),
+            ("Absolute", "Deep"),
+        ] {
+            assert!(
+                calls.contains(&(caller.to_string(), callee.to_string())),
+                "{caller} -> {callee} missing from {calls:?}"
+            );
+        }
+    }
+
+    /// A prelude cut short by a preprocessing limit would keep the standard
+    /// macros of a header whose declarations it lost, so it is refused and
+    /// the run falls back to ordinary system-header indexing.
+    #[test]
+    fn prelude_that_hits_a_preprocessing_limit_falls_back_to_ordinary_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let sys = dir.path().join("sys");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sys).unwrap();
+        std::fs::write(sys.join("api"), "#pragma once\nint Api();\n").unwrap();
+        // Unguarded and self-including: the prelude run reaches its include
+        // limits however deep they are.
+        std::fs::write(sys.join("loop"), "#include <loop>\n").unwrap();
+        std::fs::write(
+            root.join("main.cpp"),
+            "#include <api>\n#include <loop>\nvoid Run() { Api(); }\n",
+        )
+        .unwrap();
+        let opts = PreprocessOptions::new()
+            .with_compiler_system_include(&sys)
+            .with_canonical_system_headers(true);
+        for jobs in [1, 3] {
+            let program = build_program_with_jobs(&root, &opts, jobs).unwrap();
+            let prelude = program.symbols.files.iter().find(|file| {
+                file.path
+                    .to_string_lossy()
+                    .contains(".trace-canonical-std-")
+            });
+            assert!(prelude.is_none(), "jobs={jobs}: {prelude:?}");
+            assert!(
+                program.symbols.call_sites.iter().any(|site| {
+                    program.symbols.function(site.caller).name == "Run" && site.callee_name == "Api"
+                }),
+                "jobs={jobs}"
+            );
+        }
+    }
+
+    /// Covered headers never run again, so their reports come from the
+    /// prelude, once, as ordinary system-header indexing reports them.
+    #[test]
+    fn canonical_prelude_reports_its_headers_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let sys = dir.path().join("sys");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sys).unwrap();
+        std::fs::write(
+            sys.join("api"),
+            "#pragma once\n#warning IMPORTANT_DIAGNOSTIC\n#include <missing_nested>\nint Api();\nint Broken(;\n",
+        )
+        .unwrap();
+        for unit in ["a.cpp", "b.cpp"] {
+            std::fs::write(
+                root.join(unit),
+                "#include <api>\nint Run() { return Api(); }\n",
+            )
+            .unwrap();
+        }
+        let reports = |opts: &PreprocessOptions, jobs: usize| {
+            let program = build_program_with_jobs(&root, opts, jobs).unwrap();
+            ["IMPORTANT_DIAGNOSTIC", "missing_nested"].map(|needle| {
+                program
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.message.contains(needle))
+                    .count()
+            })
+        };
+        let ordinary = PreprocessOptions::new().with_compiler_system_include(&sys);
+        assert!(
+            reports(&ordinary, 1).iter().all(|count| *count > 0),
+            "ordinary indexing reports both"
+        );
+        let canonical = ordinary.clone().with_canonical_system_headers(true);
+        for jobs in [1, 3] {
+            assert_eq!(reports(&canonical, jobs), [1, 1], "jobs={jobs}");
+        }
+        // Reports name the prelude by its stable identity, never by the
+        // run's random scratch file, so exports stay reproducible.
+        let messages = |jobs| {
+            build_program_with_jobs(&root, &canonical, jobs)
+                .unwrap()
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>()
+        };
+        let first = messages(1);
+        assert!(
+            first
+                .iter()
+                .any(|message| message.contains(".trace-canonical-std-cpp.prelude")),
+            "{first:?}"
+        );
+        let scratch = |message: &String| {
+            message
+                .match_indices(".trace-canonical-std-")
+                .any(|(at, name)| {
+                    let rest = &message[at + name.len()..];
+                    !rest.starts_with("c.prelude") && !rest.starts_with("cpp.prelude")
+                })
+        };
+        assert!(!first.iter().any(scratch), "{first:?}");
+        assert_eq!(first, messages(3));
+    }
+
+    /// `--require-local-inputs` validates the headers the prelude reads, not
+    /// the indexer's own scratch preamble.
+    #[test]
+    fn local_input_validation_ignores_the_scratch_preamble() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = trace_ir::canonicalize(dir.path());
+        let sys = root.join("sdk/include");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::write(sys.join("api"), "#pragma once\nint Api();\n").unwrap();
+        std::fs::write(
+            root.join("main.cpp"),
+            "#include <api>\nint Run() { return Api(); }\n",
+        )
+        .unwrap();
+        let boundary = Arc::new(trace_preproc::InputBoundary::new(root.clone()));
+        let mut opts = PreprocessOptions::new()
+            .with_compiler_system_include(&sys)
+            .with_canonical_system_headers(true);
+        opts.input_boundary = Some(Arc::clone(&boundary));
+        let program = build_program_with_jobs(&root, &opts, 1).unwrap();
+        assert!(program.symbols.functions.iter().any(|f| f.name == "Api"));
+        assert_eq!(boundary.external_paths(), Vec::<PathBuf>::new());
+
+        // A prelude header outside the tree is still an external input.
+        let outside = tempfile::tempdir().unwrap();
+        let external = trace_ir::canonicalize(outside.path());
+        std::fs::write(external.join("api"), "#pragma once\nint Api();\n").unwrap();
+        let boundary = Arc::new(trace_preproc::InputBoundary::new(root.clone()));
+        let mut opts = PreprocessOptions::new()
+            .with_compiler_system_include(&external)
+            .with_canonical_system_headers(true);
+        opts.input_boundary = Some(Arc::clone(&boundary));
+        build_program_with_jobs(&root, &opts, 1).unwrap();
+        assert_eq!(boundary.external_paths(), vec![external.join("api")]);
+    }
+
+    /// The library option discovers the host compiler's roots on its own, as
+    /// the CLI flag does, when the caller declared none.
+    #[test]
+    fn canonical_option_discovers_compiler_roots_without_declared_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.cpp"),
+            "#include <stddef.h>\nsize_t Size() { return sizeof(int); }\n",
+        )
+        .unwrap();
+        let opts = PreprocessOptions::new().with_canonical_system_headers(true);
+        let program = build_program_with_jobs(dir.path(), &opts, 1).unwrap();
+        let paths: Vec<_> = program.symbols.files.iter().map(|f| &f.path).collect();
+        if !paths.iter().any(|path| path.ends_with("stddef.h")) {
+            eprintln!("skipping: no host gcc/clang supplies <stddef.h>");
+            return;
+        }
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with(".trace-canonical-std-cpp.prelude")),
+            "{paths:?}"
+        );
+    }
+
+    /// A C unit's prelude reads only the spellings C units and the headers
+    /// they reach write, even when one root serves both languages; each
+    /// language's prelude keeps its own dependency-owned identity.
+    #[test]
+    fn mixed_trees_build_one_prelude_per_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let sys = dir.path().join("sys");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sys).unwrap();
+        std::fs::write(sys.join("api.h"), "#pragma once\nint Shared(void);\n").unwrap();
+        std::fs::write(
+            sys.join("vector"),
+            "#pragma once\nnamespace std { template <class T> struct vector { void push_back(const T &); }; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("own.h"), "#pragma once\n#include <api.h>\n").unwrap();
+        std::fs::write(
+            root.join("a.c"),
+            "#include \"own.h\"\nint a(void) { return Shared(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.cpp"),
+            "#include \"own.h\"\n#include <vector>\nvoid b() { std::vector<int> v; v.push_back(Shared()); }\n",
+        )
+        .unwrap();
+        let files = vec![
+            trace_ir::canonicalize(&root.join("a.c")),
+            trace_ir::canonicalize(&root.join("b.cpp")),
+        ];
+        let headers = vec![trace_ir::canonicalize(&root.join("own.h"))];
+        let graph = IncludeGraph::build(&root, &files, &headers);
+        let sources = canonical_prelude_sources(&graph, &files, &headers, None);
+        assert_eq!(
+            sources,
+            vec![
+                (Language::C, vec![files[0].clone(), headers[0].clone()]),
+                (Language::Cpp, vec![files[1].clone(), headers[0].clone()]),
+            ]
+        );
+        let roots = vec![sys.clone()];
+        let (c_preamble, _c) =
+            canonical_system_preamble(&graph, &sources[0].1, &roots, Language::C).unwrap();
+        let (cpp_preamble, _cpp) =
+            canonical_system_preamble(&graph, &sources[1].1, &roots, Language::Cpp).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(c_preamble).unwrap(),
+            "#include <api.h>\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cpp_preamble).unwrap(),
+            "#include <api.h>\n#include <vector>\n"
+        );
+
+        let mut opts = PreprocessOptions::new().with_canonical_system_headers(true);
+        opts.compiler_system_include_paths = roots;
+        for jobs in [1, 3] {
+            let program = build_program_with_jobs(&root, &opts, jobs).unwrap();
+            let mut identities: Vec<_> = program
+                .symbols
+                .files
+                .iter()
+                .filter(|file| file.path.extension().is_some_and(|e| e == "prelude"))
+                .map(|file| (file.path.file_name().unwrap().to_owned(), file.is_dep))
+                .collect();
+            identities.sort();
+            assert_eq!(
+                identities,
+                [
+                    (".trace-canonical-std-c.prelude".into(), true),
+                    (".trace-canonical-std-cpp.prelude".into(), true),
+                ]
+            );
+            let names: Vec<_> = program
+                .symbols
+                .functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect();
+            assert!(names.contains(&"std::vector::push_back"), "{names:?}");
+            // The C grammar never lowered the C++-only header.
+            assert!(!names.contains(&"push_back"), "{names:?}");
+            assert!(names.contains(&"Shared"), "{names:?}");
+        }
+    }
+
+    /// Compiler-default roots can be supplied explicitly, so a bare tree with
+    /// no host probe indexes one shared standard-header prelude.
+    #[test]
+    fn canonical_preamble_supplies_system_declarations_to_every_tu() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path().join("sys");
+        std::fs::create_dir(&sys).unwrap();
+        std::fs::write(
+            dir.path().join("a.c"),
+            "#include \"own.h\"\nint a(void) { return fake(1); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.c"),
+            "#include \"own.h\"\nint b(void) { return fake(2); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sys.join("fake.h"),
+            "#ifndef FAKE_H\n#define FAKE_H\nint fake(int x);\n#endif\n",
+        )
+        .unwrap();
+
+        // The selected TU preambles contain only this project header: the
+        // system declaration unit is merged late in canonical mode.
+        std::fs::write(
+            dir.path().join("own.h"),
+            "#pragma once\n#include <fake.h>\nstruct Own { int value; };\n",
+        )
+        .unwrap();
+
+        let mut opts = PreprocessOptions::new();
+        opts.compiler_system_include_paths = vec![sys.clone()];
+        opts.canonical_system_headers = true;
+        let program = build_program_with_jobs(dir.path(), &opts, 2).unwrap();
+
+        let paths: Vec<_> = program
+            .symbols
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        // Only the language's stable prelude identity, never a scratch name,
+        // with the ownership of the headers it stands for (this fixture's
+        // root lies inside the project, so neither is a dependency).
+        let canonical: Vec<_> = program
+            .symbols
+            .files
+            .iter()
+            .filter(|file| {
+                file.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".trace-canonical-std")
+            })
+            .collect();
+        assert_eq!(canonical.len(), 1, "{canonical:?}");
+        assert_eq!(
+            canonical[0].path,
+            trace_ir::canonicalize(&sys).join(".trace-canonical-std-c.prelude")
+        );
+        assert_eq!(
+            canonical[0].is_dep,
+            program.symbols.path_is_dep(&sys.join("fake.h"))
+        );
+        let again = build_program_with_jobs(dir.path(), &opts, 1).unwrap();
+        assert_eq!(
+            paths,
+            again
+                .symbols
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>()
+        );
+
+        for name in ["a", "b", "fake"] {
+            assert!(
+                program
+                    .symbols
+                    .functions
+                    .iter()
+                    .any(|function| function.name == name),
+                "missing {name}"
+            );
+        }
+        assert_eq!(
+            program
+                .symbols
+                .call_sites
+                .iter()
+                .filter(|site| site.callee_name == "fake")
+                .count(),
+            2
+        );
     }
 }

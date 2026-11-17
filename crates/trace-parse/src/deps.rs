@@ -371,6 +371,13 @@ impl IncludeGraph {
         if !(self.project_files.contains(&from) || self.external_headers.contains(&from)) {
             return;
         }
+        let existing = self.edges.get(&from).map_or(&[][..], Vec::as_slice);
+        // Preprocessing reports transitive include closures. Large shared
+        // system closures otherwise re-scan the growing edge vector for
+        // every header of every TU. Preserve append order with membership
+        // checks rather than iterating the set.
+        let mut known = (existing.len() + headers.len() > 32)
+            .then(|| existing.iter().cloned().collect::<HashSet<_>>());
         for h in headers {
             let to = self.intern_path(h);
             if to == from
@@ -379,16 +386,20 @@ impl IncludeGraph {
                 continue;
             }
             let e = self.edges.entry(from.clone()).or_default();
-            if !e.contains(&to) {
+            let fresh = match &mut known {
+                Some(known) => known.insert(to.clone()),
+                None => !e.contains(&to),
+            };
+            if fresh {
                 e.push(to);
             }
         }
     }
 
-    /// `path` as stored in [`Self::project_files`] when it is already a key,
+    /// `path` as stored in the graph's canonical file sets when already known,
     /// otherwise [`trace_ir::canonicalize`] (syscall).
     pub fn intern_path(&self, path: &Path) -> PathBuf {
-        if self.project_files.contains(path) {
+        if self.project_files.contains(path) || self.external_headers.contains(path) {
             return path.to_path_buf();
         }
         canonicalize(path)

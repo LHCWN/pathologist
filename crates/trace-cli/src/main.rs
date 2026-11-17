@@ -34,7 +34,7 @@ struct Cli {
 enum Commands {
     /// Analyze a C project directory and write results to SQLite.
     #[command(group(clap::ArgGroup::new("compiler_discovery")
-        .args(["compiler_predefines", "system_includes"]).multiple(true)))]
+        .args(["compiler_predefines", "system_includes", "canonical_system_headers"]).multiple(true)))]
     Analyze {
         /// Target project directory containing .c files.
         target: PathBuf,
@@ -61,6 +61,12 @@ enum Commands {
         /// without commands, uses host GCC/Clang (must match the target SDK).
         #[arg(long)]
         system_includes: bool,
+        /// Lower the host compiler's standard headers once, as one shared
+        /// prelude, instead of per translation unit (implies
+        /// --system-includes; bare-tree indexing only). One standard-library
+        /// configuration serves every unit (experimental).
+        #[arg(long)]
+        canonical_system_headers: bool,
         /// Import allowlisted target compiler predefined macros (opt-in).
         #[arg(long)]
         compiler_predefines: bool,
@@ -452,6 +458,7 @@ fn main() -> Result<()> {
             compile_commands,
             require_local_inputs,
             system_includes,
+            canonical_system_headers,
             compiler_predefines,
             compiler,
             compiler_arg,
@@ -481,6 +488,7 @@ fn main() -> Result<()> {
             compile_commands,
             require_local_inputs,
             system_includes,
+            canonical_system_headers,
             compiler_predefines,
             compiler,
             compiler_arg,
@@ -528,6 +536,7 @@ fn run_analyze(
     compile_commands: Option<PathBuf>,
     require_local_inputs: bool,
     system_includes: bool,
+    canonical_system_headers: bool,
     compiler_predefines: bool,
     compiler: Option<PathBuf>,
     compiler_arg: Vec<String>,
@@ -600,7 +609,8 @@ fn run_analyze(
         }
     }
     opts.compilation_database = compile_commands;
-    opts.system_includes = system_includes;
+    opts.system_includes = system_includes || canonical_system_headers;
+    opts.canonical_system_headers = canonical_system_headers;
     opts.compiler_predefines = compiler_predefines;
     opts.compiler = match compiler {
         Some(path) if path.is_relative() && path.components().count() > 1 => {
@@ -1312,6 +1322,30 @@ mod compiler_options_tests {
         };
         assert_eq!(compiler_arg, ["--target=aarch64-linux-gnu", "-m64"]);
         assert!(compiler_predefines && system_includes);
+    }
+
+    #[test]
+    fn canonical_system_headers_select_a_compiler_like_system_includes() {
+        let cli = Cli::try_parse_from([
+            "trace",
+            "analyze",
+            ".",
+            "--canonical-system-headers",
+            "--compiler",
+            "clang",
+        ])
+        .unwrap();
+        let Commands::Analyze {
+            canonical_system_headers,
+            system_includes,
+            ..
+        } = cli.command
+        else {
+            panic!("analyze");
+        };
+        // `run_analyze` turns on system-include discovery for the flag.
+        assert!(canonical_system_headers && !system_includes);
+        assert!(Cli::try_parse_from(["trace", "analyze", ".", "--compiler", "clang"]).is_err());
     }
 
     #[test]

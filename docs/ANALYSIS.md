@@ -152,6 +152,10 @@ file-static cells retain their supporting initializers. Imported file-static
 storage also receives its initializer when a default argument of an external
 inline function is its only consumer; connected initializer temporaries and
 address/function facts follow that storage.
+An external header getter returning an internal C++ function retains the
+TU's return binding when the getter body has already been merged. Otherwise
+the shared body would lose its static callback as header-preamble merging
+omits internal definitions until their TU replay.
 
 Header-unit selection and dependency scheduling reject a different language
 before consulting variant records, including the project-header fallback when
@@ -329,7 +333,11 @@ search paths or basename fallback.
 
 An excluded definition must not erase its caller's external edge. External
 synthesis uses the shared resolver across all contributing translation units,
-including internal callees reached from header macros. An external synthesized
+including internal callees reached from header macros. A call site the
+contextual call resolver already binds, for example to an internal-linkage
+function visible from its unit or from any unit contributing a shared header
+call, is never bound to a synthesized external, so a header-static function
+declared nowhere in the unit's lowered text still resolves. An external synthesized
 after that lookup retains its result; it does not expand again by name into
 a different production overload.
 Unscoped C definitions in different inferred partitions also retain separate
@@ -5930,6 +5938,11 @@ headers use one fallback compiler for the project. GCC is preferred when it
 supplies both C and C++ search lists; otherwise Clang is tried. Reached
 external system headers have dependency ownership. Probe flag and executable
 path rules are specified in [Compilation database options](PREPROCESSOR.md#compilation-database-options-62).
+Bare-tree indexing can instead lower the compiler-default standard headers once,
+as one shared prelude, with `--canonical-system-headers`: project headers then
+follow the default sharing rules and translation units never hold standard
+text. See [Canonical system-header prelude](CANONICAL_SYSTEM_PRELUDE.md) for
+its precision tradeoffs and measurements.
 For C++ dependency headers, the parse input approximates simple
 pointer-to-member types (`T C::*`) as ordinary pointers (`T *`). This spelling
 confuses the tree-sitter C++ grammar, while dependency bodies are

@@ -1635,9 +1635,7 @@ fn merge_unit(
     }
 
     for (old_fn, flows) in &unit.fn_returns {
-        if dropped_fns.contains(old_fn) {
-            continue;
-        }
+        let dropped = dropped_fns.contains(old_fn);
         let Some(&new_fn) = fn_map.get(old_fn) else {
             continue;
         };
@@ -1645,11 +1643,24 @@ fn merge_unit(
             Some(f) => merges_body(program, mode, f),
             None => !matches!(mode, MergeMode::SymbolsOnly),
         };
-        if !merges {
-            continue;
-        }
+        // The external header body may already be merged while its static
+        // return target is replayed only in this TU. Retain that binding even
+        // when the duplicate body itself is dropped.
+        let replay_internal = matches!(
+            mode,
+            MergeMode::SymbolsOnly | MergeMode::Full | MergeMode::Variant
+        ) && program
+            .symbols
+            .function_by_id(new_fn)
+            .is_some_and(|f| !program.is_dep_file(f.file));
         let remapped: Vec<ReturnFlow> = flows
             .iter()
+            .filter(|flow| {
+                (!dropped && merges)
+                    || (replay_internal
+                        && return_flow_fns(flow)
+                            .any(|f| fn_map.get(&f).copied().is_some_and(is_internal_fn)))
+            })
             .filter(|f| {
                 f.var().into_iter().all(|v| var_map.contains_key(&v))
                     && return_flow_fns(f).all(|callee| fn_map.contains_key(&callee))

@@ -5,6 +5,291 @@ use trace_parse::build_program_with_jobs;
 use trace_preproc::PreprocessOptions;
 
 #[test]
+fn canonical_scratch_names_do_not_change_exported_analysis() {
+    let fixture = crate::common::fixture("preproc/lookup_context");
+    let root = fixture.join("project");
+    let opts = PreprocessOptions::new()
+        .with_compiler_system_include(fixture.join("system"))
+        .with_canonical_system_headers(true);
+    let mut baseline = None;
+    for jobs in [1, 3] {
+        let program = build_program_with_jobs(&root, &opts, jobs).unwrap();
+        let (pag, analysis) = analyze(&program);
+        let db = crate::common::export_program_full(&program, &pag, &analysis);
+        let rows = crate::common::analysis_rows(&db);
+        if let Some(expected) = &baseline {
+            assert_eq!(&rows, expected);
+        }
+        baseline = Some(rows);
+    }
+}
+
+/// Canonical mode changes where standard declarations and macros come from,
+/// not how project headers are shared: on a tree whose standard include adds
+/// no project-visible macro, its call graph is the default-mode graph, with
+/// each call site lowered once (no duplicate overload-tie sites).
+#[test]
+fn canonical_mode_lowers_project_headers_like_default_indexing() {
+    let fixture = crate::common::fixture("preproc/lookup_context");
+    let root = fixture.join("project");
+    let sites = |opts: &PreprocessOptions, jobs: usize| {
+        let program = build_program_with_jobs(&root, opts, jobs).unwrap();
+        let (_, analysis) = analyze(&program);
+        let mut edges: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .map(|edge| {
+                let site = program
+                    .symbols
+                    .call_site_by_id(edge.call_site)
+                    .map(|site| (site.span.line, site.span.col));
+                (
+                    program.symbols.function(edge.caller).name.clone(),
+                    program.symbols.function(edge.callee).name.clone(),
+                    site,
+                )
+            })
+            .collect();
+        edges.sort();
+        let declared = program
+            .symbols
+            .functions
+            .iter()
+            .any(|function| function.name == "EnableSystemSearch");
+        (edges, declared)
+    };
+    for static_context in [false, true] {
+        let mut default = PreprocessOptions::new();
+        let mut canonical = PreprocessOptions::new()
+            .with_compiler_system_include(fixture.join("system"))
+            .with_canonical_system_headers(true);
+        if static_context {
+            default = default.with_define("TEST_STATIC_CONTEXT", "1");
+            canonical = canonical.with_define("TEST_STATIC_CONTEXT", "1");
+        }
+        let (expected, declared) = sites(&default, 1);
+        assert!(!declared);
+        for (caller, callee) in [
+            ("Client::DirectCallback", "SDK::Callback"),
+            ("SDK::Callback", "SDK::Leaf"),
+            ("Another", "Client::HeaderRun"),
+        ] {
+            assert!(
+                expected
+                    .iter()
+                    .any(|edge| edge.0 == caller && edge.1 == callee),
+                "{expected:?}"
+            );
+        }
+        let mut unique = expected.clone();
+        unique.dedup();
+        assert_eq!(unique, expected, "duplicate call sites");
+        for jobs in [1, 3] {
+            let (edges, declared) = sites(&canonical, jobs);
+            assert!(declared, "the prelude supplies the standard declaration");
+            assert_eq!(edges, expected, "jobs={jobs}");
+        }
+    }
+}
+
+/// A covered standard header's `static` function keeps internal linkage in
+/// every consumer, also through a nested include. Ordinary indexing binds the
+/// unit's header-static copy while lowering. Canonical mode has no standard
+/// declarations then, so the call resolves by name afterwards: the visible
+/// header-static copy is always a target (never a placeholder), and an
+/// unrelated external definition of the name stays a may-candidate, as the
+/// resolver does for any name both a static and an external entry match.
+#[test]
+fn canonical_prelude_static_functions_bind_in_each_consuming_unit() {
+    for (unit, other) in [("main.c", "other.c"), ("main.cpp", "other.cpp")] {
+        for external in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("project");
+            let sys = dir.path().join("sys");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&sys).unwrap();
+            fs::write(
+                sys.join("inner.h"),
+                "#pragma once\nstatic inline int api(void) { return 1; }\n",
+            )
+            .unwrap();
+            fs::write(sys.join("outer.h"), "#pragma once\n#include <inner.h>\n").unwrap();
+            fs::write(
+                root.join(unit),
+                "#include <outer.h>\nint Run(void) { return api(); }\n",
+            )
+            .unwrap();
+            if external {
+                fs::write(root.join(other), "int api(void) { return 2; }\n").unwrap();
+            }
+            let ordinary = PreprocessOptions::new().with_compiler_system_include(&sys);
+            let canonical = ordinary.clone().with_canonical_system_headers(true);
+            for (mode, opts) in [("ordinary", &ordinary), ("canonical", &canonical)] {
+                let program = build_program_with_jobs(&root, opts, 1).unwrap();
+                let (_, analysis) = analyze(&program);
+                let mut targets: Vec<_> = analysis
+                    .call_edges
+                    .iter()
+                    .filter(|edge| program.symbols.function(edge.caller).name == "Run")
+                    .map(|edge| {
+                        let callee = program.symbols.function(edge.callee);
+                        program.symbols.files[callee.file.0 as usize]
+                            .path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                targets.sort();
+                let expected: &[&str] = if mode == "canonical" && external {
+                    &["inner.h", other]
+                } else {
+                    &["inner.h"]
+                };
+                assert_eq!(targets, expected, "{unit} {mode} external={external}");
+            }
+        }
+    }
+}
+
+/// A shared project-header body resolves through the units that contribute
+/// it: `Helper` calls a header-static function visible only through its
+/// consuming unit's earlier standard include, and binds that function rather
+/// than a synthesized external.
+#[test]
+fn shared_header_calls_bind_prelude_statics_through_their_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let sys = dir.path().join("sys");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&sys).unwrap();
+    fs::write(
+        sys.join("inner.h"),
+        "#pragma once\nstatic inline int api(void) { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(sys.join("outer.h"), "#pragma once\n#include <inner.h>\n").unwrap();
+    fs::write(
+        root.join("helper.h"),
+        "#pragma once\ninline int Helper() { return api(); }\n",
+    )
+    .unwrap();
+    for unit in ["a.cpp", "b.cpp"] {
+        fs::write(
+            root.join(unit),
+            "#include <outer.h>\n#include \"helper.h\"\nint Run() { return Helper(); }\n",
+        )
+        .unwrap();
+    }
+    let ordinary = PreprocessOptions::new().with_compiler_system_include(&sys);
+    let canonical = ordinary.clone().with_canonical_system_headers(true);
+    for (mode, opts) in [("ordinary", &ordinary), ("canonical", &canonical)] {
+        for jobs in [1, 3] {
+            let program = build_program_with_jobs(&root, opts, jobs).unwrap();
+            let (_, analysis) = analyze(&program);
+            let targets: Vec<_> = analysis
+                .call_edges
+                .iter()
+                .filter(|edge| program.symbols.function(edge.caller).name == "Helper")
+                .map(|edge| {
+                    let callee = program.symbols.function(edge.callee);
+                    let file = program.symbols.files[callee.file.0 as usize]
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    (callee.name.clone(), file)
+                })
+                .collect();
+            assert_eq!(
+                targets,
+                [("api".to_string(), "inner.h".to_string())],
+                "{mode} jobs={jobs}"
+            );
+        }
+    }
+}
+
+/// A header getter returning `&` a header-static function: its shared body is
+/// merged once, but each unit that calls it owns a copy of the static target,
+/// so every unit keeps the return binding to the callback (the replay of
+/// internal return targets in `merge_unit`).
+#[test]
+fn header_getters_return_each_units_static_callback() {
+    let (program, analysis) = crate::common::analyze_source(&[
+        (
+            "handler.h",
+            "#pragma once\nvoid Leaf();\nstatic void Callback() { Leaf(); }\n\
+             typedef void (*Handler)();\ninline Handler GetHandler() { return &Callback; }\n",
+        ),
+        (
+            "a.cpp",
+            "#include \"handler.h\"\nvoid A() { Handler h = GetHandler(); h(); }\n",
+        ),
+        (
+            "b.cpp",
+            "#include \"handler.h\"\nvoid B() { Handler h = GetHandler(); h(); }\n",
+        ),
+    ]);
+    for caller in ["A", "B"] {
+        assert!(
+            crate::common::has_any_edge(&program, &analysis, caller, "Callback"),
+            "{caller}: {:?}",
+            crate::common::callees_of(&program, &analysis, caller)
+        );
+    }
+    assert!(crate::common::has_any_edge(
+        &program, &analysis, "Callback", "Leaf"
+    ));
+}
+
+#[test]
+fn shared_project_class_imports_preserve_overload_result_typing() {
+    let fixture = crate::common::fixture("preproc/member_imports");
+    let mut baseline = None;
+    for variants in [0, 8] {
+        // A system root enables the sharing safety gates, even though this
+        // fixture's declarations all belong to project headers.
+        let opts = PreprocessOptions::new()
+            .with_system_include(&fixture)
+            .with_max_expansion_variants(variants);
+        for jobs in [1, 3] {
+            let program = build_program_with_jobs(&fixture, &opts, jobs).unwrap();
+            let (_, analysis) = analyze(&program);
+            let mut callees: Vec<_> = analysis
+                .call_edges
+                .iter()
+                .filter(|edge| program.symbols.function(edge.caller).name == "Run")
+                .map(|edge| program.symbols.function(edge.callee).name.clone())
+                .collect();
+            callees.sort();
+            assert!(
+                callees.iter().any(|name| name == "Local::Base::Select"),
+                "{callees:?}"
+            );
+            assert!(
+                callees.iter().any(|name| name == "Local::Result::Touch"),
+                "{callees:?}"
+            );
+            assert!(
+                !callees.iter().any(|name| name == "Local::Derived::Select"),
+                "{callees:?}"
+            );
+            assert!(
+                !callees.iter().any(|name| name == "Local::Other::Wrong"),
+                "{callees:?}"
+            );
+            if let Some(expected) = &baseline {
+                assert_eq!(&callees, expected, "variants={variants}, jobs={jobs}");
+            }
+            baseline = Some(callees);
+        }
+    }
+}
+
+#[test]
 fn shared_system_preambles_keep_call_sequencing_enabled() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");

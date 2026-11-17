@@ -4,6 +4,43 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Preserve files and directory context during system-header indexing
+
+Canonical preambles now use exclusively created, run-owned temporary files in
+the system temporary directory, never in the analyzed tree, preserving
+existing files and links and separating concurrent analyses. Their
+synthetic IR identity stays stable for reproducible exports. Compiler probes
+stay scoped to their command directory: a wrapper can choose an SDK relative to
+its working directory while printing absolute paths, so a probe is never reused
+for another directory.
+
+### Index compiler standard headers as one canonical prelude
+
+Bare-tree `--system-includes` re-lowered standard headers for every
+translation unit. `--canonical-system-headers` (which implies
+`--system-includes`) preprocesses the tree's standard includes once, inline,
+lowers them to one shared prelude per language, and merges it into the final
+program after the translation units. The same run yields the prelude's macro
+closure: every preprocessing run starts from it, and an include of a header the
+prelude read contributes nothing. Standard headers therefore never reach a
+translation unit, and project headers follow exactly the default sharing rules.
+Each language's prelude reads only the standard spellings its own units reach,
+under its compiler-default roots, and is exported as a dependency-owned unit.
+Directories from include environment variables such as `CPATH`, and explicit
+`-isystem`/`-idirafter` trees, are searched but never treated as compiler
+defaults, by either bare-tree or compilation-database probing. Ordinary
+`--system-includes` and default indexing keep their previous output.
+
+On the complete `ability_ability_runtime` tree (Linux, eight workers) the mode
+takes about 3.5% longer than default indexing, with the same peak memory,
+instead of 3.3 times as long. Its call graph keeps every distinct default-mode
+direct edge and binds standard calls to the prelude's declarations. The mode
+is opt-in, an explicit trade in standard-library configuration and typing
+precision, and ignored with configured indexing. See the
+[design and investigation](docs/CANONICAL_SYSTEM_PRELUDE.md),
+[measurements](docs/EVAL_REPORT.md#canonical-prelude-at-default-mode-cost-2026-11-16)
+and [preprocessor contract](docs/PREPROCESSOR.md#canonical-system-preamble).
+
 ### Look up call sites by ID with a binary search
 
 `SymbolTable::call_site_by_id` checked the record at the ID's position and, on a

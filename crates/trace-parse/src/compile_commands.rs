@@ -274,7 +274,7 @@ impl CompilationDatabase {
                         .map(|_| explicit_late_paths(&opts));
                     if overrides.system_includes || overrides.compiler_predefines {
                         let language = opts.language.unwrap_or_else(|| Language::from_path(&file));
-                        let search = compiler_includes.for_command(
+                        let mut search = compiler_includes.for_command(
                             &args,
                             &directory,
                             language,
@@ -295,7 +295,8 @@ impl CompilationDatabase {
                                 }
                             }
                         }
-                        opts.compiler_defines.extend(search.target_defines);
+                        opts.compiler_defines
+                            .extend(std::mem::take(&mut search.target_defines));
                         if !search.paths.is_empty() {
                             let cpath_dirs = cpath_by_directory
                                 .entry(directory.clone())
@@ -311,7 +312,9 @@ impl CompilationDatabase {
                                 &cli_include_paths,
                                 cpath_dirs,
                             );
-                            opts.system_include_paths = search.paths;
+                            // Explicit `-isystem` paths are echoed by the probe
+                            // but are not compiler defaults.
+                            crate::compiler_includes::apply_probed_search(&mut opts, &search);
                         }
                     }
                     if let (Some(searches), Some(excluded_cli)) =

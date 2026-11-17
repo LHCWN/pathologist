@@ -28,6 +28,12 @@ pub enum PreprocessError {
 
 #[derive(Debug, Clone)]
 pub struct PreprocessResult {
+    /// False if something cut this run short: a resource limit, or a file
+    /// that stopped part-way through (the cases `limit_warn` reports).
+    pub complete: bool,
+    /// Executed directives, excluding initial predefined/command macros.
+    /// Empty unless `PreprocessOptions::record_macro_ops` is enabled.
+    pub macro_ops: Arc<[MacroOp]>,
     pub output: String,
     pub line_map: LineMap,
     pub diagnostics: Vec<crate::SharedDiagnostic>,
@@ -234,6 +240,10 @@ struct PreprocessorState {
     /// Under `defer_expansion_publish`, where this run's cache reads and
     /// writes go.
     journal: Option<crate::ExpansionJournal>,
+    /// Standard headers a canonical prelude read: their declarations are
+    /// lowered once in the prelude and their macros seed this run, so an
+    /// `#include` resolving to one contributes nothing here.
+    canonical_files: Option<Arc<FxHashSet<PathBuf>>>,
 }
 
 /// One level of `#if`/`#elif`/`#else` nesting. A per-level bool is not
@@ -269,8 +279,18 @@ struct OutputScope {
     extern_pending: bool,
     linkage_pending: bool,
     root_block: bool,
+    /// One bit per delimiter, marking proven class bodies. Member imports
+    /// are carried by class IR rather than changing the includer's lookup.
+    class_scopes: u64,
+    class_pending: Option<u32>,
+    /// The previous token introduces an attribute operand (`alignas(...)`),
+    /// which may sit between a class key and its name.
+    attribute_operand: bool,
+    /// Delimiters already open when this file began. A member fragment
+    /// included inside someone else's class has no standalone class IR.
+    member_base: u32,
     // A using-declaration changes consumer lookup; an alias is already in IR.
-    using_declaration: Option<(u32, bool)>,
+    using_declaration: Option<(u32, bool, bool)>,
     context_effects: u64,
 }
 
@@ -286,6 +306,10 @@ impl Default for OutputScope {
             extern_pending: false,
             linkage_pending: false,
             root_block: false,
+            class_scopes: 0,
+            class_pending: None,
+            attribute_operand: false,
+            member_base: 0,
             using_declaration: None,
             context_effects: 0,
         }
@@ -301,18 +325,44 @@ impl OutputScope {
         if matches!(kind, TokenKind::Newline | TokenKind::Eof) {
             return;
         }
+        let after_attribute = std::mem::replace(
+            &mut self.attribute_operand,
+            matches!(kind, TokenKind::Identifier(name) if matches!(
+                name.as_str(),
+                "alignas" | "_Alignas" | "__attribute__" | "__attribute" | "__declspec"
+            )),
+        );
         if matches!(kind, TokenKind::Identifier(name) if name == "using") {
-            self.using_declaration = Some((self.depth, true));
+            let local_depth = self.depth.saturating_sub(self.member_base);
+            let local_mask = if local_depth == 64 {
+                u64::MAX
+            } else {
+                (1u64 << local_depth) - 1
+            };
+            self.using_declaration = Some((
+                self.depth,
+                true,
+                self.valid && self.class_scopes & local_mask != 0,
+            ));
         }
-        if let (Some((depth, alias_possible)), TokenKind::Punct(punct)) =
+        if let TokenKind::Identifier(name) = kind {
+            match name.as_str() {
+                "class" | "struct" | "union" => self.class_pending = Some(self.depth),
+                "namespace" | "extern" => self.class_pending = None,
+                _ => {}
+            }
+        }
+        if let (Some((depth, alias_possible, member)), TokenKind::Punct(punct)) =
             (self.using_declaration, kind)
         {
             if self.depth == depth {
                 match *punct {
-                    "::" => self.using_declaration = Some((depth, false)),
+                    "::" => self.using_declaration = Some((depth, false, member)),
                     "=" if alias_possible => self.using_declaration = None,
                     ";" => {
-                        self.context_effects += 1;
+                        if !member {
+                            self.context_effects += 1;
+                        }
                         self.using_declaration = None;
                     }
                     _ => {}
@@ -341,6 +391,18 @@ impl OutputScope {
         if !self.valid {
             return;
         }
+        // An elaborated type or a template parameter is not evidence that
+        // the next brace opens a class. Ambiguous template bases stay on the
+        // conservative path; a subsequent real class introducer starts anew.
+        if matches!(punct, ";" | "=" | "," | ">" | ">>") && self.class_pending == Some(self.depth) {
+            self.class_pending = None;
+        }
+        // Only an attribute operand may be parenthesized before a class body.
+        // Any other parenthesis is a declarator, as in a function returning
+        // `struct P` by value, whose body is not a class.
+        if punct == "(" && !after_attribute && self.class_pending == Some(self.depth) {
+            self.class_pending = None;
+        }
         match punct {
             "{" | "<%" | "(" | "[" | "<:" => {
                 if self.depth == 0 && matches!(punct, "{" | "<%") {
@@ -356,6 +418,11 @@ impl OutputScope {
                     "(" => 2,
                     _ => 3,
                 };
+                let class = code == 1 && self.class_pending == Some(self.depth);
+                self.class_scopes = (self.class_scopes << 1) | u64::from(class);
+                if class {
+                    self.class_pending = None;
+                }
                 self.stack = (self.stack << 2) | code;
                 self.depth += 1;
             }
@@ -370,7 +437,11 @@ impl OutputScope {
                     return;
                 }
                 self.stack >>= 2;
+                self.class_scopes >>= 1;
                 self.depth -= 1;
+                if self.class_pending.is_some_and(|depth| depth > self.depth) {
+                    self.class_pending = None;
+                }
             }
             _ => {}
         }
@@ -452,6 +523,7 @@ impl PreprocessorState {
         let system_roots = if opts.separate_system_headers {
             opts.system_include_paths
                 .iter()
+                .chain(&opts.compiler_system_include_paths)
                 .chain(&opts.after_include_paths)
                 .map(|root| trace_ir::canonicalize(root))
                 .collect()
@@ -512,6 +584,7 @@ impl PreprocessorState {
             shared_directory_results,
             forced_include_depth: 0,
             journal: None,
+            canonical_files: None,
         };
         let file = std::mem::take(&mut state.current_file);
         state.set_current_file(file);
@@ -524,7 +597,21 @@ impl PreprocessorState {
                 language,
             ));
         }
+        let canonical = state
+            .opts
+            .canonical_system_preludes
+            .as_ref()
+            .and_then(|by_language| by_language.get(&language))
+            .cloned();
         let warm = state.opts.shared_macros.is_some();
+        // The closure follows the whole command-line seed it was computed
+        // under. Only a run whose seed is predefines, compiler and `-D`
+        // definitions can start from a cached seeded table; any other applies
+        // the closure once that seed is complete, below.
+        let (seeded, pending) = match canonical {
+            Some(prelude) if !warm && state.opts.command_macros.is_empty() => (Some(prelude), None),
+            other => (None, other),
+        };
         if let Some(shared) = &state.opts.shared_macros {
             if let Ok(guard) = shared.read() {
                 state.macros.clone_from(&guard);
@@ -541,6 +628,39 @@ impl PreprocessorState {
             state.init_cli_defines_missing_only();
             state.init_compiler_defines(true);
             state.init_predefined_macros(true);
+        } else if let Some(prelude) = &seeded {
+            // A canonical standard prelude is part of the initial
+            // environment: its final macro state follows the definitions it
+            // was computed under, before any source line, in every run alike.
+            // Building that table once per configuration and cloning it keeps
+            // thousands of standard bindings out of each run's start-up.
+            let key = state.canonical_base_key();
+            debug_assert!(state.fallback_macros.is_empty() && state.macro_hashes.is_empty());
+            if let Some(base) = prelude.base(key) {
+                state.macros = base.macros.clone();
+                state.fallback_macros = base.fallbacks.clone();
+            } else {
+                // The prelude run installed builtins before its standard
+                // headers executed, so a header's `#undef` of a builtin name
+                // stays in effect. Like the cloned table, a built one is the
+                // run's baseline, not a change the deferred-publication
+                // history records.
+                let journal = state.journal.take();
+                state.init_predefined_macros(false);
+                state.init_compiler_defines(false);
+                state.init_cli_defines();
+                state.install_builtin_macros();
+                state.apply_canonical_prelude(prelude);
+                state.journal = journal;
+                prelude.remember_base(
+                    key,
+                    crate::options::CanonicalBase {
+                        macros: state.macros.clone(),
+                        fallbacks: state.fallback_macros.clone(),
+                    },
+                );
+            }
+            state.canonical_files = Some(Arc::clone(&prelude.files));
         } else {
             // Predefines first: a `-D __cplusplus=…` overrides the
             // language's own value.
@@ -550,8 +670,11 @@ impl PreprocessorState {
         }
         // Builtins are local to each preprocess so they apply even when
         // the shared warm table is cloned (hiview `__UNUSED` lives in .cpp
-        // files, not in the header that `#ifndef`s it).
-        state.install_builtin_macros();
+        // files, not in the header that `#ifndef`s it). A seeded canonical
+        // table already holds them, in the prelude's order.
+        if seeded.is_none() {
+            state.install_builtin_macros();
+        }
         if !state.opts.command_macros.is_empty() {
             // `handle_define` needs `&mut self`, and the state owns `opts`,
             // so lend the operations out rather than cloning them.
@@ -591,6 +714,9 @@ impl PreprocessorState {
                 state.init_cli_defines();
             }
         }
+        if let Some(prelude) = &pending {
+            state.apply_canonical_prelude(prelude);
+        }
         state.cpp_standard = state
             .macros
             .get("__cplusplus")
@@ -609,6 +735,7 @@ impl PreprocessorState {
             .unwrap_or(201703);
         // Seeding the environment is the constructor's job; a caller that
         // forgot this step would silently drop every `-include`.
+        state.macro_ops.clear();
         state.process_forced_includes();
         state
     }
@@ -887,7 +1014,7 @@ impl PreprocessorState {
     }
 
     fn insert_macro_arc(&mut self, name: Arc<str>, def: Arc<MacroDef>) {
-        if !self.cache_frames.is_empty() {
+        if self.opts.record_macro_ops || !self.cache_frames.is_empty() {
             self.macro_ops
                 .push(MacroOp::Define(Arc::clone(&name), Arc::clone(&def)));
         }
@@ -897,7 +1024,7 @@ impl PreprocessorState {
     fn insert_macro(&mut self, name: impl Into<Arc<str>>, def: MacroDef) {
         let name_arc: Arc<str> = name.into();
         let def_arc = Arc::new(def);
-        if !self.cache_frames.is_empty() {
+        if self.opts.record_macro_ops || !self.cache_frames.is_empty() {
             self.macro_ops
                 .push(MacroOp::Define(Arc::clone(&name_arc), Arc::clone(&def_arc)));
         }
@@ -922,14 +1049,14 @@ impl PreprocessorState {
     }
 
     fn remove_macro_arc(&mut self, name: &Arc<str>) {
-        if !self.cache_frames.is_empty() {
+        if self.opts.record_macro_ops || !self.cache_frames.is_empty() {
             self.macro_ops.push(MacroOp::Undef(Arc::clone(name)));
         }
         self.remove_macro_internal(name.as_ref());
     }
 
     fn remove_macro(&mut self, name: &str) {
-        if !self.cache_frames.is_empty() {
+        if self.opts.record_macro_ops || !self.cache_frames.is_empty() {
             let name_arc: Arc<str> = Arc::from(name);
             self.macro_ops.push(MacroOp::Undef(name_arc));
         }
@@ -1697,6 +1824,43 @@ impl PreprocessorState {
         }
     }
 
+    /// The configuration seeding a canonical base table: the language's
+    /// predefines and the compiler and command-line definitions before it.
+    fn canonical_base_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.language == Language::Cpp).hash(&mut h);
+        for (name, value) in &self.opts.compiler_defines {
+            (0u8, name, value).hash(&mut h);
+        }
+        for (name, value) in &self.opts.defines {
+            (1u8, name, value).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Start from a canonical standard prelude's final macro state. Like
+    /// the predefines, these bindings are the run's initial environment:
+    /// no cache frame is open, and the deferred-publication history treats
+    /// them as its baseline rather than as changes made by this run.
+    fn apply_canonical_prelude(&mut self, prelude: &crate::CanonicalSystemPrelude) {
+        self.macros.reserve(prelude.ops.len());
+        for op in prelude.ops.iter() {
+            match op {
+                MacroOp::Define(name, def) => {
+                    self.fallback_macros.remove(name.as_ref());
+                    self.macros.insert(Arc::clone(name), Arc::clone(def));
+                }
+                MacroOp::Undef(name) => {
+                    self.fallback_macros.remove(name.as_ref());
+                    self.macros.shift_remove(name.as_ref());
+                }
+            }
+        }
+        self.macro_hashes.clear();
+        self.canonical_files = Some(Arc::clone(&prelude.files));
+    }
+
     /// Offer `entry` to the shared cache as an expansion of `canonical`
     /// under the environment its fingerprint records.
     ///
@@ -1775,7 +1939,9 @@ impl PreprocessorState {
                     || e.eq_ignore_ascii_case("h")
             });
         if ordinary {
-            return true;
+            // Even a standalone-warmed fragment must be lowered inside the
+            // includer's class. Its member imports have no standalone owner.
+            return !self.opts.separate_system_headers || self.output_scope.at_boundary();
         }
         if !self.opts.separate_system_headers
             || self.opts.record_conditionals
@@ -1900,6 +2066,14 @@ impl PreprocessorState {
         let canonical = trace_ir::canonicalize(path);
         if let Some(boundary) = &self.opts.input_boundary {
             boundary.record(&canonical);
+        }
+        if self
+            .canonical_files
+            .as_ref()
+            .is_some_and(|files| files.contains(&canonical))
+        {
+            self.included_files.insert(canonical);
+            return Ok(Placed::Apart);
         }
         // A repeated `#include` is skipped only on a reason the file itself
         // stated — its `#pragma once`, or its include guard while that guard
@@ -2168,6 +2342,9 @@ impl PreprocessorState {
             uncached_tokens = Lexer::new(&content, self.language).tokenize();
             &uncached_tokens
         };
+        let member_base = self.output_scope.member_base;
+        self.output_scope.member_base = self.output_scope.depth;
+        self.output_scope.class_pending = None;
         if let Err(e) = self.process_file_tokens(tokens) {
             // Attribute the stop to the file being processed when it failed,
             // not the including TU — downstream consumers key fallback and
@@ -2177,6 +2354,7 @@ impl PreprocessorState {
                 format!("preprocess stopped in {}: {e}", self.current_file.display()),
             );
         }
+        self.output_scope.member_base = member_base;
 
         self.include_stack.pop();
         self.set_current_file(prev_file);
@@ -2415,7 +2593,7 @@ impl PreprocessorState {
             }
             // The log only feeds open frames; once the outermost cached
             // header closes, nothing references these entries any more.
-            if self.cache_frames.is_empty() {
+            if self.cache_frames.is_empty() && !self.opts.record_macro_ops {
                 self.macro_ops.clear();
                 self.macro_ops.shrink_to(256);
             }
@@ -3297,6 +3475,7 @@ impl PreprocessorState {
             let found = quote_dirs
                 .chain(&self.opts.include_paths)
                 .chain(&self.opts.system_include_paths)
+                .chain(&self.opts.compiler_system_include_paths)
                 .chain(&self.opts.after_include_paths)
                 .find(|inc| self.include_exists_in(inc, path))
                 .map(|inc| inc.join(path))
@@ -3780,6 +3959,12 @@ impl PreprocessorState {
             journal.finish(self.macros, self.fallback_macros);
         }
         PreprocessResult {
+            complete: !self.expansion_incomplete,
+            macro_ops: if self.opts.record_macro_ops {
+                self.macro_ops.into()
+            } else {
+                Arc::default()
+            },
             output: self.output,
             line_map: self.line_map,
             diagnostics: self.diagnostics,
@@ -6501,6 +6686,362 @@ mod tests {
                 expected,
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn canonical_prelude_seeds_every_run_and_skips_only_the_headers_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("system");
+        std::fs::create_dir(&system).unwrap();
+        let prime = dir.path().join("prime.cpp");
+        let own = dir.path().join("own.h");
+        let source = dir.path().join("main.cpp");
+        std::fs::write(
+            system.join("first"),
+            "#ifndef FIRST_H\n#define FIRST_H\n#define STD_MODE 1\n#undef RESET_ME\n\
+             #define __UNUSED __attribute__((unused))\nint First();\n#endif\n",
+        )
+        .unwrap();
+        std::fs::write(
+            system.join("second"),
+            "#pragma once\n#define SECOND_MODE 2\nint Second();\n",
+        )
+        .unwrap();
+        // Not read by the prelude: reached only through a macro-spelled include.
+        std::fs::write(system.join("outer"), "#include <first>\nint Outer();\n").unwrap();
+        std::fs::write(&prime, "#include <first>\n#include <second>\n").unwrap();
+        std::fs::write(
+            &own,
+            "#pragma once\n#include <first>\nint in_header = SECOND_MODE;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &source,
+            "#ifdef STD_MODE\nint visible_from_the_start;\n#endif\n\
+             #define RESET_ME 9\n#include \"own.h\"\n\
+             #ifdef RESET_ME\nint project_override_kept;\n#endif\n\
+             #undef STD_MODE\n#define STD_MODE 7\n#include <first>\n\
+             #define OUTER_HEADER <outer>\n#include OUTER_HEADER\n\
+             int final_mode = STD_MODE;\nint seeded = SEED_ONLY;\n\
+             #ifdef __UNUSED\nint closure_replaces_fallback;\n#endif\n\
+             #ifdef __user\nint fallback_is_defined;\n#endif\nint __user *fallback_expands;\n",
+        )
+        .unwrap();
+        // The indexer's prelude run: inline, recording executed directives.
+        let mut inline = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_compiler_system_include(&system);
+        inline.defines.insert("SEED_ONLY".into(), "123".into());
+        inline.record_macro_ops = true;
+        let prepared = preprocess_file(&prime, &inline).unwrap();
+        assert!(prepared.complete);
+        assert!(!prepared.macro_ops.iter().any(|op| matches!(op,
+            MacroOp::Define(name, _) | MacroOp::Undef(name) if &**name == "SEED_ONLY")));
+        let prelude = Arc::new(crate::CanonicalSystemPrelude::new(
+            prepared.macro_ops,
+            prepared
+                .included_headers
+                .into_iter()
+                .filter(|p| p != &trace_ir::canonicalize(&prime))
+                .collect(),
+        ));
+        assert_eq!(prelude.files.len(), 2);
+        for seed in ["123", "456"] {
+            let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+            let mut opts = PreprocessOptions::new()
+                .with_language(Language::Cpp)
+                .with_compiler_system_include(&system)
+                .with_include_expansion_cache(Arc::clone(&cache))
+                .with_inline_include_bodies(false);
+            opts.defines.insert("SEED_ONLY".into(), seed.into());
+            opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter(
+                [&own, &source]
+                    .into_iter()
+                    .map(|p| trace_ir::canonicalize(p)),
+            )));
+            opts.canonical_system_preludes = Some(Arc::new(FxHashMap::from_iter([(
+                Language::Cpp,
+                Arc::clone(&prelude),
+            )])));
+            let mut baseline = None;
+            for (frozen, deferred) in [(false, false), (true, false), (false, true)] {
+                opts.frozen_expansion_cache = frozen;
+                opts.defer_expansion_publish = deferred;
+                let result = preprocess_file(&source, &opts).unwrap();
+                assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+                let compact = result.output.split_whitespace().collect::<String>();
+                // The closure is the initial environment, not replayed at the
+                // first standard include, and covered headers never re-run.
+                assert!(compact.contains("intvisible_from_the_start;"), "{compact}");
+                assert!(compact.contains("intproject_override_kept;"), "{compact}");
+                assert!(compact.contains("final_mode=7;"), "{compact}");
+                assert!(compact.contains(&format!("seeded={seed};")), "{compact}");
+                // The run that builds a configuration's seeded table and the
+                // runs that clone it see the same fallback state: a closure
+                // definition replaces a builtin fallback, other fallbacks stay
+                // invisible to conditionals but still expand.
+                assert!(
+                    compact.contains("intclosure_replaces_fallback;"),
+                    "{compact}"
+                );
+                assert!(!compact.contains("fallback_is_defined"), "{compact}");
+                assert!(compact.contains("int*fallback_expands;"), "{compact}");
+                // Declarations come from the prelude unit, never per consumer.
+                assert!(!compact.contains("First"), "{compact}");
+                assert!(!compact.contains("Second"), "{compact}");
+                assert!(!compact.contains("in_header"), "{compact}");
+                // A standard header the prelude did not read still expands.
+                assert!(compact.contains("intOuter();"), "{compact}");
+                let stored: Vec<String> = cache.read().unwrap()
+                    [&(trace_ir::canonicalize(&own), Language::Cpp)]
+                    .iter()
+                    .map(|entry| entry.text.split_whitespace().collect())
+                    .collect();
+                assert_eq!(stored.len(), 1);
+                assert!(stored[0].contains("in_header=2;"), "{stored:?}");
+                if let Some(journal) = result.expansion_journal {
+                    let mut records = result.replayed_variants;
+                    assert!(journal.commit(&cache, &mut records));
+                }
+                if let Some(expected) = &baseline {
+                    assert_eq!(&result.output, expected);
+                }
+                baseline = Some(result.output);
+            }
+        }
+    }
+
+    /// The closure is the prelude run's final state, reached after the whole
+    /// command-line seed and the builtin fallbacks: a standard header that
+    /// redefines a `-D` macro or undefines a builtin name wins in every
+    /// consumer, with or without compilation-command macros, in the run that
+    /// builds a seeded table and in the runs that clone it.
+    #[test]
+    fn canonical_closure_follows_the_complete_command_line_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("system");
+        std::fs::create_dir(&system).unwrap();
+        let prime = dir.path().join("prime.cpp");
+        let source = dir.path().join("main.cpp");
+        std::fs::write(
+            system.join("mode.h"),
+            "#pragma once\n#undef MODE\n#define MODE 2\n#undef __user\n",
+        )
+        .unwrap();
+        std::fs::write(&prime, "#include <mode.h>\n").unwrap();
+        std::fs::write(
+            &source,
+            "#include <mode.h>\nint mode = MODE;\nint __user *pointer;\nint other = OTHER;\n",
+        )
+        .unwrap();
+        let mut inline = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_compiler_system_include(&system)
+            .with_define("MODE", "1");
+        inline.record_macro_ops = true;
+        let prepared = preprocess_file(&prime, &inline).unwrap();
+        let prelude = Arc::new(crate::CanonicalSystemPrelude::new(
+            prepared.macro_ops,
+            prepared
+                .included_headers
+                .into_iter()
+                .filter(|p| p != &trace_ir::canonicalize(&prime))
+                .collect(),
+        ));
+        for command in [false, true] {
+            let mut opts = PreprocessOptions::new()
+                .with_language(Language::Cpp)
+                .with_compiler_system_include(&system)
+                .with_define("MODE", "1");
+            if command {
+                opts.command_macros
+                    .push(crate::CommandMacro::Define("OTHER".into(), "3".into()));
+            }
+            opts.canonical_system_preludes = Some(Arc::new(FxHashMap::from_iter([(
+                Language::Cpp,
+                Arc::clone(&prelude),
+            )])));
+            for run in 0..2 {
+                let compact = preprocess_file(&source, &opts)
+                    .unwrap()
+                    .output
+                    .split_whitespace()
+                    .collect::<String>();
+                assert!(
+                    compact.contains("intmode=2;"),
+                    "command={command} run={run}: {compact}"
+                );
+                // `__user` is a builtin fallback the standard header removed.
+                assert!(
+                    compact.contains("int__user*pointer;"),
+                    "command={command} run={run}: {compact}"
+                );
+                let other = if command {
+                    "intother=3;"
+                } else {
+                    "intother=OTHER;"
+                };
+                assert!(
+                    compact.contains(other),
+                    "command={command} run={run}: {compact}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn class_member_imports_keep_project_headers_shareable() {
+        let fixture = trace_ir::canonicalize(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/preproc/member_imports"),
+        );
+        let source = fixture.join("main.cpp");
+        let header = fixture.join("own.h");
+        let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.separate_system_headers = true;
+        opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter([
+            source.clone(),
+            header.clone(),
+        ])));
+        for frozen in [false, true] {
+            opts.frozen_expansion_cache = frozen;
+            let result = preprocess_file(&source, &opts).unwrap();
+            assert!(!result.output.contains("struct Derived"));
+            let entries = cache.read().unwrap();
+            let entries = &entries[&(header.clone(), Language::Cpp)];
+            assert_eq!(entries.len(), 1);
+            let compact = entries[0].text.split_whitespace().collect::<String>();
+            assert!(
+                compact.contains("usingBase::Select;"),
+                "{}",
+                entries[0].text
+            );
+        }
+    }
+
+    #[test]
+    fn member_import_fragments_inside_the_includers_class_stay_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.cpp");
+        let member = dir.path().join("member.h");
+        std::fs::write(
+            &source,
+            "struct Base { void f(); };\nstruct Derived : Base {\n#include \"member.h\"\n};\n",
+        )
+        .unwrap();
+        let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.separate_system_headers = true;
+        opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter([
+            trace_ir::canonicalize(&source),
+            trace_ir::canonicalize(&member),
+        ])));
+        for text in [
+            "using Base::f;\n",
+            "struct Inner : Base { using Base::f; };\n",
+        ] {
+            std::fs::write(&member, text).unwrap();
+            for warmed in [false, true] {
+                cache.write().unwrap().clear();
+                if warmed {
+                    preprocess_file(&member, &opts).unwrap();
+                }
+                let before = cache.read().unwrap().len();
+                for _ in 0..2 {
+                    let result = preprocess_file(&source, &opts).unwrap();
+                    let compact = result.output.split_whitespace().collect::<String>();
+                    assert!(compact.contains("usingBase::f;"));
+                    if text.contains("Inner") {
+                        assert!(compact.contains("structInner"));
+                    }
+                    assert_eq!(cache.read().unwrap().len(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn class_scope_tracking_keeps_nonmember_imports_sensitive() {
+        for (source, sensitive) in [
+            ("struct C { using Base::f; };", false),
+            ("namespace N { class C { using Base::f; }; }", false),
+            ("class C { struct D { using Base::f; }; };", false),
+            ("template<class T> class C { using Base::f; };", false),
+            ("struct alignas(8) C { using Base::f; };", false),
+            (
+                "struct __attribute__((packed)) C { using Base::f; };",
+                false,
+            ),
+            ("using Base::f;", true),
+            ("struct C; using Base::f;", true),
+            ("struct C {}; using Base::f;", true),
+            ("namespace N { using Base::f; }", true),
+            ("namespace A { namespace B { using Base::f; } }", true),
+            ("extern \"C++\" { using Base::f; }", true),
+            ("template<class T> void f() {} using Base::f;", true),
+            ("struct C *value = factory(); using Base::f;", true),
+            ("template<class T> namespace N { using Base::f; }", true),
+            ("struct P get(int a) { using std::swap; }", true),
+            ("struct P &get() const { using std::swap; }", true),
+            ("class P operator+(P a, P b) { using std::swap; }", true),
+        ] {
+            let mut scope = OutputScope::default();
+            for token in Lexer::new(source, Language::Cpp).tokenize() {
+                scope.token(&token.kind);
+            }
+            assert_eq!(scope.context_effects > 0, sensitive, "{source}");
+        }
+    }
+
+    /// Ordinary system-header sharing keeps one gate for every system root:
+    /// a compiler-default header after project declarations or a project
+    /// preamble stays in the consumer, as an explicit `-isystem` one does.
+    /// (Relaxing it changed project typing and edges with no measured gain;
+    /// `--canonical-system-headers` handles standard headers instead.)
+    #[test]
+    fn compiler_default_system_headers_keep_the_declaration_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.cpp");
+        let own = dir.path().join("own.h");
+        let system = dir.path().join("system");
+        std::fs::create_dir(&system).unwrap();
+        std::fs::write(&source, "").unwrap();
+        std::fs::write(&own, "int own;\n").unwrap();
+        std::fs::write(system.join("api"), "#pragma once\nvoid Api();\n").unwrap();
+        let cache = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_language(Language::Cpp)
+            .with_system_include(&system)
+            .with_compiler_system_include(&system)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.separate_system_headers = true;
+        opts.separate_header_paths = Some(Arc::new(FxHashSet::from_iter([
+            trace_ir::canonicalize(&source),
+            trace_ir::canonicalize(&own),
+        ])));
+        let key = (trace_ir::canonicalize(&system.join("api")), Language::Cpp);
+        for text in [
+            "int value;\n#include <api>\n",
+            "#include \"own.h\"\n#include <api>\n",
+        ] {
+            cache.write().unwrap().clear();
+            std::fs::write(&source, text).unwrap();
+            let result = preprocess_file(&source, &opts).unwrap();
+            assert!(
+                result.output.contains("void Api"),
+                "standard header should stay in the consumer: {}",
+                result.output
+            );
+            assert!(!cache.read().unwrap().contains_key(&key), "{text}");
         }
     }
 

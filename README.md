@@ -119,6 +119,7 @@ trace analyze [OPTIONS] <TARGET>
 | `-D <NAME=VALUE>` | Define macro with explicit value. Repeatable. Overrides the language predefines (`__cplusplus`, `__STDC_VERSION__`, `__STDC__`) when the name matches. |
 | `--compile-commands <PATH>` | Compilation database to read. Default: auto-discovery at the target root, then `build/`; otherwise root `compile_flags.txt`. |
 | `--system-includes` | Query the compiler for its effective system header search paths. Off by default. |
+| `--canonical-system-headers` | Lower the compiler-default standard headers once, as one shared prelude per language, instead of per translation unit (bare-tree only; implies `--system-includes`). Every unit starts from the prelude's macros and project headers keep the default sharing rules, at close to default-mode cost. One standard-library configuration stands for all units. See [design](docs/CANONICAL_SYSTEM_PRELUDE.md) and [measurements](docs/EVAL_REPORT.md#canonical-prelude-at-default-mode-cost-2026-11-16). |
 | `--compiler-predefines` | Import allowlisted compiler identity and target macros. Off by default; see [macro sources and precedence](docs/PREPROCESSOR.md#compiler-predefined-macros-230). |
 | `--compiler <EXECUTABLE>` | Explicit fallback driver for sources without a usable compilation command; requires `--compiler-predefines` or `--system-includes`. |
 | `--compiler-arg <ARG>` | Repeatable supported fallback compiler configuration option; requires `--compiler`. |
@@ -215,6 +216,8 @@ trace analyze ./my_app --compile-commands ./out/compile_commands.json -o /tmp/ap
 
 # Include installed compiler system headers as declaration-only dependencies
 trace analyze ./my_app --system-includes -o /tmp/app.db
+# Lower the standard headers once, as one shared prelude (implies --system-includes)
+trace analyze ./my_app --canonical-system-headers -o /tmp/app.db
 
 # Explicit target compiler macros; compiler receives empty input only.
 trace analyze ./my_app --compiler-predefines --compiler clang \
@@ -983,6 +986,7 @@ tests/fixtures/    Integration test C corpora
 - **No path sensitivity** — all branches and paths are merged.
 - **Preprocessor subset** — not gcc/clang compatible for all extensions. Vendor macros such as `__GNUC__` / `__clang__` require opt-in `--compiler-predefines`; `--system-includes` imports only selected target and hosted-mode macros from the compiler. Without either discovery flag, only the language's own `__cplusplus` / `__STDC__` / `__STDC_VERSION__` are predefined; see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
 - **Build environment** — with `--system-includes`, compiler probing locates installed standard-library headers and selected target macros, but does not supply missing SDK or generated headers. Supply additional roots with `--dep` / `--include` as needed. Other compiler-specific builtins and response files are not modeled.
+- **Canonical system headers** — `--canonical-system-headers` preprocesses the tree's standard includes once, in one bare-tree configuration, lowers them to one prelude per language and merges it into the final program once. Every preprocessing run starts from the prelude's macros, and an include of a header the prelude read contributes nothing, so translation units never hold standard text and project headers keep the default sharing rules. Conditional variants and per-unit standard declarations may differ from full system-header indexing, and standard-library typing is not available while a translation unit is lowered. On `ability_ability_runtime` it takes about 3.5% longer than default indexing, with the same peak memory; see the [canonical system-header prelude](docs/CANONICAL_SYSTEM_PRELUDE.md) and [measurements](docs/EVAL_REPORT.md#canonical-prelude-at-default-mode-cost-2026-11-16). Ignored with configured indexing.
 - **Configuration coverage** — without database entries or `--explore`, indexing uses one inferred configuration. A name no `-D` or reached `#define` binds resolves to `0` in `#if`; use [conditional coverage reporting](docs/CONDITIONAL_COVERAGE.md) to measure exclusions in a selected configuration. Explicit database commands are all merged; exploratory configurations remain bounded by `--explore-budget`.
 - **Original line attribution** — entities use original source positions through the preprocessor's `LineMap`. See [Call source locations](docs/ANALYSIS.md#call-source-locations) for macro-body spelling and invocation positions, and [Shared header functions](docs/ANALYSIS.md#shared-header-functions) for header identity and ownership.
 
