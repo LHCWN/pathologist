@@ -189,7 +189,7 @@ struct LowerContext {
     /// interning order while avoiding path comparisons/hashing per span.
     origin_file_ids: Vec<Cell<Option<trace_ir::FileId>>>,
     /// This unit's canonical `#include` closure: the files whose file-local
-    /// templates it sees (docs/ANALYSIS.md, "Template-parameter bases").
+    /// templates it sees (docs/CXX.md, "Template-parameter bases").
     included_headers: Arc<Vec<PathBuf>>,
     /// `included_headers` and the unit's own file as sorted ids, resolved
     /// on the first lookup that needs them.
@@ -2382,7 +2382,7 @@ fn settle_merged_pointer_extractions(program: &mut Program) {
 /// `UnwrapPointer` reads it: mark each wrapper-typed variable a pointer, so
 /// the solver keeps its node in step with its storage and wires it across
 /// calls as it does a raw pointer. After merging, once every variable has its
-/// final type (docs/ANALYSIS.md, "Smart-pointer unwrap").
+/// final type (docs/IR.md, "Smart-pointer unwrap").
 fn mark_wrapper_values(program: &mut Program) {
     let mut is_wrapper: HashMap<trace_ir::TypeId, bool> = HashMap::default();
     let wrappers: Vec<VarId> = program
@@ -5867,7 +5867,7 @@ fn lower_struct_specifier(
                 )
         };
         // A class template's own parameters (`template<class I> class S : public I`):
-        // a base naming one is substituted per instantiation (docs/ANALYSIS.md,
+        // a base naming one is substituted per instantiation (docs/CXX.md,
         // "Template-parameter bases"), never a class of its own.
         let mut own_template = path
             .last()
@@ -7896,7 +7896,7 @@ fn register_member_prototype(
     // interface synthesized from an `.idl` file spells its types as the IDL
     // does (`sharedptr<T>`), not as its overrides do, so it records none
     // and matches them by arity. A name declared once otherwise merges with
-    // its definition by name and arity (docs/ANALYSIS.md, "In-class
+    // its definition by name and arity (docs/CXX.md, "In-class
     // prototypes" under C++ support).
     let read_types = overload
         || (flags.is_virtual
@@ -7956,7 +7956,7 @@ fn register_member_prototype(
         },
         None,
         // Shape, not id: a prototype meets a definition whose types it read
-        // in another scope (docs/ANALYSIS.md, "Templates").
+        // in another scope (docs/CXX.md, "Templates").
         Some(&program.types),
     );
     if let Some(parameters) = find_params(node) {
@@ -8314,7 +8314,7 @@ fn lower_function_signature(
         },
         None,
         // Shape, not id: a prototype meets a definition whose types it read
-        // in another scope (docs/ANALYSIS.md, "Templates").
+        // in another scope (docs/CXX.md, "Templates").
         Some(&program.types),
     );
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
@@ -8671,7 +8671,7 @@ fn lower_parameters(
         shape.record(program, ctx, source, param);
         // A C++ parameter pack (`Args &&...args`) is a formal of its own:
         // the last one, taking every argument from its position on. C's `...`
-        // names nothing and stays out (docs/ANALYSIS.md, "Variadic parameter
+        // names nothing and stays out (docs/POINTERS.md, "Variadic parameter
         // packs").
         let pack = ctx.is_cpp && param.cached_kind() == "variadic_parameter_declaration";
         if !is_parameter_node(param.cached_kind()) && !pack {
@@ -9400,7 +9400,7 @@ fn static_call_receiver(
 /// yields the same when `Svc` inherits the accessor from such a base
 /// ([`inherited_singleton_result`]). Only a recognised template with one class
 /// argument is guessed; a definition in view, from a dependency root too,
-/// decides instead (docs/ANALYSIS.md, "Undefined singleton templates" under
+/// decides instead (docs/CXX.md, "Undefined singleton templates" under
 /// "Templates").
 fn undefined_singleton_result(
     program: &Program,
@@ -10320,7 +10320,7 @@ fn weak_promotion<'t>(
 }
 
 /// For a weak-pointer promotion or a [`from_this_call`], the variable holding
-/// the value the result may alias: the weak pointer's (docs/ANALYSIS.md,
+/// the value the result may alias: the weak pointer's (docs/IR.md,
 /// "Weak-pointer promotion") or the object's address ("`shared_from_this`").
 /// Every call-result site asks before resolving a callee.
 fn promoted_receiver_value(
@@ -10403,7 +10403,7 @@ fn from_this_spelling(spelled: &str) -> Option<(String, &'static str, &'static s
 /// The one place `from_this` calls are recognized, for result typing
 /// ([`call_result_shape`]) and for value flow ([`from_this_value`]). The
 /// declared overloads are not consulted: the standard's const twins disagree
-/// on the result, and `<memory>` need not be in the tree (docs/ANALYSIS.md,
+/// on the result, and `<memory>` need not be in the tree (docs/IR.md,
 /// "`shared_from_this`"). Every call-result site asks of the same call, so
 /// the result is decided once per call node.
 fn from_this_call<'t>(
@@ -11948,7 +11948,7 @@ fn names_instance_member(program: &Program, ctx: &LowerContext, source: &str, no
 /// the read is a value flow (and a `mem_read` edge of the export), as
 /// `auto *cb = cb_; cb->OnError();` would be: every such call reads it, each
 /// at its own position. The value is not passed on as the callee's `this`:
-/// receivers are identity, not value flow (docs/ANALYSIS.md, "Memory access
+/// receivers are identity, not value flow (docs/POINTERS.md, "Memory access
 /// edges"). Ordinary member calls and explicit member operators
 /// (`cb_->operator()()`) share this hook: `named` is the call's receiver, and
 /// only an `->` receiver naming no variable is read.
@@ -12015,7 +12015,7 @@ fn smart_ptr_held_class(
 /// `std::make_shared<T>(..)` and the others [`smart_ptr_factory`]
 /// recognises, or of `sptr<T>::MakeSptr(..)`. `None` for any other call,
 /// and for a class the call site cannot name or a template parameter
-/// (docs/ANALYSIS.md, "Factory construction").
+/// (docs/CXX.md, "Factory construction").
 fn factory_constructed_class(
     program: &Program,
     ctx: &LowerContext,
@@ -12060,7 +12060,7 @@ fn factory_constructed_class(
 /// `new`. `None` for any other class and for a standard type that is no class
 /// (a pointer, a reference, an array as in `std::make_unique<std::uint8_t[]>(n)`,
 /// or a fundamental type's standard name such as `std::size_t`)
-/// (docs/ANALYSIS.md, "Factory construction").
+/// (docs/CXX.md, "Factory construction").
 fn standard_library_class(spelled: &str) -> Option<String> {
     let [arg]: [String; 1] = template_arguments(spelled).try_into().ok()?;
     let class = strip_cv(&arg);
@@ -12114,7 +12114,7 @@ fn static_factory_class(
 /// defaulted gets no site, not even an unresolved one, and neither does a
 /// copy or a move ([`copies_implicitly`]); either way no object is made. An
 /// empty lookup that proves nothing ([`ctor_set_known`]) keeps an unresolved
-/// site, as `new` does (docs/ANALYSIS.md, "Factory construction").
+/// site, as `new` does (docs/CXX.md, "Factory construction").
 #[allow(clippy::too_many_arguments)]
 fn emit_factory_construction(
     program: &mut Program,
@@ -12163,7 +12163,7 @@ fn emit_factory_construction(
     );
     // The object is exactly `cls`. Marked so, the constructor sites, which
     // share the factory call's position, stay an invocation of their own
-    // rather than alternatives of the factory's (docs/ANALYSIS.md, "Call
+    // rather than alternatives of the factory's (docs/USAGE.md, "Call
     // sequencing").
     for site in &mut program.symbols.call_sites[first..] {
         site.exact_receiver = true;
@@ -13677,7 +13677,7 @@ fn named_class(program: &Program, type_id: trace_ir::TypeId) -> Option<String> {
 /// could not resolve constructs nothing: the type may be a callback typedef
 /// from a header off the include path, and the initializer's value (the
 /// function stored into the field) must reach the object, as it did when
-/// the typedef read as `int` (`docs/ANALYSIS.md`, "Undeclared receiver
+/// the typedef read as `int` (`docs/CXX.md`, "Undeclared receiver
 /// classes").
 fn initialized_class(program: &Program, desc: &TypeDesc) -> Option<String> {
     if program.types.is_guessed_class(desc) {
@@ -13726,7 +13726,7 @@ fn automatic_object_class(program: &Program, type_id: trace_ir::TypeId) -> Optio
 
 /// The user-provided `kind` members an object of class `cls` (a
 /// [`receiver_lookup_name`]) runs when default-constructed or destroyed, by
-/// the class that provides them (docs/ANALYSIS.md, "Automatic objects":
+/// the class that provides them (docs/CXX.md, "Automatic objects":
 /// which members run).
 fn lifecycle_members(
     program: &Program,
@@ -13830,7 +13830,7 @@ fn collect_lifecycle_members<'a>(
 /// when `construct` is set (`T x;`, `T a[4];`: no initializer names its
 /// constructor), and its destructor site when it is an automatic object,
 /// both attributed to the declaration with `var` as `this`
-/// (docs/ANALYSIS.md, "Automatic objects").
+/// (docs/CXX.md, "Automatic objects").
 fn emit_automatic_lifecycle(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -13921,7 +13921,7 @@ fn emit_automatic_lifecycle(
 }
 
 /// Run the default member initializers of a declared object no user-provided
-/// constructor owns (docs/ANALYSIS.md, "C++ support (first step)"). A file-scope
+/// constructor owns (docs/CXX.md, "C++ support (first step)"). A file-scope
 /// object has no body to hold its member-wise construction, so it is built here.
 fn lower_declared_object_defaults(
     program: &mut Program,
@@ -14428,7 +14428,7 @@ enum Lifecycle {
 
 /// The variable a range-for loop or a catch clause declares (`for (T x : r)`,
 /// `catch (T e)`), lowered as a local of the statement's body
-/// (docs/ANALYSIS.md, "Automatic objects": range-for and catch variables).
+/// (docs/CXX.md, "Automatic objects": range-for and catch variables).
 fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
     let holder = if node.cached_kind() == "catch_clause" {
         node.cached_field("parameters").and_then(|params| {
@@ -15607,7 +15607,7 @@ pub(crate) fn operator_call(is_cpp: bool, source: &str, node: Node) -> Option<Op
 }
 
 /// Whether `child` of `node` is an operand the language never evaluates,
-/// so its calls never run (`CallSite::unevaluated`; docs/ANALYSIS.md,
+/// so its calls never run (`CallSite::unevaluated`; docs/USAGE.md,
 /// "Unevaluated operands"): a `noexcept` operand, a `requires` expression,
 /// `_Generic`'s controlling expression, and the operand of `sizeof`,
 /// `alignof`, `decltype` and GNU `typeof` when it is a call. Those evaluate
@@ -16701,7 +16701,7 @@ impl DerefArg {
     /// What `*x`, `x`'s value being `address`, passes a parameter: the
     /// address to a reference, the value read to a by-value parameter, and,
     /// to one no declaration describes (`reference` unknown), a temporary
-    /// holding both (docs/ANALYSIS.md, "Dereferenced operands"). Each
+    /// holding both (docs/IR.md, "Dereferenced operands"). Each
     /// temporary is emitted once, by the first site that needs it.
     fn passed(&self, program: &mut Program, address: VarId, reference: Option<bool>) -> VarId {
         let cache = match reference {
@@ -16800,7 +16800,7 @@ fn collect_call_arg_nodes<'t>(
     let mut arg_index = 0u32;
     // Where the first pack expansion is. It and every argument after it are
     // recorded there: what follows an expansion starts at no known position
-    // (docs/ANALYSIS.md, "Variadic parameter packs").
+    // (docs/POINTERS.md, "Variadic parameter packs").
     let mut pack_at: Option<u32> = None;
     // The argument being lowered that stands for the pack, as the position
     // it is recorded at and where its values begin in `var_args`: marked once
@@ -16845,7 +16845,7 @@ fn collect_call_arg_nodes<'t>(
             // position 1) and corrupt both interprocedural wiring and
             // function-model effects.
             //
-            // `&x` passes x's address (docs/ANALYSIS.md, "Argument
+            // `&x` passes x's address (docs/POINTERS.md, "Argument
             // flow"): the formal must point to `x`, not receive x's own
             // pointees.
             if let Some(v) = addr_of_plain_var(program, ctx, source, arg) {
@@ -16857,7 +16857,7 @@ fn collect_call_arg_nodes<'t>(
             }
             // `*x` passes the value it reads. In C++ a reference
             // parameter takes `x`'s value instead, and so does one no
-            // declaration describes (docs/ANALYSIS.md, "Dereferenced
+            // declaration describes (docs/IR.md, "Dereferenced
             // operands"; [`CallArgs::for_callee`]). A function pointer
             // is read in place: `*fp` passes `fp`.
             let value = peel_value_casts(program, ctx, source, arg);
@@ -23316,7 +23316,7 @@ fn record_operation_origins(
 /// reads or takes the address of, to the argument's own text rather than
 /// the call's ([`record_operation_origins`]): in `sink(a->p, b->p)` each
 /// access spans its own argument, so a position on one names only that
-/// access (docs/ANALYSIS.md, "Where a value moves"). Nothing to attribute
+/// access (docs/POINTERS.md, "Where a value moves"). Nothing to attribute
 /// when it added none.
 fn record_argument_origins(
     program: &mut Program,
@@ -24204,7 +24204,7 @@ fn field_path<'t>(
     // (`GetSp()->field`), or the class object a dereferenced member or
     // dereference reads (`(*o->inner).pp`). A call or a dereference is
     // lowered only once the path validates; one that is not a class object
-    // keeps the root variable (docs/ANALYSIS.md, "Dereferenced operands").
+    // keeps the root variable (docs/IR.md, "Dereferenced operands").
     let operand = deref_operand(source, cur).map(peel_expression);
     let operand_desc = operand.and_then(|operand| receiver_desc(program, ctx, source, operand));
     let (pointee, is_pointer) = match operand_desc.clone().and_then(|d| deref_desc(program, d)) {
@@ -24361,7 +24361,7 @@ fn field_path<'t>(
         }
         let hf = field_in_hierarchy(program, Some(ctx), type_id, fname)?;
         // An inherited field at the root is read through a summary receiver
-        // of its declaring class (docs/ANALYSIS.md, "Implicit this member
+        // of its declaring class (docs/POINTERS.md, "Implicit this member
         // variable access").
         if step == 0 && hf.owner_type_id != type_id {
             summary_receiver = Some(hf.owner_type_id);
@@ -24574,7 +24574,7 @@ struct CallRoot {
 }
 
 /// `call` as a path root: a direct call by plain name, followed by `->`,
-/// returning a smart pointer; see `docs/ANALYSIS.md`, "Smart-pointer
+/// returning a smart pointer; see `docs/IR.md`, "Smart-pointer
 /// unwrap". Any other call root, a qualified or member call among them, is
 /// left to the callers' own handling. The cheap syntactic checks run before
 /// the call is typed.
@@ -24624,7 +24624,7 @@ impl PathBoundary {
 /// the rest of the path continues. Returns the last receiver (the root when
 /// there is no crossing) and the index of the first field after it. A
 /// receiver keeps PAG's type-keyed summary fallback, which connects it to
-/// raw-pointer accesses of the pointee. See `docs/ANALYSIS.md`,
+/// raw-pointer accesses of the pointee. See `docs/IR.md`,
 /// "Smart-pointer unwrap".
 fn emit_wrapper_boundaries(
     program: &mut Program,
@@ -24891,7 +24891,7 @@ fn expr_to_store_src(
     source: &str,
     node: Node,
 ) -> Option<VarId> {
-    // `&x` stores x's address, not x's value (docs/ANALYSIS.md, "Argument
+    // `&x` stores x's address, not x's value (docs/POINTERS.md, "Argument
     // flow").
     if let Some(v) = addr_of_plain_var(program, ctx, source, node) {
         return Some(addr_of_temp(program, ctx, node, v));
@@ -26514,7 +26514,19 @@ fn return_flow_from_expr(
                         emit_call_return(program, ctx, node, temp, callee_name);
                         Some(ReturnFlow::Copy { src: temp })
                     } else {
-                        Some(ReturnFlow::Call { callee_name })
+                        let span = node_span(program, ctx, node);
+                        let result = add_temp(
+                            program,
+                            ctx.current_fn,
+                            TempKind::ReturnedCall,
+                            program.types.int(),
+                            span,
+                        );
+                        ctx.call_return_dst.borrow_mut().insert(node.id(), result);
+                        Some(ReturnFlow::Call {
+                            callee_name,
+                            result,
+                        })
                     }
                 }
                 ResolvedCallReturn::Indirect(callee_var) => {
@@ -26889,7 +26901,7 @@ fn add_temp(
 /// What a read `y = *x` or a store `*x = v` goes through, given `*x`: `x`'s
 /// value ([`Operand`]) and whether `*x` reads it in place, or, where it
 /// cannot be computed, `x`'s root variable, as these two did before
-/// (docs/ANALYSIS.md, "Dereferenced operands"). Other value positions take
+/// (docs/IR.md, "Dereferenced operands"). Other value positions take
 /// [`operand_value`] alone.
 fn deref_target<'t>(
     program: &mut Program,
@@ -27190,7 +27202,7 @@ fn this_root(ctx: &LowerContext, source: &str, node: Node) -> Option<VarId> {
 /// function pointer dereferences to the function it designates (`*fp`); a
 /// pointer to one is loaded through (`*pfp`) as any `*p` is. An array's
 /// value is its own address, so `*arr` loads its cell as any `*p` does
-/// (docs/ANALYSIS.md, "Dereferenced operands").
+/// (docs/IR.md, "Dereferenced operands").
 fn reads_in_place(program: &Program, ctx: &LowerContext, source: &str, operand: Node) -> bool {
     receiver_desc(program, ctx, source, operand)
         .and_then(|desc| deref_desc(program, desc))
@@ -27264,7 +27276,15 @@ fn names_reference_binding(ctx: &LowerContext, operand: Node, var: VarId) -> boo
 /// A temporary holding `&v`, for a value position that must carry v's
 /// address rather than v itself.
 fn addr_of_temp(program: &mut Program, ctx: &LowerContext, span_node: Node, v: VarId) -> VarId {
-    let temp = alloc_ret_temp(program, ctx, span_node);
+    let pointee = program
+        .types
+        .get(program.symbols.variable(v).type_id)
+        .desc
+        .as_ref()
+        .clone();
+    let type_id = program.types.ptr_to(pointee);
+    let span = node_span(program, ctx, span_node);
+    let temp = add_temp(program, ctx.current_fn, TempKind::Ret, type_id, span);
     program
         .flow
         .push(FlowConstraint::AddrOfVar { dst: temp, src: v });
@@ -28066,7 +28086,7 @@ fn type_desc_from_field_declarator(
     };
     // An array member keeps its array-ness, as its declarator nearest the
     // name says (`int *arr[2]`, not `int (*p)[2]`): its value is its own
-    // cell, so `*h->arr` is `h->arr[0]` (docs/ANALYSIS.md, "Dereferenced
+    // cell, so `*h->arr` is `h->arr[0]` (docs/IR.md, "Dereferenced
     // operands"). Tables of functions stay function-pointer typed.
     let mut innermost = decl;
     let mut dimensions = Vec::new();
@@ -29023,7 +29043,7 @@ fn type_desc_from_node(
     let node = peel_cpp_type_node(node);
     if node.cached_kind() == "decltype" {
         // The type of an expression is not deduced here, whether spelled
-        // natively or re-spelled from GNU `__typeof__` (docs/ANALYSIS.md,
+        // natively or re-spelled from GNU `__typeof__` (docs/CXX.md,
         // "C++ parse-input normalization"). Falling through would read the
         // operand's text as a type name: `decltype(avoid_copy())` was Void,
         // `decltype(charge())` Char, anything else Int.
@@ -29204,7 +29224,7 @@ fn type_desc_from_node(
 /// local, a field, a range-for element -- is guessed: a cast or template
 /// argument is not, a function's return type is not (`auto p = GetBare();`
 /// stays untyped), and a template parameter or dependent name is not a
-/// class (`docs/ANALYSIS.md`, "Undeclared receiver classes").
+/// class (`docs/CXX.md`, "Undeclared receiver classes").
 fn undeclared_class_guess(
     program: &Program,
     ctx: &LowerContext,

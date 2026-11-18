@@ -2959,7 +2959,7 @@ fn a_body_direct_init_with_an_unresolved_argument_defines_an_object() {
         .any(|e| fn_name(&program, e.callee).ends_with("log")));
 }
 
-/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): the
+/// Issue #151 (docs/IR.md, "Dereferenced operands"): the
 /// `deref_member_reads` fixture, solved once with points-to retained.
 fn deref_member_reads() -> &'static (
     trace_ir::Program,
@@ -3095,7 +3095,7 @@ fn deref_of_a_pointer_to_a_function_pointer_reads_through_it() {
 }
 
 /// A function designator is read in place: `*fn_designated`, read into an
-/// initializer or assigned, is `fn_designated` (docs/ANALYSIS.md,
+/// initializer or assigned, is `fn_designated` (docs/IR.md,
 /// "Dereferenced operands").
 #[test]
 fn deref_of_a_function_designator_is_the_function() {
@@ -3199,7 +3199,7 @@ fn an_array_member_value_is_its_cell_in_every_position() {
             .collect()
     };
     // The cell's address points to the member's own location (and, as any
-    // field address, to what it holds: docs/ANALYSIS.md, "Field
+    // field address, to what it holds: docs/POINTERS.md, "Field
     // sensitivity"); a load from it would point to the elements alone.
     let member = |loc: &trace_ir::LocId| {
         use trace_analysis::LocKind::{Field, FieldSummary};

@@ -382,6 +382,13 @@ fn export_flow_graph(
                 None,
                 None,
             ),
+            PagNodeKind::FieldAddress => (
+                "field_address",
+                "modeled field address".to_owned(),
+                String::new(),
+                None,
+                None,
+            ),
             PagNodeKind::Loc(loc_id) => {
                 let loc = &pag.locations[loc_id.0 as usize];
                 let kind_str = crate::inspect::loc_kind_schema_str(loc.kind);
@@ -573,7 +580,7 @@ fn export_flow_graph(
 
 /// The `flow_memory_access` rows: per load or store, by its `flow_edges` id
 /// (its rank in `edge_rows`, which is sorted), each cell it reads or writes,
-/// or one cell-less row when none is recorded (docs/ANALYSIS.md, "Memory
+/// or one cell-less row when none is recorded (docs/POINTERS.md, "Memory
 /// access edges").
 fn export_memory_accesses(
     conn: &Connection,
@@ -939,8 +946,17 @@ fn export_flow_provenance(
                                 returned.insert(*loc);
                             }
                         }
-                        trace_ir::ReturnFlow::Call { callee_name } => pending
-                            .extend(program.symbols.return_flow_candidates(callee, callee_name)),
+                        trace_ir::ReturnFlow::Call {
+                            callee_name,
+                            result,
+                        } => {
+                            if let Some(n) = pag.var_node.get(result) {
+                                returned.insert(*n);
+                            }
+                            pending.extend(
+                                program.symbols.return_flow_candidates(callee, callee_name),
+                            );
+                        }
                     }
                 }
             }

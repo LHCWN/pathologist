@@ -8,7 +8,7 @@ contain exactly the edge into that type's `Good`. Cases clang rejects are
 dropped, so only valid C++ is compared.
 
 Not covered: `decltype(expr)` declarations, whose type is deliberately left
-unknown (docs/ANALYSIS.md, "C++ parse-input normalization").
+unknown (docs/CXX.md, "C++ parse-input normalization").
 
 Axes: overload set (cv / ref-qualifier / template / arguments) x object
 declaration (parameter, alias, derived `auto`, local, field, smart pointer,

@@ -11,7 +11,7 @@ pub enum ConstraintKind {
     Dlsym,
     /// `pts(dst)` gains the locations of `pts(src)` compatible with `dst`'s
     /// pointee type (resolved into `SolverIndices::unwrap_src`); see
-    /// `docs/ANALYSIS.md`, "Smart-pointer unwrap".
+    /// `docs/IR.md`, "Smart-pointer unwrap".
     UnwrapPointer,
 }
 

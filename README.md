@@ -12,9 +12,9 @@ Typical uses:
 
 Conditional expressions such as `flag ? alpha : beta` preserve both
 alternatives in pointer and callback flow, including across function
-boundaries. See [conditional values](docs/ANALYSIS.md#conditional-values)
+boundaries. See [conditional values](docs/IR.md#conditional-values)
 for supported forms and type inference, and
-[implementation limitations](docs/ANALYSIS.md#conditional-value-limitations)
+[implementation limitations](docs/IR.md#conditional-value-limitations)
 for precision, model dependencies and coverage boundaries.
 
 ## Build
@@ -128,16 +128,16 @@ trace analyze [OPTIONS] <TARGET>
 | `--timeout-secs <N>` | Watchdog: abort the process after N seconds (exit 124). Useful when probing hang-prone trees. |
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
 | `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table and the `locations` it references (requires PAG in memory). |
-| `--models <FILE>` | Load TOML function-behavior summaries and noise macro lists. Repeatable; later files override earlier entries and built-ins. Project IPC shortcuts such as DataShare `OpenFile` are opt-in; see [missing-framework fallbacks](#missing-framework-fallbacks) and the [model format](docs/ANALYSIS.md#configuration-format). |
+| `--models <FILE>` | Load TOML function-behavior summaries (parameter flow, accessor getters, callbacks, IPC) and noise macro lists. Repeatable; later files override earlier entries and built-ins. Project IPC shortcuts such as DataShare `OpenFile` are opt-in; see [missing-framework fallbacks](#missing-framework-fallbacks) and the [model format](docs/MODELS.md#configuration-format). |
 | `--ignore-macro <NAME>` | Ignore expansions of the named macro during AST lowering (repeatable). Glob wildcards (`*`) are supported (e.g. `--ignore-macro 'LOG*'`). Suppresses boilerplate call sites, temporary variables, and flow constraints. |
 | `--ignore-logging` | Preset flag to ignore common OpenHarmony and standard logging macros (`HILOG_*`, `TAG_LOG*`, `HIVIEW_LOG*`, `MEDIA_*_LOG`, `LOGD`, `LOGI`, `LOGW`, `LOGE`, `LOGF`). |
 | `--no-test-partition` | Disable the [bare-tree test partition](docs/ANALYSIS.md#declaring-header-eligibility). |
 | `--test-dir <NAME>` | Replace the partition’s directory names (repeatable). Defaults, validation, and precedence: [Declaring-header eligibility](docs/ANALYSIS.md#declaring-header-eligibility). |
 | `--dep <PATH>` | Treat a directory as a dependency root: a tree the target builds against but that is not under analysis (repeatable). Its headers contribute declarations — types, class definitions, inheritance, prototypes, declared return types — while its sources are never translation units. Function bodies and variable initializers are skipped during lowering, so they contribute no call sites or value flow. See the note below. |
-| `--explore` | Enable bounded conditional-variant exploration. Discovers candidate macro definitions from project GN files (`BUILD.gn`, `*.gni`), evaluates semantic feasibility of excluded `#if`/`#ifdef`/`#elif` arms, preprocesses and lowers feasible variants independently, and unions their facts into the merged program (preserving body and call facts plus struct fields across configurations; conditional signatures retain the base arity, see [limits](docs/ANALYSIS.md#limits-of---explore)). Off by default. |
+| `--explore` | Enable bounded conditional-variant exploration. Discovers candidate macro definitions from project GN files (`BUILD.gn`, `*.gni`), evaluates semantic feasibility of excluded `#if`/`#ifdef`/`#elif` arms, preprocesses and lowers feasible variants independently, and unions their facts into the merged program (preserving body and call facts plus struct fields across configurations; conditional signatures retain the base arity, see [limits](docs/USAGE.md#limits-of---explore)). Off by default. |
 | `--explore-budget <N>` | Maximum additional configurations per translation unit (default: 4). Budget diagnostics count omitted candidate activation goals, not proven reachable configurations. |
-| `--sequencing` | Record a compact call-order control-flow graph per function body beside the call graph, for call-sequence queries. The call graph, points-to and argument flow are unchanged. Off by default. See [call sequencing](docs/ANALYSIS.md#call-sequencing-control-flow-sidecar). |
-| `--no-ipc` | Disable automatic IPC bridge detection and any loaded `ipc` function models. Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`). DataShare `OpenFile` requires an explicit `--models` file; prefer the [source-backed workflow](#cross-project-analysis-with-framework-sources) when framework sources are available. See [IPC rules](docs/ANALYSIS.md#openharmony-ipc-bridges). Service IDL and the HDI C++ IPC subset synthesize declarations-only interface/proxy/stub headers; HDI methods may omit a return type. See [IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces) for signatures, pairing and dialect limits. |
+| `--sequencing` | Record a compact call-order control-flow graph per function body beside the call graph, for call-sequence queries. The call graph, points-to and argument flow are unchanged. Off by default. See [call sequencing](docs/USAGE.md#call-sequencing-control-flow-sidecar). |
+| `--no-ipc` | Disable automatic IPC bridge detection and any loaded `ipc` function models. Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`). DataShare `OpenFile` requires an explicit `--models` file; prefer the [source-backed workflow](#cross-project-analysis-with-framework-sources) when framework sources are available. See [IPC rules](docs/MODELS.md#openharmony-ipc-bridges). Service IDL and the HDI C++ IPC subset synthesize declarations-only interface/proxy/stub headers; HDI methods may omit a return type. See [IDL-generated interfaces](docs/CXX.md#idl-generated-interfaces) for signatures, pairing and dialect limits. |
 | `--solve-budget-pops <N>` | Solver work budget in worklist pops. Default derives from the PAG constraint count (`800000 + 6×constraints`), so normal trees converge and huge ones finish instead of stopping at a partial result; `0` = unlimited. `TRACE_SOLVE_BUDGET_POPS` overrides it for experimentation. A truncated run is recorded, not silent: `analysis_run.options_json.solver_partial`, an `analyze`-stage diagnostic, and a `trace inspect` warning. |
 | `--solve-budget-secs <N>` | Solver wall-clock budget in seconds (default: off; `0` = no time limit). Checked periodically, so lead time can overshoot by up to one checkpoint, and the stop point varies with machine load. |
 
@@ -145,13 +145,13 @@ OpenHarmony IPC bridging recognizes proxy operations that send through
 `SendTransactCmd` helpers as well as direct `SendRequest` calls, including
 separately indexed proxy/stub repositories combined with `trace-merge`.
 Re-index older proxy-side databases to export the newly recognized senders.
-See the [IPC matching rules](docs/ANALYSIS.md#openharmony-ipc-bridges) and
+See the [IPC matching rules](docs/MODELS.md#openharmony-ipc-bridges) and
 [ability-runtime verification](docs/EVAL_REPORT.md#ipc-sends-through-sendtransactcmd--2026-11-06).
 
 Epoll event-data flow is modeled by default: registrations through `epoll_ctl`
 feed buffers returned by `epoll_wait`, `epoll_pwait` and `epoll_pwait2`, so
 indirect dispatch and upward value tracing can cross the registration/wait
-boundary. See [Epoll event data](docs/ANALYSIS.md#epoll-event-data) for the
+boundary. See [Epoll event data](docs/MODELS.md#epoll-event-data) for the
 approximation and configurable wrapper effects.
 
 **Progress output** (stderr):
@@ -226,12 +226,12 @@ trace analyze ./my_app --compiler-predefines --compiler clang \
 
 **Notes**
 
-- **`.c` and `.cpp`-family files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs. A C++ unit is preprocessed with `__cplusplus` (`201703L`) and `__STDC__` predefined, a C unit with `__STDC__` and `__STDC_VERSION__` (`201710L`), so `#ifdef __cplusplus` takes the C++ arm in `.cpp` units and the C arm in `.c` units, headers included. C++ support is a pragmatic first step — see [docs/ANALYSIS.md](docs/ANALYSIS.md) for scope and imprecision.
+- **`.c` and `.cpp`-family files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs. A C++ unit is preprocessed with `__cplusplus` (`201703L`) and `__STDC__` predefined, a C unit with `__STDC__` and `__STDC_VERSION__` (`201710L`), so `#ifdef __cplusplus` takes the C++ arm in `.cpp` units and the C arm in `.c` units, headers included. C++ support is a pragmatic first step — see [C++ support](docs/CXX.md) for scope and imprecision.
 - Line numbers in the database refer to **original** files on disk (resolved through the preprocessor's `LineMap`); call sites inside macro expansions attribute to the expansion site.
-- **C++ parser adaptation** — GNU visibility attributes before `extern "C"` are recovered during indexing, preserving source positions and external function identity. See [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization) for recognized spellings and limits. Re-analyze existing databases to apply the fix.
-- **Compilation database** — automatically reads `compile_commands.json` at the target root, then `build/compile_commands.json`, or an explicit `--compile-commands PATH`. Each entry supplies its working directory, ordered `-I`/`-iquote`/`-isystem` paths, ordered `-D`/`-U`, `-include`, and `-x`/`-std`. MSVC `cl`/`clang-cl` preprocessing switches (`/I`, `/D`, `/U`, `/FI`, `/TC`, `/TP`, `/Tc`, `/Tp`, `/std:`) are also supported. All applicable commands for a source contribute facts, even without `--explore`; link-object membership restricts them to their target. CLI `--include` paths precede database `-I` paths and CLI `-D` values override database macros. When no JSON database is selected, root `compile_flags.txt` supplies shared flags to every discovered source (the parent directory for a single-file analysis). It contains one literal argument per line, preserving spaces; relative paths use its directory. The formats are never combined. Unreadable or malformed flags produce configuration diagnostics and fall back to inferred configuration. Files without a usable entry retain inferred configuration; a database is never required. See [compilation database support](docs/ANALYSIS.md#compilation-databases-62).
+- **C++ parser adaptation** — GNU visibility attributes before `extern "C"` are recovered during indexing, preserving source positions and external function identity. See [C++ parse-input normalization](docs/CXX.md#c-parse-input-normalization) for recognized spellings and limits. Re-analyze existing databases to apply the fix.
+- **Compilation database** — automatically reads `compile_commands.json` at the target root, then `build/compile_commands.json`, or an explicit `--compile-commands PATH`. Each entry supplies its working directory, ordered `-I`/`-iquote`/`-isystem` paths, ordered `-D`/`-U`, `-include`, and `-x`/`-std`. MSVC `cl`/`clang-cl` preprocessing switches (`/I`, `/D`, `/U`, `/FI`, `/TC`, `/TP`, `/Tc`, `/Tp`, `/std:`) are also supported. All applicable commands for a source contribute facts, even without `--explore`; link-object membership restricts them to their target. CLI `--include` paths precede database `-I` paths and CLI `-D` values override database macros. When no JSON database is selected, root `compile_flags.txt` supplies shared flags to every discovered source (the parent directory for a single-file analysis). It contains one literal argument per line, preserving spaces; relative paths use its directory. The formats are never combined. Unreadable or malformed flags produce configuration diagnostics and fall back to inferred configuration. Files without a usable entry retain inferred configuration; a database is never required. See [compilation database support](docs/USAGE.md#compilation-databases-62).
 - **Compiler predefines** — `--compiler-predefines` imports a documented allowlist from the compilation-command driver, or an explicit `--compiler` fallback. Missing or unsupported compiler context produces configuration warnings without guessing a host compiler. See [macro sources, supported drivers and precedence](docs/PREPROCESSOR.md#compiler-predefined-macros-230).
-- **System headers** — `--system-includes` queries the compilation command's compiler for its effective search paths, with results cached by compiler and configuration. Sources lacking a usable compilation command or explicit compiler share one project fallback compiler: GCC first, then Clang. With `--compiler-predefines`, this implicit fallback supplies header paths only; macro discovery still requires compiler context. Reached system headers contribute declarations and macros as dependencies. Explicit `-isystem`, `-idirafter`, and library-supplied system paths continue to work without the flag. See [compiler include discovery](docs/PREPROCESSOR.md#compilation-database-options-62). Bare-tree indexing shares compatible expansions, lowered declaration units and recurring assembled header preambles, including extensionless standard headers; its [cache contract](docs/PREPROCESSOR.md#shared-system-header-bundles) describes context-sensitive fallbacks. Indexing also shares raw tokens, compacts temporary source maps, and [reuses parsed syntax](docs/ANALYSIS.md#indexing-syntax-reuse). See [post-review system-header measurements](docs/EVAL_REPORT.md#performance-recheck-after-review-fixes--2026-10-27).
+- **System headers** — `--system-includes` queries the compilation command's compiler for its effective search paths, with results cached by compiler and configuration. Sources lacking a usable compilation command or explicit compiler share one project fallback compiler: GCC first, then Clang. With `--compiler-predefines`, this implicit fallback supplies header paths only; macro discovery still requires compiler context. Reached system headers contribute declarations and macros as dependencies. Explicit `-isystem`, `-idirafter`, and library-supplied system paths continue to work without the flag. See [compiler include discovery](docs/PREPROCESSOR.md#compilation-database-options-62). Bare-tree indexing shares compatible expansions, lowered declaration units and recurring assembled header preambles, including extensionless standard headers; its [cache contract](docs/PREPROCESSOR.md#shared-system-header-bundles) describes context-sensitive fallbacks. Indexing also shares raw tokens, compacts temporary source maps, and [reuses parsed syntax](docs/CXX.md#indexing-syntax-reuse). See [post-review system-header measurements](docs/EVAL_REPORT.md#performance-recheck-after-review-fixes--2026-10-27).
 - **Unresolved headers** — analysis prints a bounded summary with file/line examples and target SDK, compiler, dependency and include-path guidance. Matching indexed files provide search-path evidence; other files' availability remains unknown. Original warnings remain in the database. `--apply-include-candidates` applies the proposed include roots and repeats indexing, retaining the final diagnostics. See [missing-header guidance](docs/PREPROCESSOR.md#missing-header-guidance).
 - **GN target inference** — automatic bare-tree target discovery follows the [target inference contract](docs/ANALYSIS.md#link-targets-and-weak-symbols).
 - **Link targets and weak symbols** — `--link-commands PATH`, auto-discovered `link_commands.json`, mixed compilation/link databases, and CMake File API replies establish target scopes. Strong definitions override weak fallbacks only in targets that contain them; shared sources retain separate bindings per target. See [resolution rules and limitations](docs/ANALYSIS.md#link-targets-and-weak-symbols).
@@ -334,7 +334,7 @@ unresolved sites, without re-analysis.
 
 Re-analyze existing databases to apply the C++
 [chained-call position](docs/ANALYSIS.md#call-source-locations) and
-[enclosing-scope lookup](docs/ANALYSIS.md#c-support-first-step) fixes. These
+[enclosing-scope lookup](docs/CXX.md#c-support-first-step) fixes. These
 preserve repeated methods in a chain and recover implicit calls whose class
 header is unavailable.
 
@@ -406,7 +406,7 @@ graph (dependency, declaration only), recursion, thread and task starts and
 IPC bridges are shown as boundaries, and a budget that cuts something leaves a
 `truncated` marker. A database analysed without `--sequencing` is rejected
 with an error naming the flag. Semantics and limits:
-[Call sequencing](docs/ANALYSIS.md#call-sequencing-control-flow-sidecar).
+[Call sequencing](docs/USAGE.md#call-sequencing-control-flow-sidecar).
 
 ```text
 trace inspect <DB> sequence (--function FN | --file SUBSTR --line N [--col C] [--callee NAME])
@@ -507,7 +507,7 @@ points-to targets. Each query shows only the graph reachable from its selected
 variable: use a receiver downstream or its formal upstream to inspect receiver
 passing, and a nullable formal upstream to inspect null arguments. See the
 authoritative
-[Source-level dataflow presentation](docs/ANALYSIS.md#source-level-dataflow-presentation)
+[Source-level dataflow presentation](docs/USAGE.md#source-level-dataflow-presentation)
 for identity, traversal, provenance, and compatibility rules. The walk stays on
 the constraint edges; the memory edges that join a store to the loads of the
 same cell are followed by `trace inspect slice`.
@@ -522,7 +522,7 @@ when known. Null callee IDs are omitted; edges omit `callee_id` entirely. Argume
 their original zero-based `arg_index`; null indices are omitted. Collapsed edges
 preserve their distinct recorded operations and callees. This changes the JSON contract:
 internal fields and the edge-level argument index are omitted. See
-[Source-level dataflow presentation](docs/ANALYSIS.md#source-level-dataflow-presentation)
+[Source-level dataflow presentation](docs/USAGE.md#source-level-dataflow-presentation)
 for field definitions, reference rules, and compatibility.
 
 A dataflow edge in `--format json`:
@@ -557,11 +557,11 @@ trace inspect /tmp/hdf.db dataflow --file usb_raw_io.c --line 331 --col 23 --dep
 
 A bounded value slice from a variable or field access: up to where the
 value comes from, then down to where it goes. Each node lists the
-[execution contexts](docs/ANALYSIS.md#execution-contexts) that reach it,
+[execution contexts](docs/MODELS.md#execution-contexts) that reach it,
 and edges where the value may change hands between threads, tasks or IPC
 requests are flagged as cross-context. A flag is a hint, not a proven race.
 Rules, output fields and limits:
-[Value slice](docs/ANALYSIS.md#value-slice-inspect-slice).
+[Value slice](docs/USAGE.md#value-slice-inspect-slice).
 
 ```text
 trace inspect <DB> slice --file SUBSTR --line N --col C [--name IDENT]
@@ -808,8 +808,26 @@ argument/value-flow queries. See the [merge contract](docs/SQLITE_SCHEMA.md#merg
 When only SDK/dependency headers are available, use `--include` and `--dep`
 to supply type, inheritance and function declarations. When an unavailable
 implementation has known behavior, an explicit `--models` file can summarize
-memory operations, callbacks or an IPC boundary. Built-in libc and callback
-models load automatically; **the DataShare `OpenFile` shortcut does not**.
+memory operations, callbacks, accessor getters or an IPC boundary. Built-in libc
+and callback models load automatically; **the DataShare `OpenFile` shortcut does
+not**.
+
+For a bodyless framework accessor such as `ops_t *get_ops(Driver *d)`, use
+`return_field` to connect the result to the named member of each caller's
+object. The same model handles a getter that returns `&d->ops` when the
+member is an `ops_t` and a getter that loads `d->ops` when the member is an
+`ops_t *`.
+
+```toml
+[[model]]
+name = "get_ops"
+effects = [ { kind = "return_field", param = 0, field = "ops" } ]
+```
+
+The getter must declare a pointer-like return type. An indexed body suppresses
+the model, and a null literal in the modeled argument contributes no field flow.
+For argument numbering and member lookup, see the
+[modeling recipes](docs/MODELS.md#modeling-recipes-examples).
 
 For a media-only analysis with indexed provider implementations, save this
 optional fallback as `datashare-fallback.toml`:
@@ -835,7 +853,7 @@ the framework can be indexed. Re-analyze previously modeled inputs without
 the DataShare fallback to obtain that source-backed view.
 
 Matching, body/override precedence and disabling rules are specified in
-[DataShare sources and fallbacks](docs/ANALYSIS.md#datashare-sources-and-fallbacks).
+[DataShare sources and fallbacks](docs/MODELS.md#datashare-sources-and-fallbacks).
 
 ## SQLite database schema
 
@@ -848,7 +866,7 @@ indexes before that export phase. See the
 SQLite export also builds a function-range index for operation ownership lookup
 during source-level dataflow inspection; see the [inspection index rules](docs/SQLITE_SCHEMA.md#source-level-presentation-metadata-v7).
 
-Schema version: **v9**; readers also support v7 and v8. Public relations are lambda-free, with complete analysis retained in `raw_*`; see the [projection contract](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views). Repeated names, call and operation expressions, and graph text are stored once in a shared dictionary; the existing query columns are exposed through read-only views (see [compact text storage](docs/SQLITE_SCHEMA.md#compact-text-storage)). Each version is an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7, v8 and v9 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `flow_memory_access` records which memory cells each load and store reaches (its sites are that load's or store's `flow_origins` rows), or that none are recorded ([Memory access edges](docs/ANALYSIS.md#memory-access-edges)); an earlier v7 export has no such table and `trace-merge` output leaves it empty. `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model that starts one (not `std::bind` or `std::packaged_task`, which only wrap a callable; `pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table. The `cfg_*` tables hold the per-function call-order graphs `trace analyze --sequencing` records (empty otherwise; `analysis_run.options_json.call_sequencing` says which), read by `trace inspect sequence`; see [call sequencing tables](docs/SQLITE_SCHEMA.md#call-sequencing-tables).
+Schema version: **v9**; readers also support v7 and v8. Public relations are lambda-free, with complete analysis retained in `raw_*`; see the [projection contract](docs/SQLITE_SCHEMA.md#lambda-free-call-graph-views). Repeated names, call and operation expressions, and graph text are stored once in a shared dictionary; the existing query columns are exposed through read-only views (see [compact text storage](docs/SQLITE_SCHEMA.md#compact-text-storage)). Each version is an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7, v8 and v9 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/POINTERS.md#where-a-value-moves)). `flow_memory_access` records which memory cells each load and store reaches (its sites are that load's or store's `flow_origins` rows), or that none are recorded ([Memory access edges](docs/POINTERS.md#memory-access-edges)); an earlier v7 export has no such table and `trace-merge` output leaves it empty. `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model that starts one (not `std::bind` or `std::packaged_task`, which only wrap a callable; `pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/MODELS.md#execution-contexts)); an earlier v7 export has no such table. The `cfg_*` tables hold the per-function call-order graphs `trace analyze --sequencing` records (empty otherwise; `analysis_run.options_json.call_sequencing` says which), read by `trace inspect sequence`; see [call sequencing tables](docs/SQLITE_SCHEMA.md#call-sequencing-tables).
 
 ### Entity relationship (overview)
 
@@ -980,9 +998,9 @@ tests/fixtures/    Integration test C corpora
 
 ## Limitations
 
-- **C++ first step** — namespaces (qualified variables and static data members included; see [Canonical variable identity](docs/ANALYSIS.md#canonical-variable-identity)), overloads (arity), classes/virtual dispatch (including virtual bases), `final` class/method devirtualization, ctors/dtors (constructors also for objects built by `std::make_shared` / `std::make_unique` / `sptr<T>::MakeSptr`; see [Factory construction](docs/ANALYSIS.md#factory-construction); member-initializer construction retains aggregate subobjects, constant and unknown array bounds, default initialization after inherited construction, cv/ref constructor distinctions and implicit copy/move subobject calls, following constructor declarations and reference-binding rules under [Ctors / dtors](docs/ANALYSIS.md#c-support-first-step)), implicit `this->method()`, smart-pointer unwrap through a declared `operator->` (`shared_ptr`, and OHOS `sptr`/`RefPtr` or HDI `AutoPtr` alike, the wrapper keeping its own members for `.`) or, for a wrapper whose body is not in the tree, through its single class argument, bodyless `std::shared_ptr<T>::get()` / `std::unique_ptr<T>::get()` pointee aliases (see [Smart-pointer unwrap](docs/ANALYSIS.md#smart-pointer-unwrap)), `auto` locals typed from declared return types and smart-pointer factories (including parenthesized single-expression initializers such as `auto self(shared_from_this());`, see [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization)), and callables (`std::function`, lambdas, `operator()`) are modeled; type-based overload ranking and templates beyond name-stripping are not (see [docs/ANALYSIS.md](docs/ANALYSIS.md)). Next slices from hiview: [docs/CPP_ROADMAP.md](docs/CPP_ROADMAP.md).
+- **C++ first step** — namespaces (qualified variables and static data members included; see [Canonical variable identity](docs/ANALYSIS.md#canonical-variable-identity)), overloads (arity), classes/virtual dispatch (including virtual bases), `final` class/method devirtualization, ctors/dtors (constructors also for objects built by `std::make_shared` / `std::make_unique` / `sptr<T>::MakeSptr`; see [Factory construction](docs/CXX.md#factory-construction); member-initializer construction retains aggregate subobjects, constant and unknown array bounds, default initialization after inherited construction, cv/ref constructor distinctions and implicit copy/move subobject calls, following constructor declarations and reference-binding rules under [Ctors / dtors](docs/CXX.md#c-support-first-step)), implicit `this->method()`, smart-pointer unwrap through a declared `operator->` (`shared_ptr`, and OHOS `sptr`/`RefPtr` or HDI `AutoPtr` alike, the wrapper keeping its own members for `.`) or, for a wrapper whose body is not in the tree, through its single class argument, bodyless `std::shared_ptr<T>::get()` / `std::unique_ptr<T>::get()` pointee aliases (see [Smart-pointer unwrap](docs/IR.md#smart-pointer-unwrap)), `auto` locals typed from declared return types and smart-pointer factories (including parenthesized single-expression initializers such as `auto self(shared_from_this());`, see [C++ parse-input normalization](docs/CXX.md#c-parse-input-normalization)), and callables (`std::function`, lambdas, `operator()`) are modeled; type-based overload ranking and templates beyond name-stripping are not (see [C++ support](docs/CXX.md)). Next slices from hiview: [docs/CPP_ROADMAP.md](docs/CPP_ROADMAP.md).
 - **May-analysis** — indirect calls can list multiple targets; absence of an edge does not prove unreachability.
-- **IDL subset** — service IDL and HDI omitted-return methods are supported for C++ IPC declarations. Imported type layouts and generator options are not reconstructed; unsupported syntax and generated-header collisions remain visible as diagnostics. See [IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces) for the supported mappings and limits.
+- **IDL subset** — service IDL and HDI omitted-return methods are supported for C++ IPC declarations. Imported type layouts and generator options are not reconstructed; unsupported syntax and generated-header collisions remain visible as diagnostics. See [IDL-generated interfaces](docs/CXX.md#idl-generated-interfaces) for the supported mappings and limits.
 - **No path sensitivity** — all branches and paths are merged.
 - **Preprocessor subset** — not gcc/clang compatible for all extensions. Vendor macros such as `__GNUC__` / `__clang__` require opt-in `--compiler-predefines`; `--system-includes` imports only selected target and hosted-mode macros from the compiler. Without either discovery flag, only the language's own `__cplusplus` / `__STDC__` / `__STDC_VERSION__` are predefined; see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
 - **Build environment** — with `--system-includes`, compiler probing locates installed standard-library headers and selected target macros, but does not supply missing SDK or generated headers. Supply additional roots with `--dep` / `--include` as needed. Other compiler-specific builtins and response files are not modeled.
@@ -993,7 +1011,13 @@ tests/fixtures/    Integration test C corpora
 ## Further reading
 
 - [Architecture](docs/ARCHITECTURE.md)
-- [Analysis algorithm](docs/ANALYSIS.md)
+- [Analysis overview](docs/ANALYSIS.md)
+- [IR facts](docs/IR.md)
+- [Pointers and solver](docs/POINTERS.md)
+- [C++ support](docs/CXX.md)
+- [Function models](docs/MODELS.md)
+- [User-facing analysis features](docs/USAGE.md)
+- [FAQ and recommendations](docs/FAQ.md)
 - [Preprocessor spec](docs/PREPROCESSOR.md)
 - [C API (`trace-capi`)](docs/CAPI.md)
 - [Conditional-compilation coverage reporting](docs/CONDITIONAL_COVERAGE.md)

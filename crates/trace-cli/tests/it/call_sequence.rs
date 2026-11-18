@@ -1,4 +1,4 @@
-//! Call sequencing (`--sequencing`; docs/ANALYSIS.md, "Call sequencing
+//! Call sequencing (`--sequencing`; docs/USAGE.md, "Call sequencing
 //! (control-flow sidecar)").
 
 use crate::common::{
@@ -517,7 +517,7 @@ fn export_without_sequencing_has_no_cfg_rows() {
     );
 }
 
-// --- `inspect sequence` (docs/ANALYSIS.md, "Call sequencing") ---
+// --- `inspect sequence` (docs/USAGE.md, "Call sequencing") ---
 
 /// `root` built with `--sequencing` on top of `opts`, analysed and exported.
 fn sequenced_db(root: &Path, opts: PreprocessOptions) -> TempDb {

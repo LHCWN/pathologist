@@ -78,7 +78,7 @@ values.
 
 ## Adding new analysis constraints
 
-Document the new constraint kind in `docs/ANALYSIS.md` **before** adding code.
+Document the new constraint kind in `docs/IR.md` **before** adding code.
 Then follow the steps in `AGENTS.md` ("Adding analysis constraints" section).
 
 ## Schema and preprocessor changes
@@ -89,7 +89,7 @@ Then follow the steps in `AGENTS.md` ("Adding analysis constraints" section).
   `docs/PREPROCESSOR.md`, add lexer tests, and add a fixture under
   `tests/fixtures/preproc/` — or under `tests/fixtures/builtin_macros/` when
   the feature is a builtin fallback macro, whose fixtures are grouped there.
-- **Flow constraints** — document the new kind in `docs/ANALYSIS.md` and
+- **Flow constraints** — document the new kind in `docs/IR.md` and
   update the phase table if applicable.
 
 ## Pull request expectations

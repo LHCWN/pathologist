@@ -2,7 +2,7 @@
 //! The parse input omits only the complete computed base entries (and the
 //! separators they owned), keeping concrete siblings, the class body and every
 //! line/column position; computed-base inheritance stays explicitly
-//! unresolved (docs/ANALYSIS.md, "C++ parse-input normalization").
+//! unresolved (docs/CXX.md, "C++ parse-input normalization").
 
 use std::fs;
 use std::path::Path;

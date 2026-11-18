@@ -1,5 +1,5 @@
 // Issue #151: `*x` reads the value `x` holds, not its root variable's.
-// See docs/ANALYSIS.md, "Dereferenced operands".
+// See docs/IR.md, "Dereferenced operands".
 int g_x;
 int *g_p = &g_x;
 int **g_pp = &g_p;

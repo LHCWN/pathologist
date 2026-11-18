@@ -524,7 +524,7 @@ pub fn assert_local_points_to(
     );
 }
 
-/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): the nodes
+/// Issue #151 (docs/IR.md, "Dereferenced operands"): the nodes
 /// `start` reaches in value-flow `(from, to, label)` edges through one edge
 /// labelled with each of `hops`, in order, with any number of `copy` edges
 /// before, between and after them.

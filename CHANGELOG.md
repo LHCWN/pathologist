@@ -41,6 +41,34 @@ precision, and ignored with configured indexing. See the
 [measurements](docs/EVAL_REPORT.md#canonical-prelude-at-default-mode-cost-2026-11-16)
 and [preprocessor contract](docs/PREPROCESSOR.md#canonical-system-preamble).
 
+### Split the analysis documentation by aspect
+
+`docs/ANALYSIS.md` had grown past 7,500 lines and mixed design, IR, solver,
+model and usage material. It is now split into topical documents:
+`ANALYSIS.md` (overall design: pipeline, symbol identity, link targets,
+merging), `IR.md` (flow constraints, return-value flow, conditional values,
+casts, smart pointers, dynamic symbols), `POINTERS.md` (PAG, solver, fields,
+arrays, indirect resolution, argument wiring), `CXX.md` (C++ lowering,
+automatic objects, factories, syntax reuse, IDL interfaces), `MODELS.md`
+(function models, IPC bridges, callbacks, execution contexts), `USAGE.md`
+(value slices, sequencing, dependency roots, compilation databases,
+conditional exploration, dataflow presentation) and `FAQ.md` (known
+imprecision, performance notes, recommendations). Section anchors moved with
+their content; cross-references in the docs, README, AGENTS and source
+comments were rewritten, and the overview carries a documentation map.
+
+### Model accessor getters with `return_field`
+
+The `return_field { param, field }` effect models bodyless accessors by
+projecting a struct or union member from each call's actual argument. It
+copies the member address for an address-returning getter and installs a
+persistent load when the declared return type matches a pointer-valued member.
+Callbacks and memory accesses follow the result through direct arguments,
+repeated assignments and wrappers. C++ instance methods can project from the
+receiver, and static methods count explicit arguments from zero. Null literals
+and getters with indexed bodies contribute no modeled field flow.
+See the [modeling recipes](docs/MODELS.md#modeling-recipes-examples).
+
 ### Look up call sites by ID with a binary search
 
 `SymbolTable::call_site_by_id` checked the record at the ID's position and, on a
@@ -75,8 +103,8 @@ fundamental types (`std::size_t`) record nothing. Pinned `edges_indirect`
 moves by the factory-built `std::thread` starts: HiView 262 to 265 and camera
 459 to 462. The rule is not limited to classes a model names, so external edges
 rise too, inside their bands: HDF +1, HiView +10, camera +8 and ability_runtime
-+46. See `docs/ANALYSIS.md` ("Factory construction", "Callable wrappers") and
-`docs/EVAL_REPORT.md`.
++46. See `docs/CXX.md` ("Factory construction") and `docs/MODELS.md`
+("Callable wrappers"), and `docs/EVAL_REPORT.md`.
 
 ### Let an `invoke` model wrap a callable without starting an execution context (#283)
 
@@ -88,7 +116,7 @@ rows and starts no context, so no row is exported and no boundary is drawn; the
 wrapping site is an ordinary call in the sequence graph. Both built-in wrappers
 state it, which removes their 14, 16, 34 and 1 rows on HDF, HiView, camera and
 ability_runtime. `none` is not a `kind` value, so the schema is unchanged. See
-`docs/ANALYSIS.md` ("Function models", "Callable wrappers") and
+`docs/MODELS.md` ("Function models", "Callable wrappers") and
 `docs/EVAL_REPORT.md`.
 
 ### Follow arguments through variadic parameter packs (#282)
@@ -105,7 +133,7 @@ resolves. The analysis stays flow-insensitive: the pack is one variable for all
 its elements, so every element may reach every formal it is forwarded to. On
 the pinned corpora only camera moves, `arg_flow_edges` 58694 to 59919, almost
 all rows into pack formals; indirect edges are unchanged. See
-`docs/ANALYSIS.md` ("Variadic parameter packs") and `docs/EVAL_REPORT.md`.
+`docs/POINTERS.md` ("Variadic parameter packs") and `docs/EVAL_REPORT.md`.
 
 ### Keep callables passed through `std::bind` and `std::packaged_task` reachable (#250)
 
@@ -123,7 +151,7 @@ reaches the lambdas it runs again on camera, the edges #249 removed with the
 `decltype` operand. Pinned `edges_indirect` moves by each corpus's `std::bind`
 sites: HDF 5139 to 5153, HiView 246 to 262, camera 443 to 459 and
 ability_runtime 1848 to 1849. The models and their imprecision are in
-`docs/ANALYSIS.md` ("Callable wrappers"), the measurements in
+`docs/MODELS.md` ("Callable wrappers"), the measurements in
 `docs/EVAL_REPORT.md`.
 
 ### Reduce the indexing cost of conditional lowering (#280)
@@ -185,7 +213,7 @@ the members its list omits; for a class without one, the function building the
 object does. A list entry replaces the default. Re-index to pick up the new
 edges.
 
-See [C++ support](docs/ANALYSIS.md#c-support-first-step);
+See [C++ support](docs/CXX.md#c-support-first-step);
 measurements in `docs/EVAL_REPORT.md` ("Default member initializers").
 
 ### Parenthesized `shared_from_this()` without `<memory>`
@@ -197,7 +225,7 @@ and a lambda capturing it receives the object without `--system-includes` or
 parsing the whole STL. A class without an `enable_shared_from_this` base keeps
 the declaration interpretation.
 
-See [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization).
+See [C++ parse-input normalization](docs/CXX.md#c-parse-input-normalization).
 
 ### Resolve immediately invoked lambdas (#268)
 
@@ -208,7 +236,7 @@ stayed unresolved with the lambda's source as its callee, or disappeared when
 that source held a string literal. Lambdas from one macro expansion no longer
 collapse into the first. Re-index to pick up the new edges.
 
-See [Callables](docs/ANALYSIS.md#c-support-first-step);
+See [Callables](docs/CXX.md#c-support-first-step);
 measurements in `docs/EVAL_REPORT.md` ("Immediately invoked lambdas").
 
 ### Parenthesized `auto` local initializers
@@ -231,7 +259,7 @@ object definitions. Explicit member and grouped spellings
 path, and recovery retains the original byte offsets, LineMap and enclosing
 scope.
 
-See [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization)
+See [C++ parse-input normalization](docs/CXX.md#c-parse-input-normalization)
 and [production evaluation](docs/EVAL_REPORT.md#parenthesized-auto-initializers--2026-11-09).
 
 ### Bridge IPC operations through `SendTransactCmd`
@@ -245,7 +273,7 @@ calling operations without IPC edges. Declaration-only helpers are supported.
 and stub repositories. Re-index proxy-side databases created before this
 change to include `SendTransactCmd` senders.
 
-See [IPC bridge rules](docs/ANALYSIS.md#openharmony-ipc-bridges) and
+See [IPC bridge rules](docs/MODELS.md#openharmony-ipc-bridges) and
 [production evaluation](docs/EVAL_REPORT.md#ipc-sends-through-sendtransactcmd--2026-11-06).
 ### Preserve pointer and callback values through conditionals (#244)
 
@@ -394,8 +422,8 @@ the definition's parameter storage. The branch is rebased on local master
 `SendTransactCmd` IPC probes.
 
 Rules and remaining modeling dependencies:
-[conditional values](docs/ANALYSIS.md#conditional-values).
-The explicit [implementation limitations](docs/ANALYSIS.md#conditional-value-limitations)
+[conditional values](docs/IR.md#conditional-values).
+The explicit [implementation limitations](docs/IR.md#conditional-value-limitations)
 define the coverage boundary; this feature does not imply complete C/C++
 expression, conversion or library modeling.
 Regression coverage, pinned-corpus changes and timing measurements:
@@ -439,7 +467,7 @@ In `ipc_cross_repo`, class-import resolution removes the undefined
 `MediaDataShareStubImpl::OpenFile`, retaining the defined `AbilityRuntime`
 implementation.
 
-Rules: [smart-pointer unwrap](docs/ANALYSIS.md#smart-pointer-unwrap).
+Rules: [smart-pointer unwrap](docs/IR.md#smart-pointer-unwrap).
 Measurements and remaining corpus limits:
 [owning-pointer extraction](docs/EVAL_REPORT.md#owning-pointer-get-aliases--2026-10-31).
 
@@ -497,7 +525,7 @@ projections, including retained linking facts and edge identities. The benchmark
 runner checks for GNU time before opening inputs or starting a merger.
 
 Rules: [Cross-repository reconstruction](docs/ANALYSIS.md#invariants-and-linking-rules)
-and [IPC models](docs/ANALYSIS.md#openharmony-ipc-bridges).
+and [IPC models](docs/MODELS.md#openharmony-ipc-bridges).
 Storage and compatibility: [Linking metadata](docs/SQLITE_SCHEMA.md#merger-inputs-and-output).
 Validation, runtime, memory, storage and coverage:
 [Rebased comparison](docs/EVAL_REPORT.md#cross-repository-ipc-after-rebasing-onto-master--2026-10-30),
@@ -552,9 +580,9 @@ the actual defining function and execution context. Sender bodies and indexed
 virtual overrides take precedence over summaries. Handler eligibility follows
 the shared declaring-header, image and test-partition rules.
 
-Rules: [C++ constructions](docs/ANALYSIS.md#c-support-first-step),
-[Undeclared receiver classes](docs/ANALYSIS.md#undeclared-receiver-classes)
-and [IPC models](docs/ANALYSIS.md#openharmony-ipc-bridges).
+Rules: [C++ constructions](docs/CXX.md#c-support-first-step),
+[Undeclared receiver classes](docs/CXX.md#undeclared-receiver-classes)
+and [IPC models](docs/MODELS.md#openharmony-ipc-bridges).
 
 ### Parse GNU visibility attributes before C linkage (#234)
 
@@ -563,7 +591,7 @@ on declarations and definitions without changing source files. Original source
 positions, external function identity and calls across translation units are
 preserved. Unrelated syntax errors still produce parse diagnostics.
 
-Rules: [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization).
+Rules: [C++ parse-input normalization](docs/CXX.md#c-parse-input-normalization).
 Validation: [Evaluation report](docs/EVAL_REPORT.md#gnu-visibility-before-c-linkage--2026-10-19).
 
 ### HDI omitted-return IDL methods
@@ -584,7 +612,7 @@ also handles a lowercase letter after the leading `I` (`Input` generates
 `nputProxy` / `nputStub`). Service-IDL mappings remain unchanged.
 
 Supported syntax, generated signatures and remaining dialect limits:
-[IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces).
+[IDL-generated interfaces](docs/CXX.md#idl-generated-interfaces).
 Fixtures, pinned-corpus results and the distinction between remaining parser
 warnings and generated-header collisions:
 [Evaluation report](docs/EVAL_REPORT.md#hdi-omitted-return-methods--2026-10-19).
@@ -606,7 +634,7 @@ This restores `ApplicationContext::GetInteropCallbacks()` at
 Existing databases with retained unresolved sites support the callgraph display
 change immediately. Re-analysis applies the lookup and chained-position fixes.
 Rules: [Call source locations](docs/ANALYSIS.md#call-source-locations),
-[Methods](docs/ANALYSIS.md#c-support-first-step), and
+[Methods](docs/CXX.md#c-support-first-step), and
 [callgraph query IDs](docs/SQLITE_SCHEMA.md#call-site-export-filter).
 Validation: [Evaluation report](docs/EVAL_REPORT.md#cpp-call-sites-and-unresolved-callgraphs--2026-10-15).
 
@@ -700,8 +728,8 @@ tree, and spills coalesce mapping blocks into larger I/O operations.
 Parallel indexing reports completed orphan/TU merges and shared-header merging.
 
 Contracts: [preprocessing](docs/PREPROCESSOR.md#shared-system-header-bundles),
-[indexing syntax reuse](docs/ANALYSIS.md#indexing-syntax-reuse) and
-[template returns](docs/ANALYSIS.md#c-support-first-step).
+[indexing syntax reuse](docs/CXX.md#indexing-syntax-reuse) and
+[template returns](docs/CXX.md#c-support-first-step).
 The [evaluation report](docs/EVAL_REPORT.md#shared-system-header-units--2026-10-16)
 records reproductions, behavioral and determinism comparisons, measurements and limits.
 The [preamble and cache-lifetime follow-up](docs/EVAL_REPORT.md#shared-header-preambles-and-default-mode-correction--2026-10-16)
@@ -738,7 +766,7 @@ add copy edges into wait buffers; mutable pointers initialized to null remain
 eligible for later values.
 
 Semantics and conservative pooling limits:
-[Epoll event data](docs/ANALYSIS.md#epoll-event-data). Validation and the
+[Epoll event data](docs/MODELS.md#epoll-event-data). Validation and the
 reference checkout revision:
 [Evaluation report](docs/EVAL_REPORT.md#epoll-event-data-flow-144--2026-10-11).
 
@@ -764,8 +792,8 @@ attributes a statement in a lambda task's body to the lambda (so to the
 task's context), requires `flow_memory_access` and refuses `trace-merge`
 output. `--file` in inspect lookups now matches a literal substring (`%` and
 `_` are no longer wildcards). Rules:
-[Value slice](docs/ANALYSIS.md#value-slice-inspect-slice) and
-[Memory access edges](docs/ANALYSIS.md#memory-access-edges); measurements and
+[Value slice](docs/USAGE.md#value-slice-inspect-slice) and
+[Memory access edges](docs/POINTERS.md#memory-access-edges); measurements and
 the camera CVE retro-test (`scripts/cve_slice_retro.py`) in
 `docs/EVAL_REPORT.md` ("Value slice: #205").
 
@@ -785,7 +813,7 @@ sites record their receiver variable, and
 `execution_contexts` gains the nullable `receiver_var_id` and `model` columns
 (additive to v7; `trace-merge` carries `model`, NULL from an input whose table
 predates it, and leaves the receiver NULL).
-Rules: [Model matching](docs/ANALYSIS.md#model-matching) and "Built-in models";
+Rules: [Model matching](docs/MODELS.md#model-matching) and "Built-in models";
 measurements in `docs/EVAL_REPORT.md` ("Task and thread primitives: #203").
 
 ### Execution contexts: thread, task and IPC entries (#202)
@@ -800,7 +828,7 @@ handler. Each row has a kind (`thread`, `pool_task`, `serial_task`,
 `call_edges` is unchanged. `trace-merge` carries the rows into merged
 databases, validates the table's columns when an input has it, and names an
 input without it in a `MissingExecutionContexts` diagnostic. Rules:
-[Execution contexts](docs/ANALYSIS.md#execution-contexts); merge behaviour:
+[Execution contexts](docs/MODELS.md#execution-contexts); merge behaviour:
 [Merger inputs and output](docs/SQLITE_SCHEMA.md#merger-inputs-and-output);
 measurements in `docs/EVAL_REPORT.md` ("Execution contexts: #202").
 
@@ -819,7 +847,7 @@ a single definition is that definition's, its first and last lines included;
 otherwise none. A statement on its own line in a lambda body or a local
 class's method is now that definition's, in `inspect dataflow` edge scopes as
 well; before, any site two definitions held had none. Rules:
-[Where a value moves](docs/ANALYSIS.md#where-a-value-moves); query:
+[Where a value moves](docs/POINTERS.md#where-a-value-moves); query:
 [Source sites of a value move](docs/SQLITE_SCHEMA.md#source-sites-of-a-value-move).
 
 ### Member initializers avoid invented constructor edges (#207)
@@ -854,7 +882,7 @@ a base class's constructor for its derived class's own constructor. Regression
 fixtures cover both import paths and lower reference-member initializer lists
 in a second translation unit. Multiple declarators, qualified base names,
 cached unions and parenthesized member names retain real calls. Rules and lookup limits:
-[Ctors / dtors](docs/ANALYSIS.md#c-support-first-step).
+[Ctors / dtors](docs/CXX.md#c-support-first-step).
 Corpus movements and verification:
 [Constructor follow-up review](docs/EVAL_REPORT.md#four-constructor-follow-up-findings-207--2026-10-09).
 
@@ -884,7 +912,7 @@ Measurements, database comparisons and remaining acceptance checks:
 
 ### Smart-pointer factories reach their constructor (#192)
 
-`std::make_shared<T>(args)`, `std::make_unique<T>(args)` and `sptr<T>::MakeSptr(args)` now also record a direct constructor call of `T` with the factory's arguments bound, as `new T(args)` does; the factory's own edge is kept. The heap object of `new` is now the variable `$new<id>` (was `_ret<id>`), a factory's `$make<id>`, and a statement-position `new` now has one too. `new (std::nothrow) T(a, b)` binds `a, b` rather than the placement list, and a one-argument copy or move records no constructor site wherever the object is built (`new T(other)`, `make_shared<T>(other)`, `T x(other)`, a member initializer `m_(other)`): one argument no constructor takes, or an object of the class itself when no constructor takes the class. A reference member's binding (`ref_(other)`) constructs nothing either. `new Agg{1, 2}` of an aggregate records no constructor site. `new T{a, b}` binds its braces as arguments when `T` has a user-provided constructor, and a `volatile` template argument constructs as a `const` one does. A bare `make_shared` / `make_unique` that resolves to a project's own function is no longer taken for the standard factory, for result typing either. `std::allocate_shared<T>(alloc, args)` is recognised too. A factory call in a cached header, or of a class defined outside the tree, keeps an unresolved constructor site as `new` does, for the TU merge to resolve. A factory's object is the constructor's `this` only, not the value the call yields (copying it changed no call edge and cost 43% more solver pops on `ability_ability_runtime`). A constructor's member initializer of a non-class member (`cb_(cb)`, `cb_{cb}`) now stores its value as `this->cb_ = cb` does, so callbacks a constructor keeps reach their calls. A variant merge pairs synthesized temporaries by their recorded kind (`Variable::temp`), never by name. Rules: [Factory construction](docs/ANALYSIS.md#factory-construction); measurements in `docs/EVAL_REPORT.md` ("Factory construction").
+`std::make_shared<T>(args)`, `std::make_unique<T>(args)` and `sptr<T>::MakeSptr(args)` now also record a direct constructor call of `T` with the factory's arguments bound, as `new T(args)` does; the factory's own edge is kept. The heap object of `new` is now the variable `$new<id>` (was `_ret<id>`), a factory's `$make<id>`, and a statement-position `new` now has one too. `new (std::nothrow) T(a, b)` binds `a, b` rather than the placement list, and a one-argument copy or move records no constructor site wherever the object is built (`new T(other)`, `make_shared<T>(other)`, `T x(other)`, a member initializer `m_(other)`): one argument no constructor takes, or an object of the class itself when no constructor takes the class. A reference member's binding (`ref_(other)`) constructs nothing either. `new Agg{1, 2}` of an aggregate records no constructor site. `new T{a, b}` binds its braces as arguments when `T` has a user-provided constructor, and a `volatile` template argument constructs as a `const` one does. A bare `make_shared` / `make_unique` that resolves to a project's own function is no longer taken for the standard factory, for result typing either. `std::allocate_shared<T>(alloc, args)` is recognised too. A factory call in a cached header, or of a class defined outside the tree, keeps an unresolved constructor site as `new` does, for the TU merge to resolve. A factory's object is the constructor's `this` only, not the value the call yields (copying it changed no call edge and cost 43% more solver pops on `ability_ability_runtime`). A constructor's member initializer of a non-class member (`cb_(cb)`, `cb_{cb}`) now stores its value as `this->cb_ = cb` does, so callbacks a constructor keeps reach their calls. A variant merge pairs synthesized temporaries by their recorded kind (`Variable::temp`), never by name. Rules: [Factory construction](docs/CXX.md#factory-construction); measurements in `docs/EVAL_REPORT.md` ("Factory construction").
 
 ### Compact flow_nodes export and on-demand dataflow inspect (#195)
 
@@ -892,15 +920,15 @@ Variable nodes in `flow_nodes` now store empty strings for `label` and `detail` 
 
 ### Thread entry points through argument-forwarding callback models (#187)
 
-A function started on a new thread is now reachable from the code that starts it. The `invoke` model effect takes the arguments the callback is called with, as `args = [..]` or a variadic `rest = N` (loadable from `--models`), and wires them into the callback's formals inside the fixpoint; each forwarded argument is an arg-flow row at the starting call site. Built-in models cover `pthread_create` and the `std::thread` constructor, including temporaries, lambdas, static members and members started with their receiver. A field path rooted at a pointer cast of a variable (`static_cast<Ctx *>(arg)->h()`, `((Ctx *)arg)->h()`) resolves against the cast's class. Rules: [Callback invocation](docs/ANALYSIS.md#callback-invocation-invoke), [Cast receivers](docs/ANALYSIS.md#cast-receivers); measurements in `docs/EVAL_REPORT.md` ("Thread entry points").
+A function started on a new thread is now reachable from the code that starts it. The `invoke` model effect takes the arguments the callback is called with, as `args = [..]` or a variadic `rest = N` (loadable from `--models`), and wires them into the callback's formals inside the fixpoint; each forwarded argument is an arg-flow row at the starting call site. Built-in models cover `pthread_create` and the `std::thread` constructor, including temporaries, lambdas, static members and members started with their receiver. A field path rooted at a pointer cast of a variable (`static_cast<Ctx *>(arg)->h()`, `((Ctx *)arg)->h()`) resolves against the cast's class. Rules: [Callback invocation](docs/MODELS.md#callback-invocation-invoke), [Cast receivers](docs/IR.md#cast-receivers); measurements in `docs/EVAL_REPORT.md` ("Thread entry points").
 
 ### Constructor and destructor edges for automatic C++ objects (#190)
 
-A local of class type (`T x;`) now records the constructors it runs and one destructor site, attributed to its declaration with the local as `this`, so RAII guards, scoped tracers and fd wrappers stay in the call graph. An implicit or defaulted member runs every base's. Range-for and catch variables lower as locals of the statement's body, and a lambda's or block-scope declaration's parameters no longer leak into the enclosing function's scope. Rules: [Automatic objects](docs/ANALYSIS.md#automatic-objects); measurements in `docs/EVAL_REPORT.md`.
+A local of class type (`T x;`) now records the constructors it runs and one destructor site, attributed to its declaration with the local as `this`, so RAII guards, scoped tracers and fd wrappers stay in the call graph. An implicit or defaulted member runs every base's. Range-for and catch variables lower as locals of the statement's body, and a lambda's or block-scope declaration's parameters no longer leak into the enclosing function's scope. Rules: [Automatic objects](docs/CXX.md#automatic-objects); measurements in `docs/EVAL_REPORT.md`.
 
 ### Return-value flow for nested call arguments (#185)
 
-When a function call's return value is passed directly as an argument into another call (`consume(make())`, `Register(obj->GetHandler())`, `consume(table[i]())`, `std::move(make())`), lowering now materializes a return temporary variable assigned via `CallReturn`, `CallReturnIndirect`, or member call return destinations and passes it as the actual argument into the outer call site. This restores parity between nested call arguments and equivalent code using intermediate variables (`Callback f = make(); consume(f);`), propagating return points-to into formal parameters and enabling indirect resolution across direct, static, indirect, member, deeper-nested, and `std::move`-wrapped calls, both within a translation unit and across units. Member calls preserve argument count and overload ranking (`rank_per_class`), and virtual dispatch across derived class overrides (`expand_virtual_overrides`) wires return flows from concrete derived implementations into member call return destinations via `Pag::expand_call_site_returns` (including pure virtual base interface declarations `= 0`). Only qualified `std::move` and `std::forward` calls with forwarding reference semantics (`T&&`) are peeled as cast expressions, preserving ordinary user-defined `move` and `forward` functions. Returned call expressions resolve through `resolve_call_for_return`, materializing indirect and member call returns into temporaries with `ReturnFlow::Copy` and preserving variable shadowing. Temporaries are allocated only after confirming resolution, eliminating orphaned variables in symbol tables. Rules: [Return-value flow](docs/ANALYSIS.md#return-value-flow); measurements in `docs/EVAL_REPORT.md` ("Nested call return arguments").
+When a function call's return value is passed directly as an argument into another call (`consume(make())`, `Register(obj->GetHandler())`, `consume(table[i]())`, `std::move(make())`), lowering now materializes a return temporary variable assigned via `CallReturn`, `CallReturnIndirect`, or member call return destinations and passes it as the actual argument into the outer call site. This restores parity between nested call arguments and equivalent code using intermediate variables (`Callback f = make(); consume(f);`), propagating return points-to into formal parameters and enabling indirect resolution across direct, static, indirect, member, deeper-nested, and `std::move`-wrapped calls, both within a translation unit and across units. Member calls preserve argument count and overload ranking (`rank_per_class`), and virtual dispatch across derived class overrides (`expand_virtual_overrides`) wires return flows from concrete derived implementations into member call return destinations via `Pag::expand_call_site_returns` (including pure virtual base interface declarations `= 0`). Only qualified `std::move` and `std::forward` calls with forwarding reference semantics (`T&&`) are peeled as cast expressions, preserving ordinary user-defined `move` and `forward` functions. Returned call expressions resolve through `resolve_call_for_return`, materializing indirect and member call returns into temporaries with `ReturnFlow::Copy` and preserving variable shadowing. Temporaries are allocated only after confirming resolution, eliminating orphaned variables in symbol tables. Rules: [Return-value flow](docs/IR.md#return-value-flow); measurements in `docs/EVAL_REPORT.md` ("Nested call return arguments").
 
 ### Memory footprint reductions across preprocessor, indexing, and analysis
 
@@ -933,7 +961,7 @@ under `call_expression` as benign, and lowering extracts the receiver and
 operator name to resolve member operator targets with their proper callee
 identity. In dependency headers, expressions in trailing return types preserve
 surrounding function signatures without emitting leaked call sites. Rules:
-[Explicit member operator calls](docs/ANALYSIS.md#explicit-member-operator-calls);
+[Explicit member operator calls](docs/CXX.md#explicit-member-operator-calls);
 measurements in `docs/EVAL_REPORT.md`.
 
 ### Static data member sharing without link information (#143)
@@ -955,7 +983,7 @@ parsed, and the interface, proxy and stub headers idl-tool would generate are
 synthesized in memory as declarations-only dependency headers. A client call
 through `sptr<IFoo>` reaches the proxy, and the proxy's methods bridge to the
 service deriving from the stub (`resolution = 'ipc'`). Rules:
-[IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces);
+[IDL-generated interfaces](docs/CXX.md#idl-generated-interfaces);
 measurements in `docs/EVAL_REPORT.md`.
 
 A header the expansion cache cannot store (its variant list is full) is no
@@ -1099,15 +1127,15 @@ from an out-of-tree template now reach the classes they name.
   definitions are outside the tree. Overloads are chosen by explicit
   parameter types recorded for prototypes, and a virtual call dispatches to
   overrides of the overloads that won. Rules: **Templates** in
-  [`docs/ANALYSIS.md`](docs/ANALYSIS.md#c-support-first-step).
+  [`docs/CXX.md`](docs/CXX.md#c-support-first-step).
 - **Undefined template bases (#122)**: `class FooProxy : public IRemoteProxy<IFoo>`
   with the template outside the tree derives from `IFoo` when the class or a
   subclass implements one of `IFoo`'s virtual members, so calls through the
-  interface reach the proxy. Rules: [Template-parameter bases](docs/ANALYSIS.md#template-parameter-bases).
+  interface reach the proxy. Rules: [Template-parameter bases](docs/CXX.md#template-parameter-bases).
 - **IPC interface consistency (#122)**: a proxy and a stub whose names pair
   but whose `IRemoteProxy<I>` / `IRemoteStub<I>` arguments name two unrelated
   declared interfaces are no longer bridged. Rules:
-  [OpenHarmony IPC bridges](docs/ANALYSIS.md#openharmony-ipc-bridges).
+  [OpenHarmony IPC bridges](docs/MODELS.md#openharmony-ipc-bridges).
 - Measurements and corpus deltas: `docs/EVAL_REPORT.md`.
 
 ### Function pointer member declarator classification and member call fallback (#147)
@@ -1156,9 +1184,9 @@ now follow the C++ meaning, and the implicit-`this` handling of #145 and
 - The Andersen solver's propagation was reworked to absorb the analyze-phase
   cost the new facts add.
 
-See [docs/ANALYSIS.md](docs/ANALYSIS.md#dereferenced-operands),
-[Template-parameter bases](docs/ANALYSIS.md#template-parameter-bases) and
-[Implicit this member variable access](docs/ANALYSIS.md#implicit-this-member-variable-access),
+See [docs/IR.md](docs/IR.md#dereferenced-operands),
+[Template-parameter bases](docs/CXX.md#template-parameter-bases) and
+[Implicit this member variable access](docs/POINTERS.md#implicit-this-member-variable-access),
 and [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md#dereferenced-operands-and-template-parameter-bases--2026-09-25-151-150).
 
 ### Implicit member pointer field decomposition (#146)
@@ -1202,7 +1230,7 @@ In OpenHarmony `services/memmgrservice/src/event/memory_pressure_observer.cpp`
 (`resourceschedule_memmgr`), `handlerInfo_ = (struct LevelHandler*)curEpollEvent->data.ptr;`
 now emits a store into `this->handlerInfo_`, preserving pointer flow from the
 epoll event loop to the callback handler.
-See [docs/ANALYSIS.md](docs/ANALYSIS.md#implicit-this-member-variable-access)
+See [docs/POINTERS.md](docs/POINTERS.md#implicit-this-member-variable-access)
 and [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md#implicit-this-member-variable-access-and-assignments--2026-09-24-145).
 
 ### Noise macro filtering
@@ -1229,7 +1257,7 @@ On `ability_ability_runtime` (clean checkout at `6c18fdc9bdef`), `--ignore-loggi
 over 307,000 call sites (-51.7%) and 309,000 call edges (-40.3%), dropping SQLite database
 size from 344 MB to 290 MB (-54.4 MB), with no impact on IPC or indirect edges. Default
 runs without flags remain 100% bit-identical. See
-[docs/ANALYSIS.md](docs/ANALYSIS.md#noise-macro-filtering---ignore-macro---ignore-logging-noise)
+[docs/USAGE.md](docs/USAGE.md#noise-macro-filtering---ignore-macro---ignore-logging-noise)
 and [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md#noise-macro-filtering---ignore-macro---ignore-logging--2026-09-23-124).
 
 ### Macro-body call source locations
@@ -1279,7 +1307,7 @@ absent (may-flow queries can under-report). New flags: `--solve-budget-pops <N>`
 time limit; checked every 10 000 pops). `TRACE_SOLVE_BUDGET_POPS` remains as a
 highest-precedence override; the eval harness still pins it to `800 000`, so
 the pinned corpora are byte-identical. See
-[docs/ANALYSIS.md](docs/ANALYSIS.md#work-budget).
+[docs/POINTERS.md](docs/POINTERS.md#work-budget).
 
 ### External callee locations
 
@@ -1297,7 +1325,7 @@ the first libc edge). See `docs/CAPI.md` and the inspect reference in `README.md
 Points-to propagation no longer allocates per step, and a store filters its
 source set once per pointer-slot signature instead of once per target
 location. Exported databases are byte-identical. See
-[Propagation highlights](docs/ANALYSIS.md#propagation-highlights).
+[Propagation highlights](docs/POINTERS.md#propagation-highlights).
 
 ### C++ caller edges (#113)
 
@@ -1332,7 +1360,7 @@ caller shows up:
   submitting call site once the points-to sets converge, deduplicated against what the callee's own
   body already yields. `ffrt::queue::submit` ships as a built-in model, and the effect is
   configurable like any other (`kind = "invoke"`). Bare model names now match qualified callees,
-  with exact-name models taking precedence. See `docs/ANALYSIS.md` ("Function models") for
+  with exact-name models taking precedence. See `docs/MODELS.md` ("Function models") for
   what the effect does and does not claim.
 
 Two code reviews of the above found further gaps, since fixed: a receiver substitutes through its

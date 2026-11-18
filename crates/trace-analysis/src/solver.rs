@@ -24,7 +24,7 @@ pub struct AnalyzeOptions {
     /// Retain full points-to sets on the result (for `--debug-points-to` export).
     pub retain_points_to: bool,
     /// Function models matched by callee name (built-ins plus any user
-    /// configuration). See `docs/ANALYSIS.md`, "Function models".
+    /// configuration). See `docs/MODELS.md`, "Function models".
     pub models: std::sync::Arc<FnModelSet>,
     /// Explicit solver pop budget (CLI `--solve-budget-pops`). `None`
     /// derives a default from the PAG constraint count; `Some(0)` means
@@ -140,10 +140,10 @@ pub struct AnalysisResult {
     pub terminator_events: Vec<(CallSiteId, u32)>,
     /// Where threads, tasks and IPC requests start running code: one per
     /// resolved callback invocation, then one per IPC stub handler
-    /// (`docs/ANALYSIS.md`, "Execution contexts").
+    /// (`docs/MODELS.md`, "Execution contexts").
     pub execution_contexts: Vec<ExecutionContext>,
     /// The cells each load reads and each store writes, read off the
-    /// converged points-to sets (`docs/ANALYSIS.md`, "Memory access edges").
+    /// converged points-to sets (`docs/POINTERS.md`, "Memory access edges").
     pub memory_accesses: Vec<MemoryAccess>,
     /// How the solver run ended: converged or budget-truncated. A truncated
     /// run exports a `solver_partial` marker and an `analyze`-stage
@@ -159,7 +159,7 @@ pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
 
 pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, AnalysisResult) {
     // One matcher for both phases: a name's class-rule candidates are
-    // resolved once (`docs/ANALYSIS.md`, "Model matching").
+    // resolved once (`docs/MODELS.md`, "Model matching").
     let models = opts.models.lookup(program);
     let mut pag = Pag::build_with_models_and_ipc(program, &models, opts.enable_ipc);
     let mut result = solve(
@@ -242,7 +242,7 @@ struct SolverState {
     /// summaries and the fallback summaries the `Gep` step pointed it at
     /// ([`Self::point_gep_at`]). Its points-to also holds those cells'
     /// contents; this set is what a load or store through it touches
-    /// (`docs/ANALYSIS.md`, "Memory access edges").
+    /// (`docs/POINTERS.md`, "Memory access edges").
     designated: FxHashMap<PagNodeId, FxHashSet<LocId>>,
     /// The `Gep` destinations whose designated cells are kept: those a load
     /// reads through or a store writes through, the only ones
@@ -273,7 +273,7 @@ struct SolverState {
     /// Locations that are the source of an `AddrOf` constraint.
     addr_taken: FxHashSet<LocId>,
     /// Variable node → the memory cell kept in step with it, and back
-    /// (docs/ANALYSIS.md, "Variable cells"). Filled when the cell's address is
+    /// (docs/POINTERS.md, "Variable cells"). Filled when the cell's address is
     /// first taken ([`register_synced_cell`]), so the per-pop hooks are one
     /// lookup each.
     /// The flag excludes an array's own storage from its element contents.
@@ -766,6 +766,9 @@ impl SolverState {
                 .extend(cells.clone());
         }
         propagate_locs(self, fresh, dst, cells.clone());
+        if pag.nodes[dst.0 as usize].kind == PagNodeKind::FieldAddress {
+            return;
+        }
         for cell in cells {
             self.merge_memory_into_if_grown(pag, fresh, dst, cell);
         }
@@ -992,7 +995,7 @@ fn solve(
     let mut resolved_callees = 0usize;
     for cs in &program.symbols.call_sites {
         // A call in an operand never evaluated never runs: no edge, no
-        // argument flow (docs/ANALYSIS.md, "Unevaluated operands").
+        // argument flow (docs/USAGE.md, "Unevaluated operands").
         if cs.unevaluated {
             continue;
         }
@@ -1179,7 +1182,13 @@ fn solve(
                         }
                     }
                 }
-                if let Some(idxs) = pag.indices.gep_src.get(&node).cloned() {
+                if let Some(idxs) = pag
+                    .indices
+                    .gep_src
+                    .get(&node)
+                    .filter(|_| !pag.null_temps.contains(&node))
+                    .cloned()
+                {
                     for idx in idxs {
                         let (dst, src, field) = {
                             let c = &pag.constraints[idx];
@@ -1299,7 +1308,12 @@ fn solve(
             }
         }
 
-        if let Some(idxs) = pag.indices.gep_src.get(&node) {
+        if let Some(idxs) = pag
+            .indices
+            .gep_src
+            .get(&node)
+            .filter(|_| !pag.null_temps.contains(&node))
+        {
             let idxs = idxs.clone();
             w_gep += delta.len() as u64 * idxs.len() as u64;
             'gep: for idx in idxs {
@@ -1722,8 +1736,8 @@ fn model_copy_side(pag: &Pag, node: PagNodeId) -> PagNodeId {
 /// Apply a callee's function model at one resolved call site: attach
 /// persistent PAG constraints between the actual-argument nodes so data
 /// flows through bodyless callees, and record terminator events.
-/// `ReturnAlias` / `ReturnHeap` are handled at PAG build time (they target
-/// the `CallReturn` destination, not call arguments).
+/// `ReturnAlias` / `ReturnHeap` / `ReturnField` are handled at PAG build time
+/// (they target the `CallReturn` destination, not call arguments).
 #[allow(clippy::too_many_arguments)]
 fn apply_fn_model(
     pag: &mut Pag,
@@ -1740,7 +1754,7 @@ fn apply_fn_model(
     };
     // Unresolved member addresses may still name the base variable;
     // copying it would pollute unrelated fields, so alias effects refuse
-    // these fallbacks (see docs/ANALYSIS.md, "Argument flow").
+    // these fallbacks (see docs/POINTERS.md, "Argument flow").
     let member_addr = |idx: u32| cs.addr_of_member_args().binary_search(&idx).is_ok();
     // Actual argument node for parameter slot `idx`, when the call passed an
     // IR variable there (literals like `0` or `sizeof(..)` do not
@@ -1866,6 +1880,7 @@ fn apply_fn_model(
             }
             Effect::ReturnAlias { .. }
             | Effect::ReturnHeap
+            | Effect::ReturnField { .. }
             | Effect::Dlsym { .. }
             | Effect::Invoke { .. }
             | Effect::Entry { .. }
@@ -1898,7 +1913,7 @@ fn wire_epoll_copy(
 }
 
 /// Whether an `UnwrapPointer` into a receiver whose pointee declaration is
-/// `pointee` admits `loc`, by the table in `docs/ANALYSIS.md`,
+/// `pointee` admits `loc`, by the table in `docs/IR.md`,
 /// "Smart-pointer unwrap".
 fn unwrap_admits(
     program: &Program,
@@ -1985,7 +2000,7 @@ enum StoreSource<'a> {
 
 /// The members of `set` that `delta` names, in `set`'s iteration order: the
 /// order a whole-set store writes them, so a store of only the new locations
-/// fills each cell as a whole-set one would (docs/ANALYSIS.md, "Propagation
+/// fills each cell as a whole-set one would (docs/POINTERS.md, "Propagation
 /// highlights").
 fn in_set_order(
     set: Option<&FxHashSet<LocId>>,
@@ -2022,7 +2037,7 @@ fn apply_store_to_targets(
     // An object whose name denotes its storage (an aggregate, an array) is
     // stored by address, like the static seed; a pointer's name is only its
     // value, and `*out = &p` lowers to an explicit `AddrOfVar` temp
-    // (docs/ANALYSIS.md, "Variable cells").
+    // (docs/POINTERS.md, "Variable cells").
     let self_loc = match pag.nodes[src_node.0 as usize].kind {
         PagNodeKind::Var(v) if !var_is_pointer_like(program, v) => {
             pag.var_location.get(&v).copied()
@@ -2186,7 +2201,7 @@ fn ensure_param_copy(
 
 /// The guard a memory cell of declared type `cell_type` imposes, if any. A
 /// class lowering only guessed for a type it could not resolve (a callback
-/// typedef from a header off the include path; `docs/ANALYSIS.md`,
+/// typedef from a header off the include path; `docs/CXX.md`,
 /// "Undeclared receiver classes") is untyped storage, as the `int` such a
 /// type read as before: a function address stored there is kept.
 fn slot_guard_for(program: &Program, cell_type: trace_ir::TypeId) -> Option<SlotGuard> {
@@ -2201,7 +2216,7 @@ fn slot_guard_of(desc: &trace_ir::TypeDesc) -> Option<SlotGuard> {
     use trace_ir::TypeDesc as TD;
     let desc = match desc {
         // A fn-pointer *variable* lowers as `Ptr(FnPtr)`, a field as bare
-        // `FnPtr`; both are fn-pointer slots (docs/ANALYSIS.md, "Variable
+        // `FnPtr`; both are fn-pointer slots (docs/POINTERS.md, "Variable
         // cells").
         TD::Ptr(inner) if matches!(inner.as_ref(), TD::FnPtr { .. }) => inner.as_ref(),
         // `void *` / an unknown pointer is untyped storage: it may hold any
@@ -2243,7 +2258,7 @@ fn slot_guard_of(desc: &trace_ir::TypeDesc) -> Option<SlotGuard> {
 /// guarded; in practice `AddrOf` sources are variable and function locations
 /// only (`ensure_var_loc`; member addresses lower to `Gep`), so lazily created
 /// field cells, whose recorded type is not reliable enough to guard by, never
-/// arrive here (docs/ANALYSIS.md, "Variable cells").
+/// arrive here (docs/POINTERS.md, "Variable cells").
 fn seed_addr_of(
     pag: &Pag,
     program: &Program,
@@ -2270,7 +2285,7 @@ fn seed_addr_of(
 /// Does the solver start `var`'s node out holding `var`'s own location? A
 /// static-storage object's name denotes its storage (an array decays to it);
 /// a pointer's name denotes only the value it holds, and seeding it would
-/// forge an address no `&G` produced (docs/ANALYSIS.md, "Variable cells").
+/// forge an address no `&G` produced (docs/POINTERS.md, "Variable cells").
 fn seeds_own_location(program: &Program, var: VarId) -> bool {
     program.symbols.variable_by_id(var).is_some_and(|v| {
         matches!(
@@ -2281,7 +2296,7 @@ fn seeds_own_location(program: &Program, var: VarId) -> bool {
 }
 
 /// Does `var` hold a pointer? Such a variable's node and memory cell are one
-/// value (docs/ANALYSIS.md, "Variable cells"). An array never does, whatever
+/// value (docs/POINTERS.md, "Variable cells"). An array never does, whatever
 /// its elements: its name denotes its storage. Deliberately wider than
 /// [`var_may_hold_pointee`], which leaves out `int *` / `void *` to bound
 /// interprocedural wiring: a buffer pointer's out-parameter still has to
@@ -2388,7 +2403,7 @@ fn write_to_cell(
     }
 }
 
-/// Node → cell half of the variable-cell rule (docs/ANALYSIS.md, "Variable
+/// Node → cell half of the variable-cell rule (docs/POINTERS.md, "Variable
 /// cells"): what a variable's node gains is written into its memory cell.
 fn sync_var_to_cell(
     pag: &Pag,
@@ -2449,7 +2464,7 @@ fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
     };
     // A pack stands for arguments of any type, whatever its dependent
     // element type lowered to (`Args &&...args` is an `int *`): it may hold
-    // any pointee (docs/ANALYSIS.md, "Variadic parameter packs").
+    // any pointee (docs/POINTERS.md, "Variadic parameter packs").
     holds || (!program.pack_vars.is_empty() && program.pack_vars.contains(&var))
 }
 
@@ -2688,7 +2703,7 @@ type Invocations<'m> = Vec<Invoked<'m>>;
 type InvokeWatch<'m> = FxHashMap<PagNodeId, Vec<(&'m trace_ir::CallSite, Invoked<'m>)>>;
 
 /// The callees a model says may invoke a callback argument, with the argument
-/// positions it names (`docs/ANALYSIS.md`, "Function models"). Read off the
+/// positions it names (`docs/MODELS.md`, "Function models"). Read off the
 /// symbol table rather than off the call graph: a model that invokes is rare,
 /// so the index is nearly always empty or tiny, and the callback pass is
 /// skipped outright when it is empty.
@@ -2736,7 +2751,7 @@ fn invoke_site_index(cs: &trace_ir::CallSite, param: u32) -> Option<u32> {
 }
 
 /// Whether `invoked` applies at `cs`: it states no argument test, or the
-/// argument it tests may pass it (docs/ANALYSIS.md, "Function models"). A
+/// argument it tests may pass it (docs/MODELS.md, "Function models"). A
 /// function named there is never a value of a class; a variable is one by
 /// its declared type; an argument the site records nothing for (an
 /// enumerator, a call result) and a type lowering could not resolve may be
@@ -2858,7 +2873,7 @@ impl Alignments {
 
 /// The ways `target` can be called with the arguments `invoked` forwards at
 /// `cs`, each as the number of leading formals the arguments skip; none when
-/// it cannot take them (docs/ANALYSIS.md, "Callback invocation"). A value the
+/// it cannot take them (docs/MODELS.md, "Callback invocation"). A value the
 /// callee supplies ahead of them is one of the skipped formals.
 fn invoke_alignments(
     program: &Program,
@@ -3718,7 +3733,7 @@ mod tests {
             .is_empty());
     }
 
-    // --- `UnwrapPointer` (docs/ANALYSIS.md, "Smart-pointer unwrap") ---
+    // --- `UnwrapPointer` (docs/IR.md, "Smart-pointer unwrap") ---
 
     /// A program whose `sp` (a `shared_ptr<Payload>` value) feeds a
     /// `Payload`-typed receiver through `UnwrapPointer`.

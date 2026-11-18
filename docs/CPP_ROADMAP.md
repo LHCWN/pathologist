@@ -24,7 +24,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 |------------|-----------------|
 | CHA from static receiver + implicit `this` | `Plugin::OnEventProxy` → 22 plugin `OnEvent` bodies |
 | Smart-pointer / `operator->` unwrap, by declaration not by name (C12); an undeclared wrapper guessed from its one class argument (#86) | `call_sp` fixture; typed `Plugin*` paths; hdf `AutoPtr<T>` (+4,551 direct edges); camera `sptr<T>` (+16,587 direct edges) |
-| Owning-pointer `get()` pointee aliases (#247; [rules](ANALYSIS.md#smart-pointer-unwrap)) | `cpp_pointer_get` fixture; HiView extraction arguments and HDF cast/return sites; [measurements and remaining limits](EVAL_REPORT.md#owning-pointer-get-aliases--2026-10-31) |
+| Owning-pointer `get()` pointee aliases (#247; [rules](IR.md#smart-pointer-unwrap)) | `cpp_pointer_get` fixture; HiView extraction arguments and HDF cast/return sites; [measurements and remaining limits](EVAL_REPORT.md#owning-pointer-get-aliases--2026-10-31) |
 | `auto` from declared returns and smart-pointer factories (C1, #87) | eval H5; see `docs/EVAL_REPORT.md` |
 | `final` / virtual bases | fixtures only (`cpp_dispatch`); hiview barely uses them |
 | Direct `std::function` field store | `cpp_callable`; **not** the factory path (C3) |
@@ -38,7 +38,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 | Members of a class in an anonymous namespace; overloads of internal functions kept apart; constructors never dispatched to subclasses | `PreconfigProfile::toString()` resolves; hiview's anonymous `BuildEvent` overloads split; `HiviewContext::GetHiViewDirectory` reaches its test overrides; `*CallbackListener` constructors stop calling their siblings (camera 359 sibling and 149 self constructor edges gone) |
 | Overloads told apart by declared arity where only in-class prototypes are seen; `T w(a);` defines an object | `GetExposureMode(mode)` reaches `GetExposureMode(ExposureMode&)`; `CameraNapiParamParser jsParamParser(env, info, ...)` constructs (camera direct edges 38,531 → 39,265) |
 | Arguments of method calls, qualified member calls and member initializers bound past the implicit `this` (#93, #94) | `UCDecorator::Invoke` reaches its 30 collector lambdas; hiview indirect edges 24 → 88, camera 108 → 182 |
-| Member-initializer construction retains declared and explicitly imported constructors and implicit default lifecycle; reference bindings construct nothing (#207; [rules](ANALYSIS.md#c-support-first-step)) | `HiviewGlobal::context_(context)` has no invented constructor edge; cached nested-class declarations retain real calls. Regression fixtures also cover C++20 parenthesized aggregates, brace-elided and class arrays, omitted default initializers, scalar callback stores, implicit copy/move subobjects, unknown union copies, inherited-constructor hiding with cv/ref distinctions, constant and unknown array bounds, derived default initialization after inherited construction, type aliases and grouped/second-TU reference bindings. [Measurements](EVAL_REPORT.md#four-constructor-follow-up-findings-207--2026-10-09) |
+| Member-initializer construction retains declared and explicitly imported constructors and implicit default lifecycle; reference bindings construct nothing (#207; [rules](CXX.md#c-support-first-step)) | `HiviewGlobal::context_(context)` has no invented constructor edge; cached nested-class declarations retain real calls. Regression fixtures also cover C++20 parenthesized aggregates, brace-elided and class arrays, omitted default initializers, scalar callback stores, implicit copy/move subobjects, unknown union copies, inherited-constructor hiding with cv/ref distinctions, constant and unknown array bounds, derived default initialization after inherited construction, type aliases and grouped/second-TU reference bindings. [Measurements](EVAL_REPORT.md#four-constructor-follow-up-findings-207--2026-10-09) |
 | Type names through enclosing scopes, `using` aliases, member classes (#90, #91, #92) | a local `Deep d;` inside `namespace a::b::c` is `a::b::Deep`; `using Alias = T;` is a typedef; hiview's 14 `AppEventHandler::PostEvent` overloads on member structs stay apart; camera direct edges 37,646 → 38,531 |
 | Conversion operators (`operator T()`) | indexed as `Cls::operator T` — declaration, in-class definition and out-of-class definition all merge, and the definition returns the type it converts to (#46) |
 | Members behind unknown attribute macros | a macro with no `#define` in the include path no longer supplies the name, whether it leads (`FFI_EXPORT T f()`, `MACRO operator ns::S()`), trails (`void C::M() OVERRIDE {}`) or flanks (`EXPORT_API int Get(long) GUARDED_BY(mu_)`) the declarator (#46) |
@@ -49,7 +49,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 
 ## C1 — Return-type inference (`auto`, `lock()`, `make_shared`) — implemented (#87)
 
-Done; this slice closes eval H5. The rules are in `docs/ANALYSIS.md`
+Done; this slice closes eval H5. The rules are in `docs/CXX.md`
 ("`auto` local types"); what it leaves unresolved is under "Known C++
 imprecision" there, and named casts and calls on a call result continue as C2
 and C8. Corpus results, H5 and performance are in `docs/EVAL_REPORT.md`.
@@ -157,20 +157,20 @@ later call through the stored task is not tied back to it.
 **Done so far:** thread entry points (`std::thread`, `pthread_create`,
 #187) and the OpenHarmony task primitives (#203, `ffrt::submit` among them)
 are `invoke` models; the list and its imprecision are in
-`docs/ANALYSIS.md`, "Built-in models" and "Documented imprecision". A
+`docs/MODELS.md`, "Built-in models" and "Documented imprecision". A
 submitted lambda (`FaultLogDatabase::SaveFaultLogInfo`, the
 `PassthroughMonitor` handlers) now has an edge **from the submitter**
 ([EVAL_REPORT.md](EVAL_REPORT.md#task-and-thread-primitives-203--2026-10-09)).
-Lambda captures bind the enclosing scope (`docs/ANALYSIS.md`, "C++ support
+Lambda captures bind the enclosing scope (`docs/CXX.md`, "C++ support
 (first step)"), and `[callback = shared_from_this()]` captures the object
-itself, typed as its `shared_ptr` (`docs/ANALYSIS.md`, "`shared_from_this`"),
+itself, typed as its `shared_ptr` (`docs/IR.md`, "`shared_from_this`"),
 so `uc_telemetry_callback.cpp:187` reaches `RunTraceOnTimeTask`.
 `std::bind` and `std::packaged_task` (#250) keep the wrapped callable's edge
 from the wrapping site (`base/plugin.cpp:93`, `base/event_loop.cpp:191`), as
-`docs/ANALYSIS.md`, "Callable wrappers", states; calling the stored task
+`docs/MODELS.md`, "Callable wrappers", states; calling the stored task
 (`event.packagedTask->operator()()`) is not tied back to it. Arguments
 through a variadic parameter pack are followed since #282
-(`docs/ANALYSIS.md`, "Variadic parameter packs").
+(`docs/POINTERS.md`, "Variadic parameter packs").
 
 **Eval when done:** `Plugin::DelayProcessEvent` reaches `OnEventProxy` (met by
 #250); `EventLoop::ProcessEvent` packaged path reaches
@@ -255,7 +255,7 @@ Same PAG pattern as C fn-ptr arrays + C3 map summary. Prefer one
 Often the chain is typed (`HiviewPlatform::GetInstance()` returns
 `HiviewPlatform&`). The `auto` forms are C1's. What is left is a call whose
 receiver is itself a call result (`Cls::GetInstance().OpenTrace(...)`), listed
-under "Known C++ imprecision" in `docs/ANALYSIS.md`. Plan: give the member-call
+under "Known C++ imprecision" in `docs/CXX.md`. Plan: give the member-call
 path the declared-return lookup C1 applies to `auto` initializers. SDK
 singletons outside the tree stay unresolved.
 
@@ -268,7 +268,7 @@ accessors inherited from one (`Svc::GetInstance()`), results returned
 inside a wrapper (`std::shared_ptr<T>`, `sptr<T>`) and c_utils' undefined
 `DelayedSingleton`/`Singleton`/`DelayedRefSingleton` are typed, and calls on
 the result reach the class's members. The rules and their limits are the
-**Templates** bullet in [`docs/ANALYSIS.md`](ANALYSIS.md#c-support-first-step);
+**Templates** bullet in [`CXX.md`](CXX.md#c-support-first-step);
 measurements are in `docs/EVAL_REPORT.md`.
 
 ---
@@ -345,7 +345,7 @@ nothing. Fixture: `tests/fixtures/dlsym/`. Handle / DSO path is ignored.
 ELF parsing of prebuilt `.so` files remains out of scope.
 
 Today function-pointer resolution is name/linkage inside the indexed
-tree. `dlsym` is explicitly unmodeled ([ANALYSIS.md](ANALYSIS.md)
+tree. `dlsym` is explicitly unmodeled ([IR.md](IR.md#ir-flow-constraints-trace-ir)
 imprecision). Both corpora use it as a **second factory**, next to
 `REGISTER` / ops tables.
 

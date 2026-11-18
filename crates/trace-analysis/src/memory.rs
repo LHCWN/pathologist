@@ -1,5 +1,5 @@
 //! Which memory cells each load reads and each store writes, read off the
-//! converged points-to sets before they are released (`docs/ANALYSIS.md`,
+//! converged points-to sets before they are released (`docs/POINTERS.md`,
 //! "Memory access edges").
 
 use rustc_hash::{FxHashMap, FxHashSet};

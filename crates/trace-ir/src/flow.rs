@@ -15,6 +15,8 @@ pub enum ReturnFlow {
     /// Return value is whatever `callee` returns (expanded after all TUs are merged).
     Call {
         callee_name: String,
+        /// The returned call's own value destination for call-site field models.
+        result: VarId,
     },
     /// Address of a returned reference's original lvalue. Expanded only by
     /// address consumers; value consumers keep the ordinary return facts.
@@ -48,7 +50,7 @@ pub enum FlowConstraint {
     ArrayFnMember { array: VarId, callee: FnId },
     /// `dst = callee()` — callee resolved by name at PAG build in the scope
     /// of `caller`, the function the call is written in (`None` for a
-    /// file-scope initializer). See `docs/ANALYSIS.md`, "Return-value flow".
+    /// file-scope initializer). See `docs/IR.md`, "Return-value flow".
     CallReturn {
         dst: VarId,
         callee_name: String,
@@ -81,7 +83,7 @@ pub enum FlowConstraint {
     /// Step through a smart pointer's overloaded `->`/`*` or modeled `get`.
     /// `src` holds the wrapper value; `dst` is a pointee-typed receiver or
     /// raw pointer, whose pointee type filters the admitted locations. See
-    /// `docs/ANALYSIS.md`, "Smart-pointer unwrap".
+    /// `docs/IR.md`, "Smart-pointer unwrap".
     UnwrapPointer { dst: VarId, src: VarId },
 }
 
@@ -122,7 +124,8 @@ impl ReturnFlow {
         match *self {
             ReturnFlow::AddrOfVar { src } | ReturnFlow::Copy { src } => Some(src),
             ReturnFlow::LvalueAddress(ref flow) => flow.var(),
-            ReturnFlow::AddrOfFn { .. } | ReturnFlow::Call { .. } => None,
+            ReturnFlow::Call { result, .. } => Some(result),
+            ReturnFlow::AddrOfFn { .. } => None,
         }
     }
 }

@@ -4,7 +4,7 @@
 //! project macro spelling each construct. Checks the exported database
 //! (minimal and full), determinism across runs and job counts, and the
 //! in-memory descriptors the export has no table for
-//! (docs/ANALYSIS.md, "C++ parse-input normalization").
+//! (docs/CXX.md, "C++ parse-input normalization").
 
 use crate::common;
 

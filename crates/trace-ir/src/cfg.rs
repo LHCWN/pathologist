@@ -1,6 +1,6 @@
 //! Per-function call-order control-flow graphs (`--sequencing`).
 //!
-//! Semantics, merge rules and limits: `docs/ANALYSIS.md`, "Call sequencing
+//! Semantics, merge rules and limits: `docs/USAGE.md`, "Call sequencing
 //! (control-flow sidecar)". Nothing here feeds the pointer analysis.
 
 use crate::{CallOccurrence, CallSiteId, FileId, FnId, Span};
@@ -630,7 +630,7 @@ impl FunctionCfg {
     /// sites through `map_site`, files (`tu` too) through `map_file`. An
     /// event left with no site is spliced out of its block and the local
     /// order, and an `omitted_sites` gap marks where it was
-    /// (docs/ANALYSIS.md, "Call sequencing"). `variant` is kept.
+    /// (docs/USAGE.md, "Call sequencing"). `variant` is kept.
     pub fn remap(
         &self,
         function: FnId,

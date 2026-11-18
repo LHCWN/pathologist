@@ -1,5 +1,5 @@
 // `shared_from_this()` / `weak_from_this()` yield the object itself
-// (docs/ANALYSIS.md, "`shared_from_this`"). The stub declares the standard's
+// (docs/IR.md, "`shared_from_this`"). The stub declares the standard's
 // const twins, whose results disagree, as libstdc++ and libc++ do.
 namespace std {
 template <class T> class shared_ptr { public: T *operator->() const; };

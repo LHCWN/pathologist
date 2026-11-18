@@ -4,7 +4,8 @@ use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{
-    FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow, StorageClass, VarId,
+    CallSite, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow, StorageClass,
+    TypeDesc, TypeId, VarId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -12,6 +13,8 @@ pub enum PagNodeKind {
     Var(VarId),
     /// Immutable null value: not storage and never a points-to target.
     NullPointer,
+    /// Projected member address for a model, without eagerly reading its cell.
+    FieldAddress,
     Loc(LocId),
     CallTarget(trace_ir::CallSiteId),
 }
@@ -119,6 +122,8 @@ pub struct Pag {
     /// Retained by exports even when no pair was found in this repository.
     pub ipc_enabled: bool,
     pub indices: SolverIndices,
+    /// Call results produced by `return_field`, for transitive return expansion.
+    return_field_values: FxHashSet<VarId>,
 }
 
 impl Pag {
@@ -141,6 +146,7 @@ impl Pag {
         };
         pag.build_variables(program);
         pag.build_function_locations(program);
+        pag.build_return_field_constraints(program, models);
         pag.build_flow_constraints(program, models);
         pag.build_dlsym_constraints(program, models);
         pag.build_call_constraints(program);
@@ -304,7 +310,7 @@ impl Pag {
             }
         }
         for cs in &program.symbols.call_sites {
-            // An unevaluated call never runs (docs/ANALYSIS.md,
+            // An unevaluated call never runs (docs/USAGE.md,
             // "Unevaluated operands").
             if cs.is_direct || cs.unevaluated {
                 continue;
@@ -383,7 +389,7 @@ impl Pag {
         match self.nodes[node.0 as usize].kind {
             PagNodeKind::Var(var) => program.symbols.variable_by_id(var).and_then(|v| v.target),
             PagNodeKind::Loc(loc) => self.location_target(loc),
-            PagNodeKind::NullPointer => None,
+            PagNodeKind::NullPointer | PagNodeKind::FieldAddress => None,
             PagNodeKind::CallTarget(site) => program
                 .symbols
                 .call_site_by_id(site)
@@ -566,7 +572,7 @@ impl Pag {
         name: &str,
     ) -> LocId {
         // One summary per declaration member, whichever snapshot of the
-        // declaration the base's type records (docs/ANALYSIS.md, "Field
+        // declaration the base's type records (docs/POINTERS.md, "Field
         // sensitivity"). A member the declaration's richest layout lacks keeps
         // the snapshot's own summary.
         let (struct_type, field) = *self
@@ -801,6 +807,10 @@ impl Pag {
                                 .find(|c| !program.symbols.function(**c).params.is_empty())
                                 .map(|c| program.symbols.function(*c).params.clone());
                             self.apply_return_model(program, dst_n, model, params.as_deref());
+                            // A file-scope initializer has no call record.
+                            if caller.is_none() {
+                                self.apply_return_fields(program, *dst, model, &candidates, None);
+                            }
                         }
                     }
                 }
@@ -1098,7 +1108,10 @@ impl Pag {
                             self.add_copy(dst, src_n);
                             applied = true;
                         }
-                        ReturnFlow::Call { callee_name } => {
+                        ReturnFlow::Call {
+                            callee_name,
+                            result,
+                        } => {
                             let inner_candidates =
                                 program.symbols.return_flow_candidates(callee, &callee_name);
                             let mut inner_applied = false;
@@ -1119,11 +1132,18 @@ impl Pag {
                                         .iter()
                                         .find(|c| !program.symbols.function(**c).params.is_empty())
                                         .map(|c| program.symbols.function(*c).params.clone());
-                                    self.apply_return_model(program, dst, model, params.as_deref());
-                                    // Modeled heap/alias facts count as applied
-                                    // so outer frames do not re-apply them.
-                                    inner_applied = true;
+                                    inner_applied = self.apply_return_model(
+                                        program,
+                                        dst,
+                                        model,
+                                        params.as_deref(),
+                                    );
                                 }
+                            }
+                            if !address && self.return_field_values.contains(&result) {
+                                let src = self.var_node_id(result);
+                                self.add_copy(dst, src);
+                                inner_applied = true;
                             }
                             if inner_applied {
                                 applied = true;
@@ -1138,18 +1158,162 @@ impl Pag {
         }
     }
 
-    /// Apply `return_alias` / `return_heap` model effects to a `CallReturn`
-    /// destination whose callee has no body under the analyzed root.
+    /// A call-site effect uses each recorded occurrence's own actuals.
+    fn build_return_field_constraints(&mut self, program: &Program, models: &ModelLookup) {
+        if !models.has_return_fields() {
+            return;
+        }
+        for site in &program.symbols.call_sites {
+            let Some(dst) = site
+                .return_dst
+                .filter(|&dst| !site.unevaluated && site.address_return_dst() != Some(dst))
+            else {
+                continue;
+            };
+            let name = site.callee_fn_id.map_or(site.callee_name.as_ref(), |id| {
+                program.symbols.function(id).name.as_str()
+            });
+            let Some(model) = models.model(name, EffectGroup::Return) else {
+                continue;
+            };
+            if model
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ReturnField { .. }))
+            {
+                let candidates = program.callees_of(site);
+                self.apply_return_fields(program, dst, model, &candidates, Some(site));
+            }
+        }
+    }
+
+    fn apply_return_fields(
+        &mut self,
+        program: &Program,
+        dst: VarId,
+        model: &crate::summaries::FnModel,
+        candidates: &[FnId],
+        site: Option<&CallSite>,
+    ) {
+        // A resolved body may return null or another value with no pointer
+        // return fact. Its presence still rules out the external summary.
+        if candidates
+            .iter()
+            .any(|&id| program.symbols.function(id).is_defined)
+        {
+            return;
+        }
+        for &id in candidates {
+            let callee = program.symbols.function(id);
+            let result = program.types.get(callee.return_type).desc.as_ref();
+            if !result.is_pointer_like() {
+                continue;
+            }
+            let has_this = program.symbols.has_this_param(id);
+            let takes_receiver = !callee.is_static_member
+                && (has_this
+                    || callee.declared_in_class
+                    || site.is_some_and(|cs| cs.args_bound_past_this));
+            for effect in &model.effects {
+                let Effect::ReturnField { param, field } = effect else {
+                    continue;
+                };
+                let receiver = takes_receiver && *param == 0;
+                let explicit = param.checked_sub(u32::from(takes_receiver));
+                let declared = if receiver && has_this {
+                    Some(program.symbols.variable(callee.params[0]).type_id)
+                } else {
+                    explicit.and_then(|index| {
+                        program.symbols.explicit_params(callee)?.get(index as usize)
+                    })
+                };
+
+                if let Some(cs) = site {
+                    let offset = u32::from(cs.args_bound_past_this);
+                    let index = if receiver {
+                        cs.args_bound_past_this.then_some(0)
+                    } else {
+                        explicit.and_then(|index| index.checked_add(offset))
+                    };
+                    let actuals = cs
+                        .var_args
+                        .iter()
+                        .filter(|(position, _)| Some(*position) == index)
+                        .map(|(_, var)| *var);
+                    // Bound receivers appear among var_args. A named receiver
+                    // can also be recorded separately, without a binding.
+                    let named_receiver = cs
+                        .receiver
+                        .filter(|_| receiver && !cs.var_args.iter().any(|(index, _)| *index == 0));
+                    for base in actuals.chain(named_receiver) {
+                        self.project_return_field(program, dst, base, declared, result, field);
+                    }
+                } else if let Some(base) = callee
+                    .params
+                    .get((*param as usize) + usize::from(callee.is_static_member && has_this))
+                {
+                    self.project_return_field(program, dst, *base, declared, result, field);
+                }
+            }
+        }
+    }
+
+    fn project_return_field(
+        &mut self,
+        program: &Program,
+        dst: VarId,
+        base: VarId,
+        declared: Option<TypeId>,
+        result: &TypeDesc,
+        field: &str,
+    ) {
+        let actual = program.symbols.variable(base).type_id;
+        let owner = declared.into_iter().chain([actual]).find_map(|ty| {
+            let desc = program.types.get(ty).desc.as_ref();
+            let desc = desc.pointee().unwrap_or(desc);
+            desc.is_class_like().then(|| {
+                program
+                    .types
+                    .tag_declaration(desc)
+                    .unwrap_or_else(|| program.types.resolve_type_id(desc))
+            })
+        });
+        let Some(owner) = owner else {
+            return;
+        };
+        let Some(field_id) = program.types.field_id_by_name(owner, field) else {
+            return;
+        };
+        let field_ty = program.types.get(owner).layout.fields[&field_id].type_id;
+        let field_ty = program.types.get(field_ty).desc.as_ref();
+        let base = self.var_node_id(base);
+        let result_node = self.var_node_id(dst);
+        let address = self.alloc_node(PagNodeKind::FieldAddress);
+        self.add_gep(address, base, field_id, field.to_owned());
+        if field_ty.is_pointer_like() && trace_ir::same_type_shape(result, field_ty) {
+            // The getter returns p->field. Keep the field address on its own
+            // node and read the cell on every growth, including later stores.
+            self.add_load(result_node, address);
+        } else {
+            // The getter returns &p->field.
+            self.add_copy(result_node, address);
+        }
+        self.return_field_values.insert(dst);
+    }
+
+    /// Apply the context-insensitive alias and heap return fallback.
     fn apply_return_model(
         &mut self,
         program: &Program,
         dst: PagNodeId,
         model: &crate::summaries::FnModel,
         params: Option<&[VarId]>,
-    ) {
+    ) -> bool {
+        let mut applied = false;
         for effect in &model.effects {
             match effect {
                 Effect::ReturnAlias { param } => {
+                    applied = true;
                     if let Some(formal) = params.and_then(|ps| ps.get(*param as usize)) {
                         let formal_n = self.var_node_id(*formal);
                         self.add_copy(dst, formal_n);
@@ -1162,10 +1326,12 @@ impl Pag {
                     self.set_location_target(loc, target);
                     let loc_n = self.loc_node[&loc];
                     self.add_addr_of(dst, loc_n);
+                    applied = true;
                 }
                 _ => {}
             }
         }
+        applied
     }
 
     /// Fresh anonymous storage location (malloc-family return summaries).
@@ -1194,7 +1360,7 @@ impl Pag {
             }
         }
         for cs in &program.symbols.call_sites {
-            // An unevaluated call never runs (docs/ANALYSIS.md,
+            // An unevaluated call never runs (docs/USAGE.md,
             // "Unevaluated operands").
             if cs.is_direct || cs.unevaluated {
                 continue;

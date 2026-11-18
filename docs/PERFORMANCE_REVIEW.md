@@ -475,7 +475,7 @@ Profiles, the alternating A/B measurements and the output-equivalence results
 are recorded in the
 [evaluation report](EVAL_REPORT.md#analyze-phase-performance--2026-09-21-117).
 What the solver does about allocation and store filtering is defined in
-[Propagation highlights](ANALYSIS.md#propagation-highlights); name-lookup
+[Propagation highlights](POINTERS.md#propagation-highlights); name-lookup
 ordering is in [Shared header functions](ANALYSIS.md#shared-header-functions).
 
 ## Incremental per-TU IR cache: macOS measurements and decision (#175)

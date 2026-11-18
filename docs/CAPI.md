@@ -238,7 +238,7 @@ below; database compatibility follows the
   `trace_db_find_symbols` requires positive, 1-based line and column values;
   zero or negative values return `TRACE_ERR_INVALID_ARG` with a position error
   in `out_err`. Its declaration ranking follows
-  [source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+  [source-level dataflow presentation](USAGE.md#source-level-dataflow-presentation).
   A database missing `variables.is_synthetic` returns `TRACE_ERR_ANALYSIS`
   with an instruction to re-run `trace analyze`, so generated temporaries
   cannot become lookup candidates.
@@ -269,7 +269,7 @@ below; database compatibility follows the
 - **Dataflow.** `trace_db_dataflow(db, symbols, n, direction, depth)` BFS over
   `flow_edges` (as the CLI's `inspect dataflow`; the memory accesses the
   CLI-only value slice follows are not edges there, see
-  [Memory access edges](ANALYSIS.md#memory-access-edges)). Pass a `trace_symbol` array obtained from
+  [Memory access edges](POINTERS.md#memory-access-edges)). Pass a `trace_symbol` array obtained from
   `trace_db_find_symbols` (its `var_id` identifies the start variables). Pass
   the single best candidate (`items[0]`) to select the same starting declaration
   as the CLI. This API calls `trace_db::dataflow_graph` and returns the **raw PAG**:
@@ -278,7 +278,7 @@ below; database compatibility follows the
   projects source entities and counts visible transitions after collapsing
   technical nodes. The same start symbol and depth therefore need not produce
   identical nodes, edges, or truncation. See the authoritative
-  [source-level dataflow contract](ANALYSIS.md#source-level-dataflow-presentation).
+  [source-level dataflow contract](USAGE.md#source-level-dataflow-presentation).
   The C ABI and direction enum values are unchanged. Node
   `kind`/`loc_kind` describe the PAG nodes; edges carry `flow_kind`;
   `path`/`line`/`col` are empty because value-flow edges have no call site.

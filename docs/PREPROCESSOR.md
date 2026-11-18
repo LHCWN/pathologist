@@ -260,7 +260,7 @@ be defined. Shared flags are parsed once, then finalized and validated once per
 effective language (C or C++). Shared configuration errors are reported once,
 even when several sources or both languages use the same invalid arguments.
 Shared flags use this check before indexing; selection and
-fallback rules are defined in [Compilation databases](ANALYSIS.md#compilation-databases-62).
+fallback rules are defined in [Compilation databases](USAGE.md#compilation-databases-62).
 
 ### Missing-header guidance
 
@@ -474,7 +474,7 @@ investigate the affected files).
 `FFI_EXPORT` and `DECLARE_SINGLETON` are not preprocessor fallbacks. Their
 available definitions expand normally; narrowly supported unresolved forms
 can receive a diagnosed parser-input approximation afterward. See
-[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization) for
+[C++ parse-input normalization](CXX.md#c-parse-input-normalization) for
 the authoritative recovery forms and their missing semantics.
 
 The preprocessor installs fallback definitions for the common offenders:
@@ -788,7 +788,7 @@ including factory prototypes and return types used to infer global initializers.
 Cached project headers also import consumed system declarations before lowering
 initializers; see [Shared header functions](ANALYSIS.md#shared-header-functions).
 Reference-binding facts also survive declaration imports and reusable preambles;
-see [Dereferenced operands](ANALYSIS.md#dereferenced-operands).
+see [Dereferenced operands](IR.md#dereferenced-operands).
 Deferred discovery records header adoption in its ordered history even
 when the header executes no macro directives. Prerequisites supplied inside a
 cached parent are local to that parent, rather than requirements on its caller.
@@ -1019,7 +1019,7 @@ where `K` counts the units the committing thread ran itself. Measurements are in
 
 Indexing sets `inline_include_bodies = false`. Nested cacheable `#include`s replay **macros and include-once state** but do not copy header tokens into the consumer's live output. Each header's preprocessed text is therefore file-local, except for a nested header whose expansion cannot be stored: its text stays in its includer's ("An expansion that cannot be stored", above).
 
-After the warm pass, reachable headers are parsed and lowered **once**. PCH order uses the include graph **plus preprocess `included_headers`** (macro includes the raw scanner misses). Independent leaves may run in parallel waves; a header is never in the same wave as a nested include it needs. Include **cycles** are not a parallel wave: leftovers are indexed in include-graph order so nested layouts stay visible. Between cached project headers, nested `#include` IR merges **types and typedefs** from **direct** includes (plus this header's preprocess `included_headers`) so `struct StreamHost { struct IDeviceIoService service; }` sees `Dispatch`, and `GpioIrqFunc func` sees the typedef, without copying every descendant's functions/flow into ancestor units. Child PCH units already nested-merged grandchild types. Types-only merges also preserve the type table's C++ reference-member metadata, each class's own default/copy constructor eligibility and explicit constructor imports, including nested classes and member class templates; see [member-initializer construction](ANALYSIS.md#c-support-first-step). Parallel isolation *without* those preprocess edges interned empty tags / `Int` and dropped field stores (`DeviceNodeExtDispatch` lost `DispatchToMessage`, `GpioOnDevEventReceive` lost `gpio->func`).
+After the warm pass, reachable headers are parsed and lowered **once**. PCH order uses the include graph **plus preprocess `included_headers`** (macro includes the raw scanner misses). Independent leaves may run in parallel waves; a header is never in the same wave as a nested include it needs. Include **cycles** are not a parallel wave: leftovers are indexed in include-graph order so nested layouts stay visible. Between cached project headers, nested `#include` IR merges **types and typedefs** from **direct** includes (plus this header's preprocess `included_headers`) so `struct StreamHost { struct IDeviceIoService service; }` sees `Dispatch`, and `GpioIrqFunc func` sees the typedef, without copying every descendant's functions/flow into ancestor units. Child PCH units already nested-merged grandchild types. Types-only merges also preserve the type table's C++ reference-member metadata, each class's own default/copy constructor eligibility and explicit constructor imports, including nested classes and member class templates; see [member-initializer construction](CXX.md#c-support-first-step). Parallel isolation *without* those preprocess edges interned empty tags / `Int` and dropped field stores (`DeviceNodeExtDispatch` lost `DispatchToMessage`, `GpioOnDevEventReceive` lost `gpio->func`).
 
 Headers that become reachable only after those preprocess edges are added join the PCH set (and leave the orphan path) so translation units can merge their prototypes.
 
@@ -1209,7 +1209,7 @@ preprocessor branch semantics. Candidate checks include preceding-arm exclusions
 `#elif`, and grouped definitions must keep all targeted predicates true. Each selected
 configuration is then preprocessed independently using the frozen expansion cache.
 Budget diagnostics count omitted activation goals; they do not certify reachability
-or exhaustive coverage. See [analysis limits](ANALYSIS.md#limits-of---explore).
+or exhaustive coverage. See [analysis limits](USAGE.md#limits-of---explore).
 
 Preprocessor cleanup retains the same token spelling and origin semantics while
 borrowing token text during output rendering and token pasting. Synthetic

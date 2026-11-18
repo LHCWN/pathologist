@@ -1,5 +1,5 @@
 //! `trace inspect slice`: a bounded two-stage value slice annotated with
-//! execution contexts (`docs/ANALYSIS.md`, "Value slice").
+//! execution contexts (`docs/USAGE.md`, "Value slice").
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
@@ -133,7 +133,7 @@ pub struct SliceEdge {
     /// (`None` for a derived edge, which has none).
     pub site: Option<FlowSite>,
     /// The function that statement is in, by the edge-scope rule
-    /// (`docs/ANALYSIS.md`, "Where a value moves").
+    /// (`docs/POINTERS.md`, "Where a value moves").
     pub function: Option<String>,
     /// The value may change hands between contexts here; a hint, not a
     /// proven race.
@@ -406,7 +406,7 @@ struct FlowDb<'c> {
 
 /// The flow edges whose `$col` is `?1`, each with the positions its
 /// `flow_origins` rows record (none for a derived edge): `flow_origins` is
-/// the one record of where an edge happens (`docs/ANALYSIS.md`, "Where a
+/// the one record of where an edge happens (`docs/POINTERS.md`, "Where a
 /// value moves").
 macro_rules! edges_sql {
     ($col:literal) => {
@@ -423,7 +423,7 @@ macro_rules! edges_sql {
     };
 }
 
-/// The memory edges (`docs/ANALYSIS.md`, "Memory access edges") a load
+/// The memory edges (`docs/POINTERS.md`, "Memory access edges") a load
 /// whose `$load` is `?1` reads over and a store whose `$store` is `?1`
 /// writes over: `mem_read` from each cell a load reads into its destination,
 /// `mem_write` from a store's value into each cell it writes, each at the
@@ -684,7 +684,7 @@ impl<'c> FlowDb<'c> {
     /// body, where the lambda names the captured variable as that variable
     /// itself. A return out of the lambda (`other = make();`) is written in
     /// the enclosing function's body, and is a return like any
-    /// (docs/ANALYSIS.md, "Value slice", stage 2).
+    /// (docs/USAGE.md, "Value slice", stage 2).
     fn capture_access(&mut self, e: &FlowEdge, from: i64, to: i64) -> Result<bool> {
         let Some(site_fn) = e.fn_id else {
             return Ok(false);
@@ -1792,7 +1792,7 @@ pub fn resolve_slice_start(
 
 /// The two-stage value slice from `start`: stage 1 follows value flow
 /// backwards to the sources, stage 2 forwards from each source (and the
-/// start) to the sinks. Rules: `docs/ANALYSIS.md`, "Value slice".
+/// start) to the sinks. Rules: `docs/USAGE.md`, "Value slice".
 pub fn value_slice(
     conn: &Connection,
     start: &SliceStart,

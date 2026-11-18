@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use walkdir::WalkDir;
 
 /// Headers held in memory instead of on disk, by the path an `#include`
-/// resolves to them under (docs/ANALYSIS.md, "IDL-generated interfaces").
+/// resolves to them under (docs/CXX.md, "IDL-generated interfaces").
 pub type VirtualHeaders = BTreeMap<PathBuf, Arc<str>>;
 
 /// `#include` edge: dependent file → included project file (canonical paths).

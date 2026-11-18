@@ -10,7 +10,7 @@
 //!
 //! - A **stub** class is identified by its name ending in `Stub`.
 //! - A **proxy** class is identified by its name ending in `Proxy` or `Client` plus
-//!   the presence of an IPC send call (see docs/ANALYSIS.md,
+//!   the presence of an IPC send call (see docs/MODELS.md,
 //!   "OpenHarmony IPC bridges").
 //! - Bridges pair proxy methods to stub handlers by interface class name +
 //!   method name correspondence (e.g. `FooProxy::Bar` → `FooStub::Bar`).
@@ -374,7 +374,7 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
     if program.idl_interfaces.is_empty() {
         return (stubs, proxies);
     }
-    // IDL-generated pairs (docs/ANALYSIS.md, "IDL-generated interfaces"): the
+    // IDL-generated pairs (docs/CXX.md, "IDL-generated interfaces"): the
     // synthesized proxy and stub are declarations only, so neither shows a
     // recognized IPC send call or a handler body. The IDL itself declares them a
     // pair; its stub has no handlers, so pairing takes the interface fallback.
@@ -535,7 +535,7 @@ pub(crate) fn remote_stub_methods(program: &Program, class: &str, method: &str) 
 /// Whether a proxy and the stub its name pairs with serve two interfaces:
 /// both name declared classes in their `IRemoteProxy<I>` / `IRemoteStub<I>`
 /// bases, and no proxy interface is a stub interface or derives from or to
-/// one (docs/ANALYSIS.md, "OpenHarmony IPC bridges"). Dropping a bridge
+/// one (docs/MODELS.md, "OpenHarmony IPC bridges"). Dropping a bridge
 /// takes more evidence than following one: unknown on either side, the pair
 /// stays name-based.
 fn interfaces_differ(program: &Program, proxy: &[String], stub: &[String]) -> bool {

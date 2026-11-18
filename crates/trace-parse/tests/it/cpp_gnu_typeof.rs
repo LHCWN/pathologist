@@ -2,7 +2,7 @@
 //! conservative descriptor for any `decltype` of an unresolved expression.
 //! A simple type operand is unwrapped in place; an expression operand is
 //! re-spelled as `decltype` with identical byte positions and lowers to
-//! `TypeDesc::Unknown`, exactly like native `decltype` (docs/ANALYSIS.md,
+//! `TypeDesc::Unknown`, exactly like native `decltype` (docs/CXX.md,
 //! "C++ parse-input normalization").
 
 use std::fs;

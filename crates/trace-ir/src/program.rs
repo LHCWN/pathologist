@@ -378,7 +378,7 @@ impl MergeDedup {
     /// merges into, for the unit `unit`. The column tells two overloads on
     /// one line apart, except those one macro declares on one line: they
     /// share its expansion column and so one entry (a known limit,
-    /// docs/ANALYSIS.md, **Overloads**). A lone entry only other units recorded
+    /// docs/CXX.md, **Overloads**). A lone entry only other units recorded
     /// matches whatever column this unit's configuration started the
     /// declaration at (`API void Foo();` with `API` an attribute in one unit
     /// and empty in another). Once this unit has met the entry at its own
@@ -398,7 +398,7 @@ impl MergeDedup {
     /// at a column only other units recorded, in a unit declaring the name
     /// once on the line, joins their entry even if its parameters differ (an
     /// overload one configuration adds where another spells a different one
-    /// at another column). docs/ANALYSIS.md, **Overloads**, records the
+    /// at another column). docs/CXX.md, **Overloads**, records the
     /// limit.
     pub fn existing_fn(
         &self,
@@ -604,7 +604,7 @@ pub struct Program {
     /// formal (`Args &&...args`) and the value a pack expansion passes
     /// (`std::forward<Args>(args)...`). A formal takes every actual from its
     /// position on, and an actual serves every formal from its position on
-    /// (docs/ANALYSIS.md, "Variadic parameter packs"). Kept for analysis.
+    /// (docs/POINTERS.md, "Variadic parameter packs"). Kept for analysis.
     pub pack_vars: FxHashSet<crate::VarId>,
     pub flow: Vec<crate::FlowConstraint>,
     /// Source operation sites, independent of solver constraints.
@@ -618,7 +618,7 @@ pub struct Program {
     pub default_arguments: IndexMap<FnId, Vec<(u32, std::sync::Arc<crate::MemberInitializer>)>>,
     pub diagnostics: Vec<Diagnostic>,
     /// Interfaces declared by `.idl` files, in sorted IDL path order
-    /// (docs/ANALYSIS.md, "IDL-generated interfaces").
+    /// (docs/CXX.md, "IDL-generated interfaces").
     pub idl_interfaces: Vec<crate::IdlInterface>,
     pub include_paths: Vec<PathBuf>,
     /// `#include` dependency edges (dependent → included), project-local only.
@@ -649,7 +649,7 @@ pub struct Program {
     /// Declared C++ `operator->` returns, merged with a unit's types so a
     /// header's wrappers are followable from every unit that includes it.
     pub arrow_returns: Vec<ArrowReturn>,
-    /// Class-body `using` declarations (docs/ANALYSIS.md, "`shared_from_this`"),
+    /// Class-body `using` declarations (docs/IR.md, "`shared_from_this`"),
     /// merged with a unit's symbols so a header's imports outlive header-unit
     /// lowering and reach every source unit that includes it.
     pub class_member_imports: Vec<ClassMemberImport>,
@@ -711,7 +711,7 @@ pub struct Program {
     /// flow constraints, or local variables).
     pub ignored_macros: Vec<String>,
     /// Whether per-function call-order graphs are recorded (`--sequencing`;
-    /// docs/ANALYSIS.md, "Call sequencing (control-flow sidecar)").
+    /// docs/USAGE.md, "Call sequencing (control-flow sidecar)").
     pub call_sequencing: bool,
     /// Call-order graphs by function; several entries are configuration
     /// variants of one body. Ordered keys keep export deterministic.
