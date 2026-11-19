@@ -705,7 +705,6 @@ impl ExplicitParams<'_> {
 
     /// The type of explicit parameter `i`, when it is known.
     pub fn get(&self, i: usize) -> Option<TypeId> {
-        self.f.debug_assert_pack_positions(self.skip);
         if i >= self.len {
             return None;
         }
@@ -2173,12 +2172,8 @@ impl SymbolTable {
         f: &'a Function,
         supplied: Option<&'a [TypeId]>,
     ) -> Option<ExplicitParams<'a>> {
-        f.debug_assert_pack_positions(usize::from(
-            f.params
-                .first()
-                .is_some_and(|&p| self.variable_by_id(p).is_some_and(|v| v.name == "this")),
-        ));
         if f.params.is_empty() {
+            f.debug_assert_pack_positions(0);
             // A prototype: no variables, its declared types (possibly none).
             let types = supplied.unwrap_or(&f.param_type_ids);
             let arity = f.explicit_arity.map_or(types.len(), |a| a as usize);
@@ -2191,6 +2186,9 @@ impl SymbolTable {
             });
         }
         let pack = f.pack_positions.len();
+        // Before a cross-unit merge remaps the incoming parameter IDs, a
+        // lookup here can find an unrelated variable. Use the declared
+        // arity to locate the implicit parameters whenever it is known.
         let skip = match f.explicit_arity {
             Some(arity) => f.params.len().checked_sub(arity as usize + pack)?,
             None => usize::from(
@@ -2198,6 +2196,7 @@ impl SymbolTable {
                     .is_some_and(|v| v.name == "this"),
             ),
         };
+        f.debug_assert_pack_positions(skip);
         Some(ExplicitParams {
             table: self,
             f,
@@ -4939,6 +4938,45 @@ mod tests {
             c_linkage: false,
             tu: None,
         }
+    }
+
+    #[test]
+    fn incoming_pack_signature_ignores_unrelated_this_variable() {
+        let mut symbols = SymbolTable::default();
+        let file = symbols.add_file("/t/callback.cpp".into());
+        let receiver = symbols.alloc_var_id();
+        symbols.add_variable(fake_variable(
+            receiver,
+            "this",
+            StorageClass::Param,
+            file,
+            1,
+        ));
+        let pack = symbols.alloc_var_id();
+        // The incoming free function's first unit-local ID is also used by
+        // an unrelated receiver in the merged table.
+        let mut incoming = fake_function(
+            symbols.alloc_fn_id(),
+            "dispatch",
+            vec![receiver, pack],
+            true,
+            true,
+            file,
+            2,
+        );
+        incoming.explicit_arity = Some(1);
+        incoming.variadic = true;
+        incoming.pack_positions = vec![1];
+        let mut types = crate::TypeTable::default();
+        let fixed = types.intern(crate::TypeDesc::Int);
+        let signature = [fixed, types.unknown()];
+
+        let explicit = symbols
+            .explicit_params_with(&incoming, Some(&signature))
+            .unwrap();
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit.get(0), Some(fixed));
+        assert_eq!(explicit.argument_type(1), None);
     }
 
     /// A shared body reaches the headers its contributors include. The search

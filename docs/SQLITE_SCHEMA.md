@@ -906,6 +906,11 @@ PAG abstract locations (`--full-export` or `--debug-points-to`).
 | `desc` | TEXT | Description |
 | `type_id` | INTEGER FK → `types` | Optional |
 
+Modeled container element cells use `ArraySummary` and describe their owners
+as `elements:<function>::<variable>` for locals, `elements:<variable>` for
+globals, or `elements:<class>.<field>` for members. See
+[Container elements](CXX.md#container-elements).
+
 ### points_to
 
 PAG node → location sets (`--debug-points-to`).

@@ -65,7 +65,7 @@ Lowered IR flow constraints (`program.flow`) and function return flows (`program
 | `Heap` | Reserved for allocator summaries (stub) |
 | `Field` | Specific field at a known parent object location |
 | `FieldSummary` | Instance-insensitive merge of struct field `T.f` across instances in the same link target |
-| `ArraySummary` | Unknown-index array element summary |
+| `ArraySummary` | Unknown-index array element summary or modeled [container element cell](CXX.md#container-elements) |
 | `Function` | Function entry address for indirect call targets |
 
 ### Lazy locations
@@ -134,6 +134,10 @@ already held, and a side that has settled pops with an empty delta, which
 fires nothing. Wiring therefore fires it once with both whole sets
 (`apply_fn_model`); from then on it is difference-propagated like any
 other store.
+
+When an indirect callee resolves during solving, the new return constraints
+replay the points-to sets their sources already hold. This includes settled
+values captured by a lambda and uses the same worklist as later growth.
 
 **Signature-guarded function-value propagation**
 
@@ -515,6 +519,9 @@ Return-value flow affects **points-to** (what a call expression assigns), not ar
 Debug builds check that pack positions are sorted, unique and within the
 parameter list before explicit-type lookup or argument wiring. Wiring also
 checks that each recorded pack slot names a lowered pack variable.
+During cross-TU registration, explicit-type lookup uses the declaration's
+arity and pack count to account for the implicit receiver before the incoming
+parameter IDs have been remapped.
 
 A parameter pack (`Args &&...args`, `Args... args`) takes any number of
 arguments, and a pack expansion (`args...`, `std::forward<Args>(args)...`)

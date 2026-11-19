@@ -35,10 +35,9 @@ impl MethodKind {
         let end = scope.rfind("::")?;
         let short = &name[end + 2..];
         let cls = name[..end].to_owned();
-        let last_cls = cls.rsplit("::").next().unwrap_or(&cls);
         let kind = if short.starts_with('~') {
             MethodKind::Dtor
-        } else if short == last_cls {
+        } else if short == Self::class_leaf(&cls) {
             MethodKind::Ctor
         } else {
             MethodKind::Named(short.to_string())
@@ -53,12 +52,34 @@ impl MethodKind {
 
     /// The member's full name as spelled on class `cls`.
     pub fn name_on(&self, cls: &str) -> String {
-        let last = cls.rsplit("::").next().unwrap_or(cls);
         match self {
             MethodKind::Named(m) => format!("{}::{}", cls, m),
-            MethodKind::Ctor => format!("{}::{}", cls, last),
-            MethodKind::Dtor => format!("{}::~{}", cls, last),
+            MethodKind::Ctor => format!("{}::{}", cls, Self::class_leaf(cls)),
+            MethodKind::Dtor => format!("{}::~{}", cls, Self::class_leaf(cls)),
         }
+    }
+
+    fn class_leaf(mut cls: &str) -> &str {
+        if cls.ends_with('>') {
+            // Only the final argument list belongs to the leaf class.
+            let mut angles = 0;
+            let mut parens = 0;
+            for (i, byte) in cls.bytes().enumerate().rev() {
+                match byte {
+                    b')' => parens += 1,
+                    b'(' if parens > 0 => parens -= 1,
+                    _ if parens > 0 => {}
+                    b'>' => angles += 1,
+                    b'<' if angles == 1 => {
+                        cls = cls[..i].trim_end();
+                        break;
+                    }
+                    b'<' => angles -= 1,
+                    _ => {}
+                }
+            }
+        }
+        cls.rsplit("::").next().unwrap_or(cls)
     }
 }
 
@@ -1564,6 +1585,22 @@ fn push_edge_index(map: &mut FxHashMap<String, Vec<usize>>, key: &str, index: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn special_members_use_the_nested_class_leaf() {
+        for cls in [
+            "Outer<A>::Inner<B>",
+            "Outer<ns::A>::Inner",
+            "Outer<A>::Inner<ns::B<C>>",
+            "Outer<A>::Inner<(2 > 1)>",
+        ] {
+            for (kind, member) in [(MethodKind::Ctor, "Inner"), (MethodKind::Dtor, "~Inner")] {
+                let name = format!("{cls}::{member}");
+                assert_eq!(kind.name_on(cls), name);
+                assert_eq!(MethodKind::of_function(&name), Some((cls.to_owned(), kind)));
+            }
+        }
+    }
 
     #[test]
     fn template_return_hits_keep_overload_facts_in_first_seen_order() {

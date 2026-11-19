@@ -1,0 +1,132 @@
+[[container]]
+name = "std::vector"
+declaration_aliases = ["std::__1::vector"]
+element = 0
+initializer_list = true
+initializer_allocator = 1
+operations = [
+    { kind = "store", method = "push_back", arity = 1, value = 0 },
+    { kind = "store", method = "emplace_back", arity = 1, value = 0 },
+    { kind = "store", method = "insert", arity = 2, value = 1 },
+    { kind = "store", method = "emplace", arity = 2, value = 1 },
+    { kind = "access", method = "operator[]", arity = 1 },
+    { kind = "access", method = "at", arity = 1 },
+    { kind = "access", method = "front", arity = 0 },
+    { kind = "access", method = "back", arity = 0 },
+]
+
+[[container]]
+name = "std::deque"
+declaration_aliases = ["std::__1::deque"]
+element = 0
+initializer_list = true
+operations = [
+    { kind = "store", method = "push_front", arity = 1, value = 0 },
+    { kind = "store", method = "push_back", arity = 1, value = 0 },
+    { kind = "store", method = "emplace_front", arity = 1, value = 0 },
+    { kind = "store", method = "emplace_back", arity = 1, value = 0 },
+    { kind = "store", method = "insert", arity = 2, value = 1 },
+    { kind = "store", method = "emplace", arity = 2, value = 1 },
+    { kind = "access", method = "operator[]", arity = 1 },
+    { kind = "access", method = "at", arity = 1 },
+    { kind = "access", method = "front", arity = 0 },
+    { kind = "access", method = "back", arity = 0 },
+]
+
+[[container]]
+name = "std::list"
+declaration_aliases = ["std::__cxx11::list", "std::__1::list"]
+element = 0
+initializer_list = true
+operations = [
+    { kind = "store", method = "push_front", arity = 1, value = 0 },
+    { kind = "store", method = "push_back", arity = 1, value = 0 },
+    { kind = "store", method = "emplace_front", arity = 1, value = 0 },
+    { kind = "store", method = "emplace_back", arity = 1, value = 0 },
+    { kind = "store", method = "insert", arity = 2, value = 1 },
+    { kind = "store", method = "emplace", arity = 2, value = 1 },
+    { kind = "access", method = "front", arity = 0 },
+    { kind = "access", method = "back", arity = 0 },
+]
+
+[[container]]
+name = "std::forward_list"
+declaration_aliases = ["std::__1::forward_list"]
+element = 0
+initializer_list = true
+operations = [
+    { kind = "store", method = "push_front", arity = 1, value = 0 },
+    { kind = "store", method = "emplace_front", arity = 1, value = 0 },
+    { kind = "store", method = "insert_after", arity = 2, value = 1 },
+    { kind = "store", method = "emplace_after", arity = 2, value = 1 },
+    { kind = "access", method = "front", arity = 0 },
+]
+
+[[container]]
+name = "std::queue"
+declaration_aliases = ["std::__1::queue"]
+element = 0
+operations = [
+    { kind = "store", method = "push", arity = 1, value = 0 },
+    { kind = "store", method = "emplace", arity = 1, value = 0 },
+    { kind = "access", method = "front", arity = 0 },
+    { kind = "access", method = "back", arity = 0 },
+]
+
+[[container]]
+name = "std::set"
+declaration_aliases = ["std::__1::set"]
+element = 0
+initializer_list = true
+operations = [
+    { kind = "store", method = "insert", arity = 1, value = 0 },
+    { kind = "store", method = "emplace", arity = 1, value = 0 },
+    { kind = "store", method = "emplace_hint", arity = 2, value = 1 },
+    { kind = "iterator", method = "find", arity = 1 },
+    { kind = "iterator", method = "begin", arity = 0 },
+]
+
+[[container]]
+name = "std::unordered_set"
+declaration_aliases = ["std::__1::unordered_set"]
+element = 0
+initializer_list = true
+operations = [
+    { kind = "store", method = "insert", arity = 1, value = 0 },
+    { kind = "store", method = "emplace", arity = 1, value = 0 },
+    { kind = "store", method = "emplace_hint", arity = 2, value = 1 },
+    { kind = "iterator", method = "find", arity = 1 },
+    { kind = "iterator", method = "begin", arity = 0 },
+]
+
+[[container]]
+name = "std::map"
+declaration_aliases = ["std::__1::map"]
+element = 1
+initializer_list = true
+initializer_entry = 1
+operations = [
+    { kind = "store", method = "insert", arity = 1, value = 0, entry = 1 },
+    { kind = "store", method = "insert_or_assign", arity = 2, value = 1 },
+    { kind = "store", method = "emplace", arity = 2, value = 1 },
+    { kind = "access", method = "operator[]", arity = 1 },
+    { kind = "access", method = "at", arity = 1 },
+    { kind = "iterator", method = "find", arity = 1, member = "second" },
+    { kind = "iterator", method = "begin", arity = 0, member = "second" },
+]
+
+[[container]]
+name = "std::unordered_map"
+declaration_aliases = ["std::__1::unordered_map"]
+element = 1
+initializer_list = true
+initializer_entry = 1
+operations = [
+    { kind = "store", method = "insert", arity = 1, value = 0, entry = 1 },
+    { kind = "store", method = "insert_or_assign", arity = 2, value = 1 },
+    { kind = "store", method = "emplace", arity = 2, value = 1 },
+    { kind = "access", method = "operator[]", arity = 1 },
+    { kind = "access", method = "at", arity = 1 },
+    { kind = "iterator", method = "find", arity = 1, member = "second" },
+    { kind = "iterator", method = "begin", arity = 0, member = "second" },
+]
