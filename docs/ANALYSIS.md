@@ -615,11 +615,12 @@ pointers (`void (*get_handler(int))(int);`) by examining the declarator binding 
 the declared identifier. A pointer to member function (`void (S::*cb)(int);`)
 never reaches this classification as such: the parse input blanks its owner
 (see [C++ parse-input normalization](CXX.md#c-parse-input-normalization)), so it is
-an ordinary function-pointer declarator and the variable is named `cb`. A
-project data-member pointer (`int S::* dm;`) is not rewritten; declarator
-classification still traverses its pointer-bearing qualified name
-(`pointer_type_declarator`) and indexes it as a variable binding, `S::*dm`,
-while retaining ordinary qualified function names as terminals.
+an ordinary function-pointer declarator and the variable is named `cb`. Its
+callable signature and invocation semantics are retained as described in
+[C++ parse-input normalization](CXX.md#c-parse-input-normalization). Data-member pointer declarations (`int S::* dm;`) likewise adapt their owner
+for parsing and restore an explicit member-pointer descriptor during lowering;
+the variable keeps its declared identifier (`dm`). See the same normalization
+section for data-member value flow.
 
 A member declared in-class and defined out-of-class (`int *Holder::member;`
 or `int *Holder::member = &object;` at namespace scope) share one `VarId`:
@@ -781,6 +782,9 @@ selection, so ordinary indexing does not allocate those range maps;
 a source shared by targets has distinct function and variable instances in
 each scope. Unmapped sources remain in an unscoped partition. Without link
 metadata, the existing indexing and whole-program merge path remains in use.
+Callback overload selection during lowering therefore sees only its unit,
+before images exist; the target merge remaps address, argument and return
+facts into each image's symbol instances.
 
 GNU `weak`/`__weak__` attributes (including C++ `[[gnu::weak]]` and
 `[[gnu::__weak__]]`) and active `#pragma weak name` mark functions
@@ -838,6 +842,10 @@ remain within a target. The same target-aware name resolver serves call and
 return wiring; a lookup that names no image (the public resolver entry points)
 still sees every symbol, which is not the same question as naming the unscoped
 partition explicitly.
+An indirect member-function value already naming a definition in a different
+image is rejected, as an ordinary callback value is; it must not fall back to
+a same-named local definition. Member declarations still use the caller's
+image to resolve their definitions.
 
 When separate translation units contribute distinct strong definitions of a
 C++ function with the same qualified name and signature (such as multiple
@@ -954,7 +962,12 @@ covers the DataShare framework route. For partial checkouts, choose among
   source uncertainty; a class declared in another provider cannot turn a
   caller's unresolved typedef into a certain class. The shared signature
   matcher admits scalar-typedef alternatives for such guesses. Legacy exports
-  conservatively infer guesses for undeclared parameter tags. A method
+  conservatively infer guesses for undeclared parameter tags. Shape normalization
+  and guess collection recurse through member-pointer values just as through
+  ordinary pointers, arrays and callbacks; the member owner and function/data
+  category remain intact. Completed nested tags do not enter the compact shape,
+  and reconstruction tags nested guesses even when another provider declares
+  that class. A method
   recovered through an unavailable `IRemoteStub<I>` remains a candidate when
   the indexed dispatch hierarchy supplies no targets. Unresolved arrow/field
   spellings with a known receiver are normalized in new linking facts; readers

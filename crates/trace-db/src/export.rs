@@ -211,7 +211,8 @@ fn export_types(conn: &Connection, program: &Program) -> Result<()> {
             TypeDesc::Double => "double",
             TypeDesc::SizeT => "size_t",
             TypeDesc::Unknown => "unknown",
-            TypeDesc::Ptr(_) => "ptr",
+            TypeDesc::Ellipsis => "ellipsis",
+            TypeDesc::Ptr(_) | TypeDesc::MemberPointer { .. } => "ptr",
             TypeDesc::Array { .. } => "array",
             TypeDesc::Struct { .. } => "struct",
             TypeDesc::Union { .. } => "union",
@@ -235,6 +236,9 @@ fn type_name(desc: &TypeDesc) -> String {
                 size.map(|s| s.to_string()).unwrap_or_default()
             )
         }
+        TypeDesc::MemberPointer { owner, member, .. } => {
+            format!("{} {}::*", type_name(member), owner)
+        }
         TypeDesc::FnPtr { .. } => "fn_ptr".into(),
         TypeDesc::Void => "void".into(),
         TypeDesc::Char => "char".into(),
@@ -247,6 +251,7 @@ fn type_name(desc: &TypeDesc) -> String {
         TypeDesc::Double => "double".into(),
         TypeDesc::SizeT => "size_t".into(),
         TypeDesc::Unknown => "unknown".into(),
+        TypeDesc::Ellipsis => "...".into(),
     }
 }
 
@@ -2072,7 +2077,7 @@ mod tests {
                 explicit_arity: Some(0),
                 owner_unresolved: false,
                 variadic: false,
-                has_pack_param: false,
+                pack_positions: Vec::new(),
                 defaulted_in_class: false,
                 declared_in_class: false,
                 is_member_template: false,

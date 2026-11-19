@@ -1,5 +1,5 @@
 {
-  "note": "Fresh 2026-11-08 release comparison for #244 rebased on local master 5555e9a; measurements and historical recaptures are authoritative in docs/EVAL_REPORT.md, Store projections and declaration-scoped defaults. Argument-flow band centers are HDF 72400 (both entries), HiView 32470 and Camera 59919 (58694 before #282), with tolerances unchanged. Keep the exact HDF indirect total 5153 separate from named recovery and known-imprecision probes. Preserve master's 222-site Camera named-cast calibration and ability_runtime SendTransactCmd IPC probes. Added ability_runtime probes retain matching integer StartAbility overloads, exclude the six remote-token overload edges, and pin evaluated DataObsOption defaults and four conservative LifecycleFlow aggregate calls. Correctness metrics use exact or named-site checks; bulk totals keep their established bands.",
+  "note": "PR #257 expectation centers were recaptured relative to parent aa6f846, including HDF functions_total 12198 -> 12172, indirect edges 5153 -> 5226 and arg_flow_edges 72400 -> 72585; HiView and Camera centers were also recaptured. The 2026-11-13 owner-dependency/reference-alias/receiver-qualification follow-up remeasured every HDF, HiView and Camera global with release analyzer 3980106-dirty including all production changes in this amend, at jobs 1 and 8, matching the preceding 3980106 review snapshot. Existing tolerances were retained. Source/binary identities, strict compiler cases, parent differential residuals and the Camera metadata audit are in docs/EVAL_REPORT.md, Dependent owners, reference aliases and receiver qualification. Other corpora, including ability_runtime, carry forward earlier measurements and were not rerun here.",
   "budget_pops": 800000,
   "jobs": 8,
   "corpora": {
@@ -10,19 +10,19 @@
       "dir": "drivers_hdf_core",
       "globals": {
         "files": {"cmp": "exact", "value": 1510},
-        "functions_total": {"cmp": "band", "value": 12198, "tol": 40},
+        "functions_total": {"cmp": "band", "value": 12172, "tol": 40},
         "functions_defined": {"cmp": "band", "value": 10306, "tol": 40},
-        "functions_external": {"cmp": "band", "value": 1892, "tol": 40},
-        "edges_total": {"cmp": "band", "value": 78728, "tol": 240},
-        "edges_direct": {"cmp": "band", "value": 49673, "tol": 240},
-        "edges_indirect": {"cmp": "exact", "value": 5153},
-        "edges_external": {"cmp": "band", "value": 23909, "tol": 200},
+        "functions_external": {"cmp": "band", "value": 1866, "tol": 40},
+        "edges_total": {"cmp": "band", "value": 78974, "tol": 240},
+        "edges_direct": {"cmp": "band", "value": 49816, "tol": 240},
+        "edges_indirect": {"cmp": "exact", "value": 5226},
+        "edges_external": {"cmp": "band", "value": 23874, "tol": 200},
         "edges_ipc": {"cmp": "exact", "value": 58},
-        "arg_flow_edges": {"cmp": "band", "value": 72400, "tol": 150},
+        "arg_flow_edges": {"cmp": "band", "value": 72585, "tol": 150},
         "diagnostics": {"cmp": "exact", "value": 1910},
         "dlsym_edges": {"cmp": "exact", "value": 6},
-        "public_functions_total": {"cmp": "band", "value": 12145, "tol": 20},
-        "public_edges_total": {"cmp": "band", "value": 78709, "tol": 80}
+        "public_functions_total": {"cmp": "band", "value": 12131, "tol": 20},
+        "public_edges_total": {"cmp": "band", "value": 78844, "tol": 80}
       },
       "sites": [
       {"case": "HdfRemoteServiceCheckInterfaceToken -> the C++ adapter body (#83: the `extern \"C\"` prototype in hdf_remote_adapter_if.h and the definition in hdf_remote_adapter.cpp interned `struct HdfRemoteService *` under two ids, so the overload check split them and this call stopped at the undefined prototype)", "caller": "%HdfRemoteServiceCheckInterfaceToken", "line": 68, "resolution": "direct", "expected": 1},
@@ -40,6 +40,7 @@
         {"case": "WorkEntry (linux workqueue)", "caller": "%WorkEntry", "caller_file": "%linux/osal/src/osal_workqueue.c%", "line": 0, "resolution": "indirect", "expected": 20}
       ],
       "probes": [
+        {"name": "reinterpreted void worker retains its int-returning HDF thread-entry call (#257)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id WHERE e.resolution='indirect' AND c.name='OsalThreadFn' AND t.name='HdfThreadMain'", "cmp": "exact", "value": 1},
         {"name": "a wrapped callable starts no execution context (#283)", "sql": "SELECT COUNT(*) FROM execution_contexts WHERE model IN ('std::bind','std::packaged_task::packaged_task')", "cmp": "exact", "value": 0},
         {"name": "first-member cast arguments retain six HdfRemoteService field projections (#244)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN files p ON p.id=s.file_id JOIN variables f ON f.id=a.formal_var_id JOIN variables v ON v.id=a.actual_var_id JOIN files vp ON vp.id=v.file_id WHERE p.path LIKE '%/framework/core/manager/test/unittest/common/hdf_remote_adapter_test.cpp' AND s.line IN(50,52,91,96,98,103) AND a.arg_index=0 AND f.name='service' AND EXISTS (SELECT 1 FROM flow_nodes n JOIN flow_edges e ON e.dst_node=n.id WHERE n.var_id=v.id AND e.kind='gep')", "cmp": "exact", "value": 6},
         {"name": "built-in integral offset arguments retain five named HDF bindings (#244)", "sql": "WITH expected(caller,file,line,position,formal) AS (VALUES ('MmapWriteData','framework/model/audio/common/src/audio_platform_base.c',463,1,'from'),('MmapReadData','framework/model/audio/common/src/audio_platform_base.c',619,0,'srcData'),('MmapReadData','framework/model/audio/common/src/audio_platform_base.c',626,0,'to'),('MmapReadData','framework/model/audio/common/src/audio_platform_base.c',626,1,'from'),('AudioUsbParseFeatureUnit','framework/model/audio/usb/src/audio_usb_mixer.c',1601,0,'bytes')) SELECT COUNT(*) FROM expected x WHERE EXISTS (SELECT 1 FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN functions c ON c.id=s.caller_fn_id JOIN files p ON p.id=s.file_id JOIN variables v ON v.id=a.formal_var_id WHERE c.name=x.caller AND p.path LIKE '%/'||x.file AND s.line=x.line AND a.arg_index=x.position AND v.name=x.formal)", "cmp": "exact", "value": 5},
@@ -68,7 +69,7 @@
       {"name": "no external name carries both a definition and a declaration-only entity (#83: a prototype the overload check refused to merge with its own definition leaves callers bound to the undefined entity; hdf's C-over-C++ IPC interface put 10 names in this state)", "sql": "SELECT COUNT(*) FROM (SELECT name FROM functions WHERE linkage='external' GROUP BY name HAVING SUM(is_defined)>0 AND SUM(1-is_defined)>0)", "cmp": "exact", "value": 0},
         {"name": "DevHostServiceAddDevice reaches the driver loader's GetDriver and both ReclaimDriver bodies (#127 review: the constructor stores them through `HdfDriverLoader.super`, the call loads them through `IDriverLoader *`; two interned snapshots of `IDriverLoader` split the field summary, which the pointer-static seed used to paper over)", "sql": "SELECT COUNT(DISTINCT tf.name) FROM call_edges e JOIN functions cf ON cf.id=e.caller_fn_id JOIN functions tf ON tf.id=e.callee_fn_id WHERE cf.name='DevHostServiceAddDevice' AND e.resolution='indirect' AND tf.name IN ('HdfDriverLoaderGetDriver', 'HdfDriverLoaderReclaimDriver', 'HdfDriverLoaderFullReclaimDriver')", "cmp": "exact", "value": 3},
         {"name": "flow_graph_nodes", "sql": "SELECT COUNT(*) FROM flow_nodes", "cmp": "min", "value": 100000},
-        {"name": "arg_flow_rows_per_call_edge", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites cs ON cs.id=a.call_site_id", "cmp": "band", "value": 72400, "tol": 150},
+        {"name": "arg_flow_rows_per_call_edge", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites cs ON cs.id=a.call_site_id", "cmp": "band", "value": 72585, "tol": 150},
         {"name": "no member indexed under a declarator fragment (#46: a conversion operator's `operator_cast` declarator was unknown to both member walks, so `operator bool() const {...}` fell out of a generic walk as `X::()const`; the real `operator()` stays, and so does a conversion whose target is a function pointer or reference — `X::operator void(*)` is the correct name for one)", "sql": "SELECT COUNT(*) FROM functions WHERE name GLOB '*(*' AND name NOT GLOB '*operator()' AND name NOT GLOB '*operator *(*'", "cmp": "exact", "value": 0},
         {"name": "no member indexed under the bare keyword `operator` (#46: `normalize_qualified` stripped `<...>` as a template-argument span, truncating the whole `operator<` / `<=` / `<<` / `<=>` family to the keyword and collapsing a class's comparison operators into one symbol)", "sql": "SELECT COUNT(*) FROM functions WHERE name='operator' OR name GLOB '*::operator'", "cmp": "exact", "value": 0},
         {"name": "no member indexed under a standard attribute (#46 review: `[[deprecated]] void LockForControl();` parses cleanly -- no error recovery involved -- but the attribute holds an identifier in front of the declaration and the member walk took it, collapsing every annotated member of a class into one symbol; camera lost 26 `CameraInput` / `CameraManager` members to 7 such phantoms)", "sql": "SELECT COUNT(*) FROM functions WHERE name GLOB '*::deprecated' OR name GLOB '*::nodiscard' OR name GLOB '*::maybe_unused' OR name GLOB '*::noreturn' OR name GLOB '*::fallthrough' OR name GLOB '*::visibility' OR name GLOB '*::dllexport' OR name GLOB '*::dllimport'", "cmp": "exact", "value": 0},
@@ -82,19 +83,19 @@
       "dir": "hiviewdfx_hiview",
       "globals": {
         "files": {"cmp": "exact", "value": 1452},
-        "functions_total": {"cmp": "band", "value": 9971, "tol": 120},
-        "functions_defined": {"cmp": "band", "value": 7993, "tol": 120},
-        "functions_external": {"cmp": "band", "value": 1978, "tol": 120},
-        "edges_total": {"cmp": "band", "value": 39315, "tol": 160},
-        "edges_direct": {"cmp": "band", "value": 23332, "tol": 160},
-        "edges_indirect": {"cmp": "exact", "value": 265},
-        "edges_external": {"cmp": "band", "value": 15693, "tol": 160},
+        "functions_total": {"cmp": "band", "value": 9762, "tol": 120},
+        "functions_defined": {"cmp": "band", "value": 7992, "tol": 120},
+        "functions_external": {"cmp": "band", "value": 1770, "tol": 120},
+        "edges_total": {"cmp": "band", "value": 39500, "tol": 160},
+        "edges_direct": {"cmp": "band", "value": 24105, "tol": 160},
+        "edges_indirect": {"cmp": "exact", "value": 266},
+        "edges_external": {"cmp": "band", "value": 15085, "tol": 160},
         "edges_ipc": {"cmp": "exact", "value": 44},
-        "arg_flow_edges": {"cmp": "band", "value": 32470, "tol": 120},
-        "diagnostics": {"cmp": "exact", "value": 3576},
+        "arg_flow_edges": {"cmp": "band", "value": 33789, "tol": 120},
+        "diagnostics": {"cmp": "exact", "value": 3559},
         "dlsym_edges": {"cmp": "exact", "value": 3},
-        "public_functions_total": {"cmp": "band", "value": 9551, "tol": 120},
-        "public_edges_total": {"cmp": "band", "value": 38726, "tol": 160}
+        "public_functions_total": {"cmp": "band", "value": 9344, "tol": 120},
+        "public_edges_total": {"cmp": "band", "value": 38891, "tol": 160}
       },
       "sites": [
         {"case": "Plugin::OnEventProxy dispatch", "caller": "%Plugin::OnEventProxy", "line": 68, "resolution": "all", "expected": 13},
@@ -113,6 +114,9 @@
         {"name": "the shared_from_this() init-capture at uc_telemetry_callback.cpp:187 reaches RunTraceOnTimeTask", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites cs ON cs.id=e.call_site_id JOIN files f ON f.id=cs.file_id JOIN functions target ON target.id=e.callee_fn_id WHERE f.path LIKE '%/uc_telemetry_callback.cpp' AND COALESCE(cs.expansion_line,cs.line)=187 AND e.resolution='direct' AND target.name='OHOS::HiviewDFX::UcTelemetryCallback::RunTraceOnTimeTask'", "cmp": "exact", "value": 1},
         {"name": "owning-pointer get extraction from the singleton-returned wrapper", "sql": "SELECT COUNT(DISTINCT s.id) FROM call_sites s JOIN files p ON p.id=s.file_id JOIN functions f ON f.id=s.caller_fn_id JOIN flow_nodes r ON r.var_id=s.return_dst JOIN flow_edges u ON u.dst_node=r.id AND u.kind='unwrap' WHERE p.path LIKE '%/xperf_service_server.cpp' AND s.line=39 AND f.name='OHOS::HiviewDFX::XperfServiceServer::Start' AND s.callee_text='std::shared_ptr::get'", "cmp": "exact", "value": 1},
         {"name": "owning-pointer get extraction retains the submitted event and bound receiver values", "sql": "SELECT COUNT(DISTINCT s.id) FROM call_sites s JOIN files p ON p.id=s.file_id JOIN flow_nodes r ON r.var_id=s.return_dst JOIN flow_edges u ON u.dst_node=r.id AND u.kind='unwrap' WHERE s.callee_text='std::shared_ptr::get' AND ((p.path LIKE '%/base/event_dispatch_queue.cpp' AND s.line=87) OR (p.path LIKE '%/base/event_loop.cpp' AND s.line=191))", "cmp": "exact", "value": 2},
+        {"name": "explicit instantiation headers recover without parse warnings (#246)", "sql": "SELECT COUNT(*) FROM diagnostics d LEFT JOIN files f ON f.id=d.file_id WHERE d.stage='parse' AND (f.path LIKE '%/encoded/encoded_param.h' OR d.message LIKE '%/encoded/encoded_param.h' OR d.message LIKE '%/encoded/encoded_param.h:%' OR f.path LIKE '%/encoded/raw_data_builder.h' OR d.message LIKE '%/encoded/raw_data_builder.h' OR d.message LIKE '%/encoded/raw_data_builder.h:%')", "cmp": "exact", "value": 0},
+        {"name": "instantiation recovery restores the test class namespace (#246)", "sql": "SELECT COUNT(*) FROM functions WHERE name='OHOS::HiviewDFX::EventRawEncodedTest::SetUp' AND is_defined=1", "cmp": "exact", "value": 1},
+        {"name": "no phantom definition consumes declarations after a member instantiation (#246)", "sql": "SELECT COUNT(*) FROM functions WHERE name LIKE '%TAG;%'", "cmp": "exact", "value": 0},
         {"name": "unknown imported standard types never acquire a nested std namespace", "sql": "SELECT COUNT(*) FROM functions WHERE is_defined=0 AND name LIKE '%::std::%'", "cmp": "exact", "value": 0},
         {"name": "using std::string keeps a global std::string::c_str external", "sql": "SELECT COUNT(*) FROM functions WHERE is_defined=0 AND name='std::string::c_str'", "cmp": "min", "value": 1},
         {"name": "undeclared reader at sys_event_store_utility_test.cpp:100 retains one 1-argument ReadHeader target", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites cs ON cs.id=e.call_site_id JOIN files f ON f.id=cs.file_id JOIN functions target ON target.id=e.callee_fn_id WHERE f.path LIKE '%sys_event_store_utility_test.cpp' AND COALESCE(cs.expansion_line,cs.line)=100 AND e.resolution='direct' AND target.is_defined=1 AND target.name='OHOS::HiviewDFX::EventStore::SysEventDocReader::ReadHeader'", "cmp": "exact", "value": 1},
@@ -139,19 +143,19 @@
       "dir": "multimedia_camera_framework",
       "globals": {
         "files": {"cmp": "exact", "value": 1703},
-        "functions_total": {"cmp": "band", "value": 23722, "tol": 120},
+        "functions_total": {"cmp": "band", "value": 23539, "tol": 120},
         "functions_defined": {"cmp": "band", "value": 19806, "tol": 120},
-        "functions_external": {"cmp": "band", "value": 3916, "tol": 120},
-        "edges_total": {"cmp": "band", "value": 116253, "tol": 420},
-        "edges_direct": {"cmp": "band", "value": 68918, "tol": 420},
-        "edges_indirect": {"cmp": "exact", "value": 462},
-        "edges_external": {"cmp": "band", "value": 46085, "tol": 420},
+        "functions_external": {"cmp": "band", "value": 3733, "tol": 120},
+        "edges_total": {"cmp": "band", "value": 117298, "tol": 420},
+        "edges_direct": {"cmp": "band", "value": 70073, "tol": 420},
+        "edges_indirect": {"cmp": "exact", "value": 475},
+        "edges_external": {"cmp": "band", "value": 45942, "tol": 420},
         "edges_ipc": {"cmp": "exact", "value": 808},
-        "arg_flow_edges": {"cmp": "band", "value": 59919, "tol": 250},
-        "diagnostics": {"cmp": "exact", "value": 5251},
+        "arg_flow_edges": {"cmp": "band", "value": 60961, "tol": 250},
+        "diagnostics": {"cmp": "exact", "value": 5192},
         "dlsym_edges": {"cmp": "exact", "value": 6},
-        "public_functions_total": {"cmp": "band", "value": 22874, "tol": 120},
-        "public_edges_total": {"cmp": "band", "value": 114648, "tol": 420}
+        "public_functions_total": {"cmp": "band", "value": 22693, "tol": 120},
+        "public_edges_total": {"cmp": "band", "value": 115599, "tol": 420}
       },
       "sites": [
         {"case": "Command::Do GetCommandName", "caller": "%DeferredProcessing::Command::Do", "line": 35, "resolution": "all", "expected": 31},
@@ -164,7 +168,7 @@
         {"name": "a wrapped callable starts no execution context (#283)", "sql": "SELECT COUNT(*) FROM execution_contexts WHERE model IN ('std::bind','std::packaged_task::packaged_task')", "cmp": "exact", "value": 0},
         {"name": "pack formals receive their arguments: CameraNapiObjectTypes::Hold takes 52 (#282)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN variables f ON f.id=a.formal_var_id JOIN functions c ON c.id=f.fn_id WHERE c.name='OHOS::CameraStandard::CameraNapiObjectTypes::Hold' AND f.name='args'", "cmp": "exact", "value": 52},
         {"name": "const-reference moviePath defaults bind all 136 retained VideoInfo arguments (#244)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN files p ON p.id=s.file_id JOIN variables f ON f.id=a.formal_var_id JOIN variables v ON v.id=a.actual_var_id JOIN files vp ON vp.id=v.file_id WHERE f.name='moviePath' AND a.arg_index=4 AND vp.path LIKE '%/services/deferred_processing_service/include/base/video_info.h' AND v.line IN(30,32) AND EXISTS (SELECT 1 FROM flow_nodes n JOIN flow_edges e ON e.dst_node=n.id WHERE n.var_id=v.id AND e.kind='addr_of')", "cmp": "exact", "value": 136},
-        {"name": "known-imprecise SubmitTask default binds 14 param arguments past explicit handle (#244 overload debt; audit changes)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN variables f ON f.id=a.formal_var_id JOIN variables v ON v.id=a.actual_var_id JOIN files p ON p.id=v.file_id WHERE s.callee_text='OHOS::CameraStandard::DeferredProcessing::TaskManager::SubmitTask' AND f.name='param' AND p.path LIKE '%/common/include/task_manager/task_manager.h' AND v.line=36 AND a.arg_index=2", "cmp": "exact", "value": 14},
+        {"name": "known-imprecise SubmitTask default binds 20 param arguments past explicit handle (#244 overload debt; six more typed receivers in #257; audit changes)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN variables f ON f.id=a.formal_var_id JOIN variables v ON v.id=a.actual_var_id JOIN files p ON p.id=v.file_id WHERE s.callee_text='OHOS::CameraStandard::DeferredProcessing::TaskManager::SubmitTask' AND f.name='param' AND p.path LIKE '%/common/include/task_manager/task_manager.h' AND v.line=36 AND a.arg_index=2", "cmp": "exact", "value": 20},
         {"name": "SubmitTask default never replaces explicit argument position (#244)", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites s ON s.id=a.call_site_id JOIN variables f ON f.id=a.formal_var_id JOIN variables v ON v.id=a.actual_var_id JOIN files p ON p.id=v.file_id WHERE s.callee_text='OHOS::CameraStandard::DeferredProcessing::TaskManager::SubmitTask' AND f.name='param' AND p.path LIKE '%/common/include/task_manager/task_manager.h' AND v.line=36 AND a.arg_index<>2", "cmp": "exact", "value": 0},
         {"name": "known-imprecise SubmitTask std::any defaults retain six named caller identities (#244 overload debt; audit changes)", "sql": "WITH expected(caller,file,line,col,target,resolution) AS (VALUES ('OHOS::CameraStandard::AuxiliaryBufferConsumer::OnBufferAvailable','common/include/task_manager/task_manager.h',36,62,'std::any','external'),('OHOS::CameraStandard::HStreamCapture::InitCaptureThread','common/include/task_manager/task_manager.h',36,62,'std::any','external'),('OHOS::CameraStandard::PhotoAssetBufferConsumer::OnBufferAvailable','common/include/task_manager/task_manager.h',36,62,'std::any','external'),('OHOS::CameraStandard::PhotoBufferConsumer::OnBufferAvailable','common/include/task_manager/task_manager.h',36,62,'std::any','external'),('OHOS::CameraStandard::PhotoNativeConsumer::OnBufferAvailable','common/include/task_manager/task_manager.h',36,62,'std::any','external'),('OHOS::CameraStandard::ThumbnailBufferConsumer::OnBufferAvailable','common/include/task_manager/task_manager.h',36,62,'std::any','external')) SELECT COUNT(*) FROM expected x WHERE EXISTS (SELECT 1 FROM call_sites s JOIN functions c ON c.id=s.caller_fn_id JOIN files p ON p.id=s.file_id JOIN call_edges e ON e.call_site_id=s.id JOIN functions t ON t.id=e.callee_fn_id WHERE c.name=x.caller AND p.path LIKE '%/'||x.file AND s.line=x.line AND s.col=x.col AND t.name=x.target AND e.resolution=x.resolution)", "cmp": "exact", "value": 6},
         {"name": "known-imprecise cross-header PhotoAssetAdapter constructor candidate (#244 duplicate class debt; audit changes)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN functions c ON c.id=s.caller_fn_id JOIN files p ON p.id=s.file_id JOIN functions t ON t.id=e.callee_fn_id JOIN files tp ON tp.id=t.file_id WHERE c.name='OHOS::CameraStandard::createPhotoAssetIntf' AND p.path LIKE '%/services/camera_service/src/media_library/photo_asset_adapter.cpp' AND s.line=79 AND t.name='OHOS::CameraStandard::PhotoAssetAdapter::PhotoAssetAdapter' AND tp.path LIKE '%/dynamic_libs/media_library/src/photo_asset_adapter.cpp' AND t.line_start=29 AND e.resolution='direct'", "cmp": "exact", "value": 1},
@@ -173,6 +177,9 @@
         {"name": "conditional metadata auto receiver retains all three external CameraMetadata get edges", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id JOIN files p ON p.id=s.file_id WHERE p.path LIKE '%/profession_session.cpp' AND e.resolution='external' AND t.name='OHOS::Camera::CameraMetadata::get' AND ((c.name='OHOS::CameraStandard::ProfessionSession::GetIsoRange' AND s.line=178) OR (c.name='OHOS::CameraStandard::ProfessionSession::GetSupportedFlashModes' AND s.line=597) OR (c.name='OHOS::CameraStandard::ProfessionSession::GetFlashMode' AND s.line=619))", "cmp": "exact", "value": 3},
         {"name": "Camera stream and default-session conditional value-arm calls retain return destinations", "sql": "SELECT COUNT(*) FROM call_sites s JOIN functions c ON c.id=s.caller_fn_id JOIN files p ON p.id=s.file_id WHERE s.return_dst IS NOT NULL AND ((p.path LIKE '%/hstream_operator.cpp' AND c.name='OHOS::CameraStandard::HStreamOperator::GetStreamByStreamID' AND ((s.line=1008 AND s.col=69) OR s.line=1009)) OR (p.path LIKE '%/hstream_operator.cpp' AND c.name='OHOS::CameraStandard::HStreamOperator::GetHdiStreamByStreamID' AND ((s.line=1018 AND s.col=72) OR s.line=1019)) OR (p.path LIKE '%/hcamera_session_manager.cpp' AND c.name='OHOS::CameraStandard::HCameraSessionManager::GetGroupDefaultSession' AND s.line=115 AND s.callee_text='list.front'))", "cmp": "exact", "value": 5},
         {"name": "Camera null-or-new initializer retains heap allocation provenance in its value arm", "sql": "SELECT COUNT(*) FROM flow_origins o JOIN files p ON p.id=o.file_id WHERE p.path LIKE '%/hstream_repeat.cpp' AND o.line=182 AND o.kind='addr_of' AND o.expression='new BufferProducerSequenceable(metaProducer_)'", "cmp": "exact", "value": 1},
+        {"name": "dependent RegCallback signature retains the composition callback (#246 review)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN files p ON p.id=s.file_id JOIN functions f ON f.id=e.callee_fn_id WHERE e.resolution='indirect' AND p.path LIKE '%/camera_napi_adaptor.h' AND s.line=172 AND f.name='OHOS::CameraStandard::CaptureSession::SetCompositionEffectReceiveCallback'", "cmp": "exact", "value": 1},
+        {"name": "all five CameraNapiAdaptor member-pointer invocation lines reach targets (#246)", "sql": "SELECT COUNT(DISTINCT s.line) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN files f ON f.id=s.file_id WHERE e.resolution='indirect' AND f.path LIKE '%/camera_napi_adaptor.h' AND s.line IN (97,120,151,172,195)", "cmp": "exact", "value": 5},
+        {"name": "CameraNapiAdaptor member-pointer invocation gains twelve indirect edges (#246)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN files f ON f.id=s.file_id WHERE e.resolution='indirect' AND f.path LIKE '%/camera_napi_adaptor.h' AND s.line IN (97,120,151,172,195)", "cmp": "exact", "value": 12},
         {"name": "media SDK PhotoAssetProxy does not acquire camera wrapper AddPhotoProxy callees or a false cycle", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites cs ON cs.id=e.call_site_id JOIN files f ON f.id=cs.file_id JOIN functions caller ON caller.id=e.caller_fn_id JOIN functions target ON target.id=e.callee_fn_id WHERE f.path LIKE '%photo_asset_adapter.cpp' AND caller.name='OHOS::CameraStandard::PhotoAssetAdapter::AddPhotoProxy' AND target.name='OHOS::CameraStandard::PhotoAssetProxy::AddPhotoProxy' AND e.resolution='direct'", "cmp": "exact", "value": 0},
         {"name": "reference member binding records no constructor site (OHOS::CameraStandard::CameraNapiFocusTrackingMetaInfo::CameraNapiFocusTrackingMetaInfo)", "sql": "SELECT COUNT(*) FROM call_sites s JOIN functions f ON f.id=s.caller_fn_id WHERE f.name='OHOS::CameraStandard::CameraNapiFocusTrackingMetaInfo::CameraNapiFocusTrackingMetaInfo' AND s.callee_text='OHOS::CameraStandard::FocusTrackingMetaInfo::FocusTrackingMetaInfo'", "cmp": "exact", "value": 0},
         {"name": "ProcessPhotoProxy reaches RotatePicture, the function its `std::thread` temporary starts (#187; none before)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites cs ON cs.id=e.call_site_id JOIN functions cf ON cf.id=e.caller_fn_id JOIN functions tf ON tf.id=e.callee_fn_id WHERE cf.name='OHOS::CameraStandard::HStreamOperator::ProcessPhotoProxy' AND tf.name='OHOS::CameraStandard::RotatePicture' AND cs.callee_text='std::thread' AND e.resolution='indirect'", "cmp": "exact", "value": 1},
@@ -190,7 +197,8 @@
         {"name": "an FFI entry point is indexed under its own name and defined (#46: the definition hid behind the glued spelling, so this function was absent from the index under its own name)", "sql": "SELECT COUNT(*) FROM functions WHERE name='OHOS::CameraStandard::FfiCameraZoomGetZoomRatioRange' AND is_defined=1", "cmp": "exact", "value": 1},
         {"name": "a `[[deprecated]]`-annotated member is indexed under its own name (#46 review: all 26 of `CameraInput`'s annotated members collapsed into a single `CameraInput::deprecated`; scoped to the name rather than the file so a moved path cannot make this pass vacuously)", "sql": "SELECT COUNT(*) FROM functions WHERE name='OHOS::CameraStandard::CameraInput::LockForControl'", "cmp": "exact", "value": 1},
         {"name": "`sptr<MovingPhotoManagerProxy>::MakeSptr(...)` constructs its class (#192: moving_photo_proxy.cpp:263 had only the external `sptr::MakeSptr` edge, 0 on the baseline)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN functions c ON c.id = e.caller_fn_id JOIN functions t ON t.id = e.callee_fn_id WHERE c.name='OHOS::CameraStandard::MovingPhotoManagerProxy::CreateMovingPhotoManagerProxy' AND t.name='OHOS::CameraStandard::MovingPhotoManagerProxy::MovingPhotoManagerProxy'", "cmp": "exact", "value": 1},
-        {"name": "UnifiedPipelineThreadpool::Submit reaches the 7 lambdas it binds through std::bind (#250)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN functions f ON f.id=e.caller_fn_id WHERE e.resolution='indirect' AND s.callee_text='std::bind' AND f.name='OHOS::CameraStandard::UnifiedPipelineThreadpool::Submit'", "cmp": "exact", "value": 7}
+        {"name": "UnifiedPipelineThreadpool::Submit reaches the 7 lambdas it binds through std::bind (#250)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN functions f ON f.id=e.caller_fn_id WHERE e.resolution='indirect' AND s.callee_text='std::bind' AND f.name='OHOS::CameraStandard::UnifiedPipelineThreadpool::Submit'", "cmp": "exact", "value": 7},
+        {"name": "grouped member-pointer casts parse in both Camera callback emitters (#246 grouping)", "sql": "SELECT COUNT(*) FROM diagnostics d LEFT JOIN files f ON f.id=d.file_id WHERE d.stage='parse' AND (f.path LIKE '%/camera_napi_event_emitter.h' OR d.message LIKE '%/camera_napi_event_emitter.h' OR d.message LIKE '%/camera_napi_event_emitter.h:%' OR f.path LIKE '%/camera_event_emitter_taihe.h' OR d.message LIKE '%/camera_event_emitter_taihe.h' OR d.message LIKE '%/camera_event_emitter_taihe.h:%')", "cmp": "exact", "value": 0}
       ]
     },
     "ability_runtime": {

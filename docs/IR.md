@@ -4,6 +4,12 @@ How lowering records values, returns, conditions, casts and smart-pointer unwrap
 
 ## Type storage
 
+Member-function pointers carry optional const/ref signature metadata. Parsed
+declarations record it explicitly; missing metadata in coarse or legacy types
+remains conservative. `FnPtr` parameter lists use a trailing `Ellipsis` for a
+declared variadic signature and `Unknown` for unresolved types or coarse open
+signatures. A dependent `Unknown` parameter does not hide later known parameters.
+
 Type tables share immutable `Arc<TypeDesc>` descriptors and typedef alias
 payloads across simultaneously live headers and translation units. Interning
 order, IDs, layouts, and tag-completion state remain local to each table;
@@ -50,6 +56,9 @@ merge-only indexes after the last merge and before the shared finalization
 steps. `Program::release_merge_state` also drops the call-name interning lookup;
 finalization may rebuild it, so the terminal builder clears it again after the
 last call is created. Call records retain ownership of their shared names.
+Reference-return category metadata remains available through PAG construction
+and solving, where callable signature checks restore the reference layer. It
+is released with flow facts by `Program::release_flow` after their last consumer.
 With explicit images, idle indexing workers return freed lexer/AST
 pages before scoped copies are built on glibc. Consumed linked-unit vectors
 drop immediately after image merging,
@@ -117,7 +126,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
 | `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
 | `CallReturn { dst, callee_name, caller }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer) | `p = GetOps()`; `void *g = GetOps();` |
-| `CallReturnResolved { dst, callee }` | return from an exact selected function | post-merge file-scope getter return |
+| `CallReturnResolved { dst, callee }` | return from an exact selected function | selected free arrow-star overload or post-merge file-scope getter return |
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
 | `StringConst { dst, value }` | `dst` points at a string literal | `p = "target"`; `dlsym(h, "target")` |
@@ -168,7 +177,10 @@ stores through the getter's returned reference reach that cell too.
 Free reference getters use the same signature-preserving path. No file-scope
 call site or synthetic caller is introduced.
 Default argument expressions retain their declaration scope and source mappings
-as function metadata through header imports and merge. A file-scope reference
+as function metadata through header imports and merge. Deferred defaults and
+member initializers capture the original preprocessed spelling at the parser's
+preserved byte offsets, so reparsing retains member-pointer operators and other
+syntax adapted for the grammar. A file-scope reference
 getter instantiates only omitted defaults for the selected declaration, then
 binds their values or original reference-cell addresses alongside explicit
 actuals. Explicit arguments suppress the corresponding defaults.
@@ -703,6 +715,11 @@ through and passes. `*x` goes through the value `x` holds, computed as a value
 - A conditional, assignment or comma operand uses its cached compound value
   before the dereference, for reads, stores and arguments alike; see
   [Conditional values](#conditional-values).
+- An ordinary array element uses the array summary's value with the element's
+  type, so `*table[i]` loads through the pointer stored in the table. Callable
+  elements use the ordinary table load, which preserves initializer functions
+  without copying the array's storage address into the callable value. An
+  element reached through a pointer instead loads through that pointer.
 - A call's result, for a direct call by plain name (`*f()`) or a call through
   a function-pointer data member (`*h->cb()`). A method's result is not
   modeled, so `*obj->Get()` has no value.

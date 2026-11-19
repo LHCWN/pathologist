@@ -139,7 +139,31 @@ other store.
 
 Wrong-type pointer casts put unrelated objects into a pointer's points-to; a store through such a pointer would otherwise write callback addresses into alien layouts, where later field loads surface them as bogus indirect-call targets. The solver therefore filters **function values only** (all non-function flow stays unfiltered, preserving soundness):
 
-- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it (`slot_guard_for`): `FnPtr` slots — a fn-pointer field (`FnPtr`) or variable (`Ptr(FnPtr)`) — require the same parameter count; an array takes its element's guard, a multi-dimensional one its leaf element's: a table of fn pointers keeps their arity, a table of untyped pointers (`void *ops[]`) or of scalars (`long v[4]`) stays writable as its element does, and an array of structs or scalar pointers rejects fn values; other concrete non-fn-pointer cells (`struct`, scalar-pointer, union) reject all fn values; unknown/untyped cells, `void *` included, stay writable (a dlsym-style `GetSymbol(name, void **out)` stores a function there).
+- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it (`slot_guard_for`): `FnPtr` slots — a fn-pointer field (`FnPtr`) or variable (`Ptr(FnPtr)`) — with a recorded fixed signature require the same known parameter count.
+  An empty parameter list is a known zero-argument signature and requires
+  arity zero; a function with genuinely unknown arity remains admissible.
+  Static members use their explicit parameter count, excluding any lowered
+  receiver slot, when matching an ordinary callable slot.
+  C++ callable declarators record their parameters; C callable descriptors
+  remain coarse, even when their source spells a parameter list, and therefore
+  impose no fixed-arity guard. A leading class-pointer parameter in an ordinary callback does not exempt the
+  slot. A trailing `Unknown` parameter denotes an open variadic/pack signature,
+  so it imposes no fixed-arity storage guard, including through pointer and
+  array slots. Field-access filtering uses the same fixed/open arity policy:
+  open callable fields admit every arity, while non-callable fields remain
+  excluded from function-value projection. Explicit `MemberPointer` descriptors
+  retain their values through field-cell loads/stores and check their signature
+  at invocation; they do not use the GEP shortcut for ordinary function locations. Reinterpreting casts carry
+  function values through separate abstract locations with the same `FnId`
+  and link target, exempting only those values from storage arity checks;
+  invoking such a value checks the cast's callable signature. Restoring the
+  original signature therefore recovers a round trip through differently typed
+  storage without weakening ordinary function locations' guards. Callable casts
+  in array initializers use the same value lowering before copying into the
+  array summary. Casts inside aggregate array elements use typed field stores;
+  publishing an ordinary `ArrayFnMember` would lose reinterpretation before a
+  restoring cast could read the element. Uncast function-address tables retain
+  their existing per-array summary. An array takes its element's guard, a multi-dimensional one its leaf element's: a table of fn pointers keeps their arity, a table of untyped pointers (`void *ops[]`) or of scalars (`long v[4]`) stays writable as its element does, and an array of structs or scalar pointers rejects fn values; other concrete non-fn-pointer cells (`struct`, scalar-pointer, union) reject all fn values; unknown/untyped cells, `void *` included, stay writable (a dlsym-style `GetSymbol(name, void **out)` stores a function there).
 - The same guard applies when `merge_memory_into` lifts cell contents into points-to sets — to **function values only**, exactly as on the store path: a load through a `NotFnPtr` cell (declared pointer, `struct`, `union`, an array of those) returns every non-function value stored there. (Before #127 the load applied the guard to every value, so such cells yielded nothing — e.g. `viaload = *pp` with `int **pp` lost `&g`.) The guard also applies when a `Gep` passes fn values from the base node's set into the field node — except registered `array_fn_members` table members, which always pass (see "Arrays and function-pointer tables").
 
 Consequence: callbacks stored through correctly-typed ops assignments resolve exactly as before, while cross-signature leaks (e.g. a 2-param `AddService` callback surfacing at 4-param `Dispatch` sites) are cut. Documented imprecision: old-style casts that stash fn pointers in `void *`-typed cells then call them through typed loads still work (unknown cells accept everything), but calls through cells whose declared type is structurally wrong for the stored fn are no longer reported.
@@ -172,6 +196,11 @@ Lazily created *field* cells get no slot guard: their recorded type can be anoth
 Before #127 the two representations were disjoint, and both idioms lost all flow. The pointer seed had also hidden a missed field-summary join, keyed by declaration since (see "Field sensitivity"); what that cost on the corpora and how it was recovered is in [EVAL_REPORT.md](EVAL_REPORT.md), "Pointer cells and `&x` arguments".
 
 **Propagation without per-step allocation**
+
+Copy propagation checks cast-specific destinations only when the PAG contains
+reinterpretation nodes. That path reads copy indices in place and reuses
+`Scratch::reinterpret_values`, filled in the source delta's order. The ordinary
+copy path does not scan destinations for casts when the set is empty.
 
 Every propagation step used to allocate. A fresh vector of newly-added
 locations per propagate/merge call; a clone of a location's entire holder set
@@ -457,6 +486,15 @@ occupants of the "no target" indirect bucket.
 When a call edge is created (direct or indirect), actuals are connected to callee formals:
 
 - **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types). Callback-pointer chains retain this persistent edge at every depth, including reference-return addresses that arrive through copies after initial parameter wiring.
+- **Opaque pointer arguments** (`void *`) use the same persistent copies for
+  actual/formal pairs whose pointees can carry callbacks: function-pointer slots,
+  aggregates, unknown or erased types. A known scalar-buffer pointee on either
+  side (`char *`, `int *`, other sized values) retains the existing snapshot
+  behavior instead of adding a persistent copy. Both function values and addresses of their
+  storage slots must propagate when they arrive after initial call wiring:
+  `void *p = (void *)&cb; put(p)` must let `put` write into `cb` just as passing
+  the cast directly does. Member-pointer slot pointees (`M *out`) use these
+  copies too. The usual memory-cell guards still apply to subsequent stores.
 - **Function identifiers** passed as fn-ptr args → `add_pts(formal, fn_loc)`
 - **Parameter packs** (`Args &&...args`, `args...`): a pack formal takes every actual from its position on, and a pack expansion serves every formal from its position on ([Variadic parameter packs](#variadic-parameter-packs))
 - **Dereferenced arguments** (`f(*x)`) pass what [Dereferenced operands](IR.md#dereferenced-operands) gives the parameter kind
@@ -474,6 +512,10 @@ Return-value flow affects **points-to** (what a call expression assigns), not ar
 
 ### Variadic parameter packs
 
+Debug builds check that pack positions are sorted, unique and within the
+parameter list before explicit-type lookup or argument wiring. Wiring also
+checks that each recorded pack slot names a lowered pack variable.
+
 A parameter pack (`Args &&...args`, `Args... args`) takes any number of
 arguments, and a pack expansion (`args...`, `std::forward<Args>(args)...`)
 passes any number. Neither is a position, so the analysis treats a pack as
@@ -486,11 +528,12 @@ section is the authoritative statement of the rule; lowering
 is added: the wiring is the ordinary actual-to-formal copy of
 [Argument flow](#argument-flow).
 
-- **The pack formal.** A C++ pack is lowered as a formal of its own, the last
-  one, named without its `...`; C's `...` names nothing and is not a formal.
-  The pack variable is in `Program::pack_vars`. `Function::has_pack_param`
-  records it, and `explicit_arity`, in-class prototypes' counts and the
-  explicit parameter types do **not** count it: a call may pass none
+- **The pack formal.** A C++ pack is lowered as a formal of its own, in
+  declaration order, named without its `...`; C's `...` names nothing and is
+  not a formal. The pack variable is in `Program::pack_vars`.
+  `Function::pack_positions` records every explicit pack position (excluding `this`),
+  and `explicit_arity`, in-class prototypes' counts and the
+  explicit parameter types do **not** count packs: a call may pass none
   (`takes_argument_count`).
 - **A pack formal takes every argument from its position on.** At a call, the
   pack formal at position `p` receives the actuals at `p`, `p + 1`, and every
@@ -499,6 +542,16 @@ is added: the wiring is the ordinary actual-to-formal copy of
   variable always counts as able to hold a pointee (`var_may_hold_pointee`),
   whatever its dependent element type lowered to (`Args &&...args` is an
   `int *`), so the copy does not depend on the order the sets grow in.
+  Every declared pack receives that variadic wiring, including packs before
+  another pack. Earlier packs may all be empty, so each formal's first
+  possible actual position omits every preceding pack's synthetic slot.
+- **Parameters after a pack.** A following fixed parameter has no fixed
+  actual position: it may immediately follow an empty pack or move right by
+  any number of elements. It receives every recorded actual from that first
+  possible position on. Parameters before the pack retain their fixed
+  bindings. Declaration signatures skip every pack wherever it occurs;
+  argument-type filtering and ranking use only the known prefix before the first pack,
+  retaining uncertain suffix matches. Member receivers remain at position zero.
 - **An expansion serves every formal from its position on.** An argument that
   is a pack expansion records the value of its pattern at its position
   (`std::forward<Args>(args)` is the same value as `args`) and marks it a pack

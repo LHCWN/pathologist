@@ -6,6 +6,12 @@ use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, Weak};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MemberFunctionQualifiers {
+    pub is_const: bool,
+    pub ref_qualifier: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TypeDesc {
     Void,
@@ -19,6 +25,8 @@ pub enum TypeDesc {
     Double,
     SizeT,
     Unknown,
+    /// Trailing callable parameter marker for a declared C/C++ ellipsis.
+    Ellipsis,
     Ptr(Box<TypeDesc>),
     Array {
         elem: Box<TypeDesc>,
@@ -32,20 +40,96 @@ pub enum TypeDesc {
         name: String,
         fields: Vec<(String, TypeDesc)>,
     },
+    /// Pointer to a non-static class member. The member type distinguishes
+    /// a function (FnPtr, including its owner slot) from a data member,
+    /// including data members whose values are themselves function pointers.
+    MemberPointer {
+        /// The owner names an active template parameter, even if a class shadows it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        owner_dependent: bool,
+        owner: String,
+        is_function: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        qualifiers: Option<MemberFunctionQualifiers>,
+        member: Box<TypeDesc>,
+    },
     FnPtr {
         ret: Box<TypeDesc>,
+        /// Empty is a known zero-argument signature. A trailing Unknown
+        /// leaves arity open; [Unknown] also represents a coarse signature.
+        /// Ellipsis marks a declared variadic tail with a required fixed prefix.
         params: Vec<TypeDesc>,
     },
 }
 
 impl TypeDesc {
+    /// Fixed ordinary function-pointer arity. An Unknown or Ellipsis tail leaves arity
+    /// open; an empty list is the known zero-argument signature. Other type
+    /// categories have no ordinary callable arity.
+    pub fn fixed_fn_ptr_arity(&self) -> Option<usize> {
+        match self {
+            Self::FnPtr { params, .. }
+                if !matches!(params.last(), Some(Self::Unknown | Self::Ellipsis)) =>
+            {
+                Some(params.len())
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_pointer_like(&self) -> bool {
-        matches!(self, TypeDesc::Ptr(_) | TypeDesc::FnPtr { .. })
+        matches!(
+            self,
+            TypeDesc::Ptr(_) | TypeDesc::FnPtr { .. } | TypeDesc::MemberPointer { .. }
+        )
     }
 
     pub fn pointee(&self) -> Option<&TypeDesc> {
         match self {
             TypeDesc::Ptr(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    /// A callable signature under ordinary pointer layers, or inside a
+    /// member-function pointer. A data-member pointer needs an object and a
+    /// member load before its value can be called, even if that value is callable.
+    pub fn callable_signature(&self) -> Option<&TypeDesc> {
+        match self.innermost().0 {
+            signature @ Self::FnPtr { .. } => Some(signature),
+            Self::MemberPointer {
+                is_function: true,
+                member,
+                ..
+            } => member.callable_signature(),
+            _ => None,
+        }
+    }
+
+    pub fn member_pointer(&self) -> Option<(&str, &TypeDesc)> {
+        match self {
+            Self::MemberPointer { owner, member, .. } => Some((owner, member)),
+            Self::Ptr(inner) | Self::Array { elem: inner, .. } => inner.member_pointer(),
+            _ => None,
+        }
+    }
+
+    pub fn is_member_function_pointer(&self) -> bool {
+        match self {
+            Self::MemberPointer { is_function, .. } => *is_function,
+            Self::Ptr(inner) | Self::Array { elem: inner, .. } => {
+                inner.is_member_function_pointer()
+            }
+            _ => false,
+        }
+    }
+
+    pub fn member_function_qualifiers(&self) -> Option<MemberFunctionQualifiers> {
+        match self {
+            Self::MemberPointer { qualifiers, .. } => *qualifiers,
+            Self::Ptr(inner) | Self::Array { elem: inner, .. } => {
+                inner.member_function_qualifiers()
+            }
             _ => None,
         }
     }
@@ -66,14 +150,14 @@ impl TypeDesc {
     }
 
     /// `a` and `b` with the pointer layers both carry stripped, stopping
-    /// where either is no longer a pointer: `T **` beside `U *` is
-    /// `T *` beside `U`.
+    /// where either is no longer an ordinary pointer: `T **` beside `U *`
+    /// is `T *` beside `U`. Member-pointer owners and categories are retained.
     pub fn strip_common_pointers<'a>(
         a: &'a TypeDesc,
         b: &'a TypeDesc,
     ) -> (&'a TypeDesc, &'a TypeDesc) {
         let (mut x, mut y) = (a, b);
-        while let (Some(px), Some(py)) = (x.pointee(), y.pointee()) {
+        while let (Self::Ptr(px), Self::Ptr(py)) = (x, y) {
             (x, y) = (px, py);
         }
         (x, y)
@@ -1759,6 +1843,7 @@ fn desc_has_named_tag(desc: &TypeDesc) -> bool {
     match desc {
         TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => !name.is_empty(),
         TypeDesc::Ptr(inner) | TypeDesc::Array { elem: inner, .. } => desc_has_named_tag(inner),
+        TypeDesc::MemberPointer { member, .. } => desc_has_named_tag(member),
         TypeDesc::FnPtr { ret, params } => {
             desc_has_named_tag(ret) || params.iter().any(desc_has_named_tag)
         }
@@ -1776,7 +1861,9 @@ fn compute_layout(desc: &TypeDesc, table: &mut TypeTable) -> (u64, u64, TypeLayo
         | TypeDesc::LongLong
         | TypeDesc::Double
         | TypeDesc::SizeT
-        | TypeDesc::Unknown => (8, 8, TypeLayout::default()),
+        | TypeDesc::Unknown
+        | TypeDesc::Ellipsis => (8, 8, TypeLayout::default()),
+        TypeDesc::MemberPointer { .. } => (8, 8, TypeLayout::default()),
         TypeDesc::Ptr(_) | TypeDesc::FnPtr { .. } => (8, 8, TypeLayout::default()),
         TypeDesc::Array { elem, size } => {
             let (elem_size, elem_align, _) = compute_layout(elem, table);
@@ -1975,6 +2062,28 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
         | (TypeDesc::Array { elem: x, .. }, TypeDesc::Array { elem: y, .. }) => {
             may_name_same_type(x, y)
         }
+        (
+            TypeDesc::MemberPointer {
+                owner_dependent: dx,
+                owner: x,
+                is_function: fx,
+                member: mx,
+                qualifiers: qx,
+            },
+            TypeDesc::MemberPointer {
+                owner_dependent: dy,
+                owner: y,
+                is_function: fy,
+                member: my,
+                qualifiers: qy,
+            },
+        ) => {
+            dx == dy
+                && qx.zip(*qy).is_none_or(|(a, b)| a == b)
+                && same_or_requalified(x, y)
+                && fx == fy
+                && may_name_same_type(mx, my)
+        }
         // Units number an anonymous tag each their own way (`anon_4`,
         // `anon_9`): its fields say whether two are one type.
         (TypeDesc::Struct { name: x, .. }, TypeDesc::Struct { name: y, .. })
@@ -1987,12 +2096,17 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
         | (TypeDesc::Union { name: x, .. }, TypeDesc::Union { name: y, .. }) => {
             same_or_requalified(x, y)
         }
-        // A declarator's parameter list is not always lowered into the type;
-        // two lists that are both there must agree.
+        // An Unknown tail leaves arity open, but every fixed prefix must
+        // agree. An empty list is a known zero-argument signature.
         (TypeDesc::FnPtr { params: x, .. }, TypeDesc::FnPtr { params: y, .. }) => {
-            x.is_empty()
-                || y.is_empty()
-                || (x.len() == y.len() && x.iter().zip(y).all(|(x, y)| may_name_same_type(x, y)))
+            let (xp, yp) = (
+                x.strip_suffix(&[TypeDesc::Unknown]),
+                y.strip_suffix(&[TypeDesc::Unknown]),
+            );
+            let (xf, yf) = (xp.unwrap_or(x), yp.unwrap_or(y));
+            (xp.is_some() || xf.len() >= yf.len())
+                && (yp.is_some() || yf.len() >= xf.len())
+                && xf.iter().zip(yf).all(|(x, y)| may_name_same_type(x, y))
         }
         _ => same_type_shape_inner(a, b, true),
     }
@@ -2164,6 +2278,28 @@ fn same_type_shape_inner(a: &TypeDesc, b: &TypeDesc, unresolved_matches: bool) -
     match (a, b) {
         (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) if unresolved_matches => true,
         (TypeDesc::Ptr(x), TypeDesc::Ptr(y)) => same_type_shape_inner(x, y, unresolved_matches),
+        (
+            TypeDesc::MemberPointer {
+                owner_dependent: dx,
+                owner: x,
+                is_function: fx,
+                member: mx,
+                qualifiers: qx,
+            },
+            TypeDesc::MemberPointer {
+                owner_dependent: dy,
+                owner: y,
+                is_function: fy,
+                member: my,
+                qualifiers: qy,
+            },
+        ) => {
+            dx == dy
+                && (qx == qy || (unresolved_matches && (qx.is_none() || qy.is_none())))
+                && x.trim_start_matches("::") == y.trim_start_matches("::")
+                && fx == fy
+                && same_type_shape_inner(mx, my, unresolved_matches)
+        }
         (TypeDesc::Array { elem: x, size: sx }, TypeDesc::Array { elem: y, size: sy }) => {
             same_array_extent(*sx, *sy) && same_type_shape_inner(x, y, unresolved_matches)
         }
@@ -3220,6 +3356,37 @@ mod tests {
     }
 
     #[test]
+    fn callable_type_matching_preserves_fixed_prefix_and_empty_arity() {
+        let callable = |params: &[TypeDesc]| TypeDesc::FnPtr {
+            ret: Box::new(TypeDesc::Void),
+            params: params.to_vec(),
+        };
+        use TypeDesc::{Double, Int, Unknown};
+        for (a, b, expected) in [
+            (vec![], vec![], true),
+            (vec![], vec![Int], false),
+            (vec![], vec![Unknown], true),
+            (vec![], vec![Int, Unknown], false),
+            (vec![Int], vec![Unknown], true),
+            (vec![Int], vec![Int, Unknown], true),
+            (vec![Int, Double], vec![Int, Unknown], true),
+            (vec![Int, Unknown], vec![Double, Unknown], false),
+            (vec![Int, Unknown], vec![Int, Double, Unknown], true),
+        ] {
+            assert_eq!(
+                may_name_same_type(&callable(&a), &callable(&b)),
+                expected,
+                "{a:?} / {b:?}"
+            );
+            assert_eq!(
+                may_name_same_type(&callable(&b), &callable(&a)),
+                expected,
+                "{b:?} / {a:?}"
+            );
+        }
+    }
+
+    #[test]
     fn anonymous_tags_units_number_differently_may_name_one_type() {
         // `typedef struct { float v; } Info;` is `anon_4` in one unit and
         // `anon_9` in another: one type, compared by its fields.
@@ -3299,5 +3466,81 @@ mod tests {
     fn type_info_and_layout_sizes() {
         assert_eq!(std::mem::size_of::<TypeLayout>(), 8);
         assert_eq!(std::mem::size_of::<TypeInfo>(), 40);
+    }
+}
+
+#[cfg(test)]
+mod member_pointer_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_pointer_traversal_retains_member_pointer_boundaries() {
+        let callable = TypeDesc::FnPtr {
+            ret: Box::new(TypeDesc::Void),
+            params: vec![TypeDesc::Int],
+        };
+        for (is_function, member) in [
+            (false, TypeDesc::Int),
+            (
+                false,
+                TypeDesc::Struct {
+                    name: "Value".into(),
+                    fields: vec![],
+                },
+            ),
+            (
+                false,
+                TypeDesc::Array {
+                    elem: Box::new(TypeDesc::Int),
+                    size: Some(2),
+                },
+            ),
+            (false, callable.clone()),
+            (true, callable.clone()),
+        ] {
+            let pointer = TypeDesc::MemberPointer {
+                qualifiers: None,
+                owner_dependent: false,
+                owner: "Owner".into(),
+                is_function,
+                member: Box::new(member),
+            };
+            assert!(pointer.is_pointer_like());
+            assert_eq!(pointer.pointee(), None);
+            assert_eq!(pointer.innermost(), (&pointer, 0));
+            assert_eq!(
+                pointer.callable_signature(),
+                is_function.then_some(&callable)
+            );
+            let address = TypeDesc::Ptr(Box::new(pointer.clone()));
+            assert_eq!(address.pointee(), Some(&pointer));
+            assert_eq!(address.innermost(), (&pointer, 1));
+            assert_eq!(
+                address.callable_signature(),
+                is_function.then_some(&callable)
+            );
+        }
+        assert_eq!(callable.callable_signature(), Some(&callable));
+    }
+
+    #[test]
+    fn member_pointer_identity_keeps_owner_category_and_member_type() {
+        let member = |owner: &str, is_function, ty| TypeDesc::MemberPointer {
+            qualifiers: None,
+            owner_dependent: false,
+            owner: owner.into(),
+            is_function,
+            member: Box::new(ty),
+        };
+        let a = member("A", false, TypeDesc::Int);
+        for other in [
+            member("B", false, TypeDesc::Int),
+            member("A", true, TypeDesc::Int),
+            member("A", false, TypeDesc::Double),
+        ] {
+            assert!(!may_name_same_type(&a, &other));
+            assert!(!same_type_shape(&a, &other));
+        }
+        assert!(may_name_same_type(&a, &member("::A", false, TypeDesc::Int)));
     }
 }
