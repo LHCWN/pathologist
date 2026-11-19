@@ -2075,6 +2075,101 @@ fn unevaluated_operands_prove_no_order() {
     assert_eq!(relation(&conn, &counted, &after), MayPrecede);
 }
 
+#[test]
+fn nested_macro_subscripts_have_distinct_sequencing_sites() {
+    let root = fixture("cpp_vector_elements");
+    let program = sequenced(&root, default_opts(&root));
+    let [cfg] = cfgs_named(&program, "nested_macro_subscripts")
+        .try_into()
+        .unwrap();
+    let sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            site.caller == cfg.function && site.callee_name.as_str() == "std::vector::operator[]"
+        })
+        .collect();
+    let [first, second] = sites.as_slice() else {
+        panic!("expected two subscript occurrences")
+    };
+    assert_eq!(
+        (first.span, first.expansion_span),
+        (second.span, second.expansion_span)
+    );
+    let occurrence_id = |site: &trace_ir::CallSite| {
+        site.details
+            .as_ref()
+            .unwrap()
+            .occurrence
+            .unwrap()
+            .expansion_id
+    };
+    assert_ne!(occurrence_id(first), occurrence_id(second));
+    let indexed: Vec<_> = cfg
+        .events
+        .iter()
+        .flat_map(|event| &event.sites)
+        .filter(|site| **site == first.id || **site == second.id)
+        .copied()
+        .collect();
+    assert_eq!(indexed, [first.id, second.id]);
+}
+
+#[test]
+fn modeled_subscripts_are_kept_in_unevaluated_gaps() {
+    let root = fixture("cpp_vector_elements");
+    let program = sequenced(&root, default_opts(&root));
+    let (_, analysis) = trace_analysis::analyze(&program);
+    let [cfg] = cfgs_named(&program, "unevaluated_subscripts")
+        .try_into()
+        .unwrap();
+    let sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            site.caller == cfg.function
+                && matches!(
+                    site.callee_name.as_str(),
+                    "std::vector::operator[]" | "subscript_index"
+                )
+        })
+        .collect();
+    assert_eq!(sites.len(), 3);
+    assert_eq!(
+        sites
+            .iter()
+            .filter(|site| site.callee_name.as_str() == "std::vector::operator[]")
+            .count(),
+        2
+    );
+    for site in sites {
+        assert!(site.unevaluated);
+        assert!(!analysis
+            .call_edges
+            .iter()
+            .any(|edge| edge.call_site == site.id));
+        let event = cfg
+            .events
+            .iter()
+            .position(|event| event.sites.contains(&site.id))
+            .unwrap();
+        assert!(cfg.gaps.iter().any(|gap| {
+            gap.kind == trace_ir::GapKind::Unevaluated
+                && gap.events.is_some_and(|(first, last)| {
+                    first.0 as usize <= event && event <= last.0 as usize
+                })
+        }));
+    }
+    assert!(!program.flow.iter().any(|flow| match flow {
+        trace_ir::FlowConstraint::ContainerElement { dst, .. } => {
+            program.symbols.variable(*dst).fn_id == Some(cfg.function)
+        }
+        _ => false,
+    }));
+}
+
 /// Lowering tags the calls of an operand the language never evaluates and
 /// emits no call for an operator spelled like one (`noexcept(e)`,
 /// `typeid(e)`, C `__typeof__(e)`): an unevaluated call has no call edge,

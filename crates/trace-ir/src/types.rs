@@ -2,6 +2,7 @@ use crate::{FieldId, TypeId};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, Weak};
@@ -390,6 +391,7 @@ pub struct InitializerAlias {
     pub reference: Option<bool>,
     pub qualification: CvQualification,
     pub callable_reference: bool,
+    pub type_spelling: Option<Arc<str>>,
 }
 
 /// A namespace or file-scope using declaration visible to a member initializer.
@@ -577,6 +579,46 @@ pub struct FieldQualification {
     pub is_reference: bool,
 }
 
+type ContainerMembers = BTreeMap<String, BTreeMap<String, BTreeSet<usize>>>;
+
+/// A modeled container's declared type default, with dependencies on earlier
+/// type arguments recorded by position.
+#[derive(Debug, Clone)]
+pub enum ContainerTemplateDefault {
+    Type(String),
+    Parameter(usize),
+    Template {
+        head: String,
+        arguments: Vec<ContainerTemplateDefault>,
+    },
+}
+
+impl ContainerTemplateDefault {
+    pub fn bind(&self, written: &[String]) -> Option<String> {
+        match self {
+            Self::Type(spelling) => Some(spelling.clone()),
+            Self::Parameter(position) => written.get(*position).cloned(),
+            Self::Template { head, arguments } => {
+                let args = arguments
+                    .iter()
+                    .map(|arg| arg.bind(written))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(format!("{head}<{}>", args.join(",")))
+            }
+        }
+    }
+}
+
+pub type ContainerTemplateDefaults = BTreeMap<usize, Arc<ContainerTemplateDefault>>;
+
+#[derive(Debug, Clone, Default)]
+struct ContainerSpecializations {
+    owners: BTreeSet<Arc<str>>,
+    /// The prefix fixes all but a trailing list of unconstrained parameters.
+    partial_owners: BTreeMap<String, Arc<str>>,
+    defaults: BTreeMap<String, ContainerTemplateDefaults>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeTable {
     /// Every C++ class name a specifier declared, forward declarations
@@ -614,6 +656,15 @@ pub struct TypeTable {
     /// because lowering sees bare identifiers (`fn_t`, `SHandle`) whose
     /// pointer-ness is otherwise lost (they degrade to `Int`).
     aliases: IndexMap<String, Arc<TypeDesc>, FxBuildHasher>,
+    /// C++ alias syntax distinguishes types that have the same flow shape.
+    alias_type_spellings: FxHashMap<String, Arc<str>>,
+    /// Type arguments lowered where a specialization is declared. The key
+    /// includes the canonical argument spelling and survives a header merge.
+    template_element_types: FxHashMap<String, (Arc<TypeDesc>, CvQualification)>,
+    container_specializations: Option<Box<ContainerSpecializations>>,
+    /// Modeled member/arity pairs from cached header declarations. Kept with
+    /// types so a types-only import can validate access and insertion effects.
+    container_members: Option<Box<ContainerMembers>>,
     /// Hashes of the last `::` segment of every alias name. A spelling whose
     /// last segment is absent here names no alias in any scope, which lets
     /// lowering skip a scope walk for most call names. Unlike the symbol
@@ -636,7 +687,7 @@ pub struct TypeTable {
     reference_callable_aliases: FxHashSet<String>,
     reference_callable_fields: FxHashMap<String, FxHashSet<String>>,
     integer_enums: SharedNames,
-    integer_enumerators: SharedNames,
+    integer_enumerators: SharedNames<Option<Arc<str>>>,
     /// Each class's own constructor declaration metadata needed by types-only
     /// header imports, before constructor symbols merge into a translation unit.
     user_provided_ctors: FxHashSet<String>,
@@ -683,6 +734,10 @@ impl TypeTable {
             canonical: CanonicalCache::default(),
             union_epoch: 0,
             aliases: IndexMap::default(),
+            alias_type_spellings: FxHashMap::default(),
+            template_element_types: FxHashMap::default(),
+            container_specializations: None,
+            container_members: None,
             alias_leaves: FxHashSet::default(),
             reference_aliases: FxHashSet::default(),
             rvalue_reference_aliases: FxHashSet::default(),
@@ -1071,6 +1126,7 @@ impl TypeTable {
         if !alias.is_empty() {
             let shared = self.descriptors.share(desc);
             self.aliases.insert(alias.to_string(), shared);
+            self.alias_type_spellings.remove(alias);
             self.alias_leaves.insert(alias_leaf_hash(alias));
             if reference {
                 self.reference_aliases.insert(alias.to_owned());
@@ -1084,6 +1140,15 @@ impl TypeTable {
                 self.rvalue_reference_aliases.remove(alias);
             }
         }
+    }
+
+    pub fn set_alias_type_spelling(&mut self, alias: &str, spelling: &Arc<str>) {
+        self.alias_type_spellings
+            .insert(alias.to_owned(), Arc::clone(spelling));
+    }
+
+    pub fn alias_type_spelling(&self, alias: &str) -> Option<&Arc<str>> {
+        self.alias_type_spellings.get(alias)
     }
 
     /// Whether a callable alias returns a reference, independently of the
@@ -1130,16 +1195,21 @@ impl TypeTable {
 
     /// Unscoped enum tags admit built-in integer offsets; scoped enums and
     /// unknown/class spellings do not. This does not change their type shape.
-    pub fn note_integer_enumerator(&mut self, name: String) {
-        self.integer_enumerators.insert(name);
+    pub fn note_integer_enumerator(&mut self, name: String, tag: Option<Arc<str>>) {
+        self.integer_enumerators.insert(name, tag);
     }
 
     pub fn is_integer_enumerator(&self, name: &str) -> bool {
         self.integer_enumerators.contains(name)
     }
 
+    /// The tag of a known enumerator, if its enum has a name.
+    pub fn integer_enumerator_tag(&self, name: &str) -> Option<Option<&str>> {
+        self.integer_enumerators.get(name).map(Option::as_deref)
+    }
+
     pub fn note_integer_enum(&mut self, name: String) {
-        self.integer_enums.insert(name);
+        self.integer_enums.insert(name, ());
     }
 
     pub fn is_integer_enum(&self, name: &str) -> bool {
@@ -1318,6 +1388,104 @@ impl TypeTable {
         self.aliases.get(alias).map(Arc::as_ref)
     }
 
+    pub fn register_template_element(
+        &mut self,
+        specialization: &str,
+        element: TypeDesc,
+        cv: CvQualification,
+    ) {
+        if !self.template_element_types.contains_key(specialization) {
+            self.template_element_types.insert(
+                specialization.to_owned(),
+                (self.descriptors.share(&element), cv),
+            );
+        }
+    }
+
+    pub fn template_element(&self, specialization: &str) -> Option<&TypeDesc> {
+        self.template_element_types
+            .get(specialization)
+            .map(|(element, _)| element.as_ref())
+    }
+
+    pub fn template_element_cv(&self, specialization: &str) -> Option<CvQualification> {
+        self.template_element_types
+            .get(specialization)
+            .map(|(_, cv)| *cv)
+    }
+
+    pub fn note_container_specialization(&mut self, owner: &str, partial_prefix: Option<String>) {
+        let specializations = self
+            .container_specializations
+            .get_or_insert_with(Default::default);
+        let owner: Arc<str> = owner.into();
+        specializations.owners.insert(owner.clone());
+        if let Some(prefix) = partial_prefix {
+            specializations
+                .partial_owners
+                .entry(prefix)
+                .or_insert(owner);
+        }
+    }
+
+    pub fn container_partial_owner(&self, prefix: &str) -> Option<&str> {
+        self.container_specializations
+            .as_ref()?
+            .partial_owners
+            .get(prefix)
+            .map(AsRef::as_ref)
+    }
+
+    pub fn container_partial_owners(&self) -> impl Iterator<Item = (&String, &Arc<str>)> {
+        self.container_specializations
+            .iter()
+            .flat_map(|specializations| specializations.partial_owners.iter())
+    }
+
+    pub fn note_container_template_default(
+        &mut self,
+        class: &str,
+        position: usize,
+        default: ContainerTemplateDefault,
+    ) {
+        self.container_specializations
+            .get_or_insert_with(Default::default)
+            .defaults
+            .entry(class.to_owned())
+            .or_default()
+            .entry(position)
+            .or_insert_with(|| Arc::new(default));
+    }
+
+    pub fn container_template_defaults(&self, class: &str) -> Option<&ContainerTemplateDefaults> {
+        self.container_specializations.as_ref()?.defaults.get(class)
+    }
+
+    pub fn container_specialization_owners(&self) -> impl Iterator<Item = &str> {
+        self.container_specializations
+            .iter()
+            .flat_map(|specializations| specializations.owners.iter())
+            .map(AsRef::as_ref)
+    }
+
+    pub fn note_container_member(&mut self, class: String, method: String, arity: usize) {
+        self.container_members
+            .get_or_insert_with(Default::default)
+            .entry(class)
+            .or_default()
+            .entry(method)
+            .or_default()
+            .insert(arity);
+    }
+
+    pub fn has_container_member(&self, class: &str, method: &str, arity: usize) -> bool {
+        self.container_members
+            .as_ref()
+            .and_then(|classes| classes.get(class))
+            .and_then(|members| members.get(method))
+            .is_some_and(|arities| arities.contains(&arity))
+    }
+
     pub fn all_aliases(&self) -> &IndexMap<String, Arc<TypeDesc>, FxBuildHasher> {
         &self.aliases
     }
@@ -1342,6 +1510,8 @@ impl TypeTable {
         }
         self.types.shrink_to_fit();
         self.aliases.shrink_to_fit();
+        self.alias_type_spellings.shrink_to_fit();
+        self.template_element_types.shrink_to_fit();
         // Only lowering asks; a merge rebuilds the destination's from its names.
         self.alias_leaves = FxHashSet::default();
         self.reference_aliases.shrink_to_fit();
@@ -1668,6 +1838,42 @@ impl TypeTable {
         }
         extend_missing(&mut self.defined_structs, &other.defined_structs);
         extend_missing(&mut self.guessed_tags, &other.guessed_tags);
+        for (specialization, element) in &other.template_element_types {
+            if !self.template_element_types.contains_key(specialization) {
+                self.template_element_types
+                    .insert(specialization.clone(), element.clone());
+            }
+        }
+        if let Some(specializations) = &other.container_specializations {
+            let dest = self
+                .container_specializations
+                .get_or_insert_with(Default::default);
+            dest.owners.extend(specializations.owners.iter().cloned());
+            for (prefix, owner) in &specializations.partial_owners {
+                if !dest.partial_owners.contains_key(prefix) {
+                    dest.partial_owners.insert(prefix.clone(), owner.clone());
+                }
+            }
+            for (class, defaults) in &specializations.defaults {
+                let known = dest.defaults.entry(class.clone()).or_default();
+                for (&position, default) in defaults {
+                    known.entry(position).or_insert_with(|| Arc::clone(default));
+                }
+            }
+        }
+        if let Some(classes) = &other.container_members {
+            let members = self.container_members.get_or_insert_with(Default::default);
+            for (class, declarations) in classes.iter() {
+                let dest = members.entry(class.clone()).or_default();
+                for (method, arities) in declarations {
+                    if let Some(known) = dest.get_mut(method) {
+                        known.extend(arities);
+                    } else {
+                        dest.insert(method.clone(), arities.clone());
+                    }
+                }
+            }
+        }
         extend_missing(&mut self.user_provided_ctors, &other.user_provided_ctors);
         extend_missing(&mut self.declared_ctors, &other.declared_ctors);
         for (class, provided) in &other.default_ctors {
@@ -1969,7 +2175,9 @@ fn extend_missing<T: Clone + Eq + Hash>(dst: &mut FxHashSet<T>, src: &FxHashSet<
     }
 }
 
-/// A set of names that tables import from one another by sharing.
+type NameLayer<T> = Arc<FxHashMap<Arc<str>, T>>;
+
+/// A table of names that indexes import from one another by sharing.
 ///
 /// A header unit's table is merged into every translation unit that includes
 /// it, and its names are the header's whole include closure: hundreds per
@@ -1982,9 +2190,9 @@ fn extend_missing<T: Clone + Eq + Hash>(dst: &mut FxHashSet<T>, src: &FxHashSet<
 /// another table imported copies the set first, so the importer never sees
 /// later additions.
 #[derive(Clone, Default)]
-struct SharedNames {
-    own: Arc<FxHashSet<Arc<str>>>,
-    imported: Vec<Arc<FxHashSet<Arc<str>>>>,
+struct SharedNames<T = ()> {
+    own: NameLayer<T>,
+    imported: Vec<NameLayer<T>>,
     /// The address of each `imported` layer, so an import asks one set per
     /// layer rather than scanning them all. `imported` keeps every layer
     /// alive, so an address cannot be reused while it is recorded.
@@ -1993,11 +2201,11 @@ struct SharedNames {
 
 /// The names, sorted: layer addresses and set order vary between runs, and a
 /// table's `Debug` output is compared across indexing paths.
-impl std::fmt::Debug for SharedNames {
+impl<T> std::fmt::Debug for SharedNames<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut names: Vec<&str> = std::iter::once(&self.own)
             .chain(&self.imported)
-            .flat_map(|layer| layer.iter().map(|name| name.as_ref()))
+            .flat_map(|layer| layer.keys().map(|name| name.as_ref()))
             .collect();
         names.sort_unstable();
         names.dedup();
@@ -2005,18 +2213,24 @@ impl std::fmt::Debug for SharedNames {
     }
 }
 
-impl SharedNames {
+impl<T: Clone> SharedNames<T> {
     /// Note a name in this table's own set. A name an imported layer already
     /// holds is noted again: membership is unaffected, and the table's own
     /// set stays the complete record of what it declares.
-    fn insert(&mut self, name: String) {
-        if !self.own.contains(name.as_str()) {
-            Arc::make_mut(&mut self.own).insert(name.into());
+    fn insert(&mut self, name: String, value: T) {
+        if !self.own.contains_key(name.as_str()) {
+            Arc::make_mut(&mut self.own).insert(name.into(), value);
         }
     }
 
+    fn get(&self, name: &str) -> Option<&T> {
+        self.own
+            .get(name)
+            .or_else(|| self.imported.iter().find_map(|layer| layer.get(name)))
+    }
+
     fn contains(&self, name: &str) -> bool {
-        self.own.contains(name) || self.imported.iter().any(|layer| layer.contains(name))
+        self.get(name).is_some()
     }
 
     fn import(&mut self, other: &Self) {
@@ -2981,8 +3195,8 @@ mod tests {
     fn merging_enum_names_shares_the_source_layer() {
         let mut header = TypeTable::new();
         header.note_integer_enum("ns::E".to_owned());
-        header.note_integer_enumerator("ns::A".to_owned());
-        header.note_integer_enumerator("ns::E::A".to_owned());
+        header.note_integer_enumerator("ns::A".to_owned(), None);
+        header.note_integer_enumerator("ns::E::A".to_owned(), None);
         let mut dst = TypeTable::new();
         dst.merge_struct_declarations(&header);
         dst.merge_struct_declarations(&header);
@@ -3037,13 +3251,13 @@ mod tests {
     #[test]
     fn enum_name_debug_lists_the_sorted_union() {
         let mut header = TypeTable::new();
-        header.note_integer_enumerator("B".to_owned());
+        header.note_integer_enumerator("B".to_owned(), None);
         let mut merged = TypeTable::new();
-        merged.note_integer_enumerator("A".to_owned());
+        merged.note_integer_enumerator("A".to_owned(), None);
         merged.merge_struct_declarations(&header);
         let mut flat = TypeTable::new();
         for name in ["B", "A"] {
-            flat.note_integer_enumerator(name.to_owned());
+            flat.note_integer_enumerator(name.to_owned(), None);
         }
         assert_eq!(
             format!("{:?}", merged.integer_enumerators),
@@ -3057,14 +3271,14 @@ mod tests {
     #[test]
     fn enum_name_layers_are_snapshots() {
         let mut header = TypeTable::new();
-        header.note_integer_enumerator("A".to_owned());
+        header.note_integer_enumerator("A".to_owned(), None);
         let mut dst = TypeTable::new();
         dst.merge_struct_declarations(&header);
-        header.note_integer_enumerator("B".to_owned());
+        header.note_integer_enumerator("B".to_owned(), None);
         assert!(header.is_integer_enumerator("A") && header.is_integer_enumerator("B"));
         assert!(dst.is_integer_enumerator("A"));
         assert!(!dst.is_integer_enumerator("B"));
-        dst.note_integer_enumerator("C".to_owned());
+        dst.note_integer_enumerator("C".to_owned(), None);
         assert!(dst.is_integer_enumerator("C"));
         assert!(!header.is_integer_enumerator("C"));
     }

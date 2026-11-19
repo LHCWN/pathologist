@@ -3,11 +3,11 @@
 
 Re-analyzes each pinned corpus fresh with the release binary,
 after verifying the checkout is clean and at the revision pinned in
-eval_expected.json (corpus base: --corpus-base, $TRACE_CORPUS_BASE, or ~),
+the selected expectations file (corpus base: --corpus-base, $TRACE_CORPUS_BASE, or ~),
 then asserts:
 
 1. Global metrics (files, functions, call edges by resolution, arg-flow,
-   diagnostics, dlsym PAG edges) against `eval_expected.json`.
+   diagnostics, dlsym PAG edges) against the selected expectations.
    Correctness numbers (diagnostics, dlsym, indirect edges) must match EXACTLY;
    bulk totals (functions/edges/arg-flow) use a tolerance band because the
    parallel index drifts a little between runs.
@@ -32,6 +32,7 @@ Usage:
     python3 scripts/eval_check.py [--bin target/release/trace] [--jobs 8]
         [--budget 800000] [--outdir /tmp/eval_check] [--expected scripts/eval_expected.json]
         [--corpus-base DIR] [--skip-rev-check] [--allow-dirty]
+    python3 scripts/eval_check.py --expected scripts/eval_expected_canonical.json
 """
 
 import argparse
@@ -124,12 +125,12 @@ def checkout_matches(root, spec, skip_rev_check=False, allow_dirty=False):
     return proceed
 
 
-def analyze(trace_bin, corpus, expected, root, outdir, env):
+def analyze(trace_bin, corpus, spec, root, outdir, env, jobs, mode_args):
     db = Path(outdir) / f"eval_check_{corpus}.db"
-    log("info", f"analyzing {expected['name']} -> {db}")
+    log("info", f"analyzing {spec['name']} -> {db}")
     proc = run(
-        [trace_bin, "analyze", str(root), "-o", str(db), "--jobs", str(expected.get("jobs", 8)),
-         *expected.get("analyze_args", [])],
+        [trace_bin, "analyze", str(root), "-o", str(db), "--jobs", str(jobs),
+         *mode_args, *spec.get("analyze_args", [])],
         root, env)
     if proc.returncode != 0 or not db.exists():
         global SETUP_ERRORS
@@ -142,10 +143,11 @@ def analyze(trace_bin, corpus, expected, root, outdir, env):
 def connect(db, relations="raw"):
     """Open `db` on one of its call graphs. A snapshot without `raw_*`
     relations stores its complete graph under the public names, so both
-    graphs read the same rows there."""
+    graphs read the same rows there. Probe paths use forward slashes on all hosts."""
     if relations not in ("raw", "public"):
         raise ValueError(f"unknown relations {relations!r} (want 'raw' or 'public')")
     con = sqlite3.connect(str(db))
+    files_relation = "files"
     if relations == "raw":
         names = relation_types(con)
         missing = REQUIRED_RAW_RELATIONS - names.keys()
@@ -153,9 +155,17 @@ def connect(db, relations="raw"):
             con.close()
             raise ValueError(f"{db}: incomplete raw graph, missing {sorted(missing)}")
         for name in names:
-            if name.startswith("raw_") and not name.startswith("raw_preimage_"):
+            if name == "raw_files":
+                files_relation = name
+            elif name.startswith("raw_") and not name.startswith("raw_preimage_"):
                 alias = quote_identifier(name.removeprefix("raw_"))
                 con.execute(f"CREATE TEMP VIEW {alias} AS SELECT * FROM main.{quote_identifier(name)}")
+    # Expectations use slash-delimited project-relative suffixes on every host.
+    # Keep the original paths on disk and in the qualified main relations.
+    fields = ["replace(path, char(92), '/') AS path" if row[1] == "path" else quote_identifier(row[1])
+              for row in con.execute(f"PRAGMA main.table_info({files_relation})")]
+    if fields:
+        con.execute(f"CREATE TEMP VIEW files AS SELECT {','.join(fields)} FROM main.{files_relation}")
     return con
 
 
@@ -190,7 +200,12 @@ def globals_from_db(db):
 def check_global(name, got, spec):
     global FAILS, CHECKS
     CHECKS += 1
-    want = spec["value"]
+    platform_values = spec.get("platform_values", {})
+    want = platform_values[sys.platform] if sys.platform in platform_values else spec.get("value")
+    if want is None:
+        log("fail", f"{name}: no expectation for platform {sys.platform!r}")
+        FAILS += 1
+        return
     if spec["cmp"] == "exact":
         ok = got == want
         log("ok" if ok else "fail",
@@ -269,8 +284,8 @@ def check_probe(db, probe):
 def main():
     global FAILS, CHECKS
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default="target/release/trace")
-    ap.add_argument("--jobs", type=int, default=8)
+    ap.add_argument("--bin", default="target/release/trace.exe" if os.name == "nt" else "target/release/trace")
+    ap.add_argument("--jobs", type=int, help="override the jobs set in the expectations file (default 8)")
     ap.add_argument("--budget", type=int, default=800000)
     ap.add_argument("--outdir", default="/tmp/eval_check")
     ap.add_argument("--expected", default="scripts/eval_expected.json")
@@ -289,11 +304,12 @@ def main():
         log("fail", f"binary not found: {trace_bin} (build with cargo build --release)")
         sys.exit(2)
 
-    with open(args.expected) as fh:
+    with open(args.expected, encoding="utf-8") as fh:
         expected = json.load(fh)
 
-    outdir = Path(args.outdir)
+    outdir = Path(args.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
+    base = corpus_base(args.corpus_base).resolve()
 
     env = dict(os.environ)
     env["TRACE_SOLVE_BUDGET_POPS"] = str(expected.get("budget_pops", args.budget))
@@ -304,10 +320,11 @@ def main():
         if spec is None:
             log("fail", f"unknown corpus {corpus!r} (have {list(expected['corpora'])})")
             sys.exit(2)
-        root = corpus_base(args.corpus_base) / spec["dir"]
+        root = base / spec["dir"]
         if not checkout_matches(root, spec, args.skip_rev_check, args.allow_dirty):
             continue
-        db = analyze(trace_bin, corpus, spec, root, outdir, env)
+        jobs = args.jobs if args.jobs is not None else spec.get("jobs", expected.get("jobs", 8))
+        db = analyze(trace_bin, corpus, spec, root, outdir, env, jobs, expected.get("analyze_args", []))
         if db is None:
             continue
         log("info", f"== {spec['name']}")

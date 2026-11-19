@@ -1246,7 +1246,7 @@ section is the authoritative statement of the rules; lowering
   so they hide an outer name whatever their type. Copy-initialized, one of
   class type gets the destructor site only. A range naming an array
   variable gives the loop variable its elements, read from the array
-  summary as `x = arr[i]` reads them; containers have no element model.
+  summary as `x = arr[i]` reads them.
   Calls through a loop or catch variable resolve by its type:
   - the declared one (`catch (const std::logic_error &e)`,
     `for (Handler *h : hs)`);
@@ -1275,6 +1275,86 @@ section is the authoritative statement of the rules; lowering
   D() = default; int n; }; D d{{}, 1};` records no `B::B`); the elements a
   partly listed array value-initializes; and copy or move constructors for
   copy-initialized locals.
+
+### Container elements
+
+For a named modeled container or one stored in a data member, lowering binds the
+element type at the template-id using the normal type and declarator rules.
+The specialization key keeps qualified type spellings and expands recorded
+aliases. It normalizes equivalent qualifier positions such as `const int*`
+and `int const*` while preserving distinctions such as `int*` and
+`unsigned int*` even when their element-flow descriptors have the same shape.
+Omitted type arguments take the defaults from the indexed template declaration.
+This makes a default allocator and the same allocator written explicitly share
+one signature, while a distinct allocator keeps its own signature. Supported
+dependent defaults use earlier arguments directly or as arguments of a template
+such as `allocator<T>`. Defaults that need dependent member lookup or apply cv
+qualifiers or a declarator to a dependent parameter are left unresolved.
+Element qualifications also carry into member-call typing through subscript
+and accessor results.
+The [TOML model](MODELS.md#container-element-models) selects the type argument
+and operations for pointer, function-pointer and directly spelled
+`std::function` values. The sequence models cover initializer lists and
+selected insertions, emplacement, and element accessors. Subscript syntax
+also records the `operator[]` call through the normal member-call path.
+Indexed concrete container specializations have distinct member owners.
+Macro-generated subscripts use the bracket's expansion identity for the call
+site and its provenance for filtering element reads and writes.
+Unevaluated subscripts retain a site for sequencing without an element access.
+Braced construction prefers the indexed initializer-list constructor while
+the elements may initialize the modeled element type. A known incompatible
+arithmetic value leaves the ordinary constructor candidates available. List
+conversion checks account for array decay and visible free enum operators.
+Single-value braces can wrap a modeled insertion or an initializer-list element.
+Default member initializers and constructor member initializers store list
+elements in the declaring field's cell each time lowering evaluates them.
+
+The queue model connects `push` and single-argument `emplace` to `front` and
+`back`. Both accessors see the queue's may-set of values. `pop` adds no
+constraints.
+The summary includes values from every index. Replacement, `clear` and erasure
+leave those values reachable.
+
+Separate variable declarations use separate cells. Cross-unit sharing follows
+the ordinary global symbol merge. Instances of a data member share its cell
+within a link target, while different member declarations and element types have
+separate cells. Subscripts on named arrays and pointers can select the object
+that owns the field. Library effects require indexed container member
+declarations. Canonical indexing supplies those declarations through the
+shared prelude. Cached project headers carry the modeled member names and
+arities through types-only imports, so an inline function can use operations
+declared by another project header.
+
+Map models read the mapped slot from braced key/value entries, direct
+`std::make_pair` arguments, and named `std::pair` values initialized from two
+arguments or braced clauses. Named pair reads use the ordinary field summaries
+for their concrete specialization. Copy initialization and assignment between
+named pair specializations propagate pointer and callable values between
+matching fields. Explicit pair specializations use their indexed constructor
+declarations, while ordinary instantiations use the primary template's
+declarations. Braced `insert` calls can store each
+element of a sequence or set list, or the mapped slot from each braced map
+entry. A `find` or `begin`
+result holds the address of its originating
+container's summary cell. Copies and assignments propagate that address, so
+`iter->second` and `(*iter).second` read the mapped values from the containers
+the iterator may refer to. Both spellings preserve the mapped pointer's pointee
+qualification for later member calls. Explicit `iterator` and `const_iterator` types
+also bind the enclosing container's template arguments in declaration scope,
+including a container named through a type alias.
+A branch that tests a failed lookup does not narrow
+those values. Set and unordered-set models connect braced initializers and
+selected insertions to iterators from `find` and `begin`. A local iterator or
+an immediate lookup can read the same cell through `*it`, preserving the
+set's read-only element access.
+
+Follow-ups include container copies, iterator arithmetic and reference
+parameters, range-for value flow, access via pointers or references to the
+container itself, nested containers, and structured bindings. Planned stores
+include fill construction, initializer-list assignment and `assign`, and
+`try_emplace`. Pair projections currently cover named standard pairs and direct
+`std::make_pair` calls. Other pair-producing expressions and lists of typed
+pair expressions are follow-ups.
 
 ### Factory construction
 
