@@ -731,6 +731,185 @@ fn ipc_stub_suffix_handler_fallback() {
 }
 
 #[test]
+fn ipc_host_stub_bridges_proxy_to_host_handlers() {
+    // OpenHarmony spells some remote halves `Host`, not `Stub`.
+    let (program, pag, analysis) = build("ipc_host_stub");
+
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "AppSchedulerProxy::ScheduleForegroundApplication",
+        "AppSchedulerHost::HandleScheduleForegroundApplication"
+    ));
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "AppSchedulerProxy::ScheduleLowMemory",
+        "AppSchedulerHost::HandleScheduleLowMemory"
+    ));
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "DataCallbackProxy::OnData",
+            "DataCallbackService::OnData"
+        ),
+        "a dispatcher-only `*Host` takes the interface fallback"
+    );
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "HandleOnlyProxy::Ping",
+            "HandleOnlyHost::HandlePing"
+        ),
+        "an external dispatcher still leaves Handle* evidence"
+    );
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "InheritedDataProxy::OnData",
+            "InheritedDataHost::OnData"
+        ),
+        "a dispatcher inherited through IRemoteStub qualifies the Host"
+    );
+    assert!(
+        !has_bridge_edge(
+            &program,
+            &analysis,
+            "OtherServiceProxy::Ping",
+            "OtherServiceHost::Ping"
+        ),
+        "a `*Host` with no dispatcher, Handle* method, or binder-stub base is not a stub"
+    );
+    assert_eq!(pag.ipc_bridges.len(), 5);
+}
+
+#[test]
+fn ipc_stub_and_host_candidates_are_both_evaluated() {
+    let (program, pag, analysis) = build("ipc_stub_and_host");
+
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "BothProxy::Run",
+        "BothStub::Run"
+    ));
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "BothProxy::Run",
+        "BothHost::Run"
+    ));
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "SharedProxy::Run",
+        "IShared::Run"
+    ));
+    let shared_bridges = pag
+        .ipc_bridges
+        .iter()
+        .filter(|bridge| {
+            fn_name(&program, bridge.proxy_method) == "SharedProxy::Run"
+                && fn_name(&program, bridge.stub_handler) == "IShared::Run"
+        })
+        .count();
+    assert_eq!(
+        shared_bridges, 1,
+        "both dispatcher-only candidates resolve the same handler once"
+    );
+    let shared_edges = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| {
+            edge.resolution == ResolutionKind::IpcBridge
+                && fn_name(&program, edge.caller) == "SharedProxy::Run"
+                && fn_name(&program, edge.callee) == "IShared::Run"
+        })
+        .count();
+    assert_eq!(shared_edges, 1);
+    assert_eq!(pag.ipc_bridges.len(), 3);
+}
+
+#[test]
+fn ipc_interface_fallback_narrows_overloads_by_signature() {
+    // Both the proxy pointer and the service pointer implement the same
+    // interface member, so their declared explicit parameters agree. The
+    // fallback keeps only the matching overload instead of the cross-product.
+    let (program, pag, analysis) = build("ipc_interface_overloads");
+
+    let mut arities = HashSet::new();
+    for bridge in &pag.ipc_bridges {
+        let proxy = program.symbols.function(bridge.proxy_method);
+        let handler = program.symbols.function(bridge.stub_handler);
+        assert_eq!(
+            program.symbols.explicit_params_alike(
+                proxy,
+                handler,
+                &program.types,
+                trace_ir::SpellingTolerance::Override,
+            ),
+            Some(true),
+            "{} must bridge to the same-signature overload, not {}:{}",
+            proxy.name,
+            handler.name,
+            handler.span.line
+        );
+        arities.insert(program.symbols.explicit_params(proxy).unwrap().len());
+    }
+
+    assert_eq!(
+        pag.ipc_bridges.len(),
+        2,
+        "one bridge per proxy overload, not the 2x2 cross-product"
+    );
+    assert_eq!(arities, HashSet::from([2, 3]));
+    let ipc_edges = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| edge.resolution == ResolutionKind::IpcBridge)
+        .count();
+    assert_eq!(ipc_edges, 2);
+
+    let by_arity = |name: &str, arity: usize| {
+        program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| {
+                f.name == name
+                    && program
+                        .symbols
+                        .explicit_params(f)
+                        .is_some_and(|params| params.len() == arity)
+            })
+            .map(|f| f.id)
+            .unwrap()
+    };
+    let short_proxy = by_arity("AbilityManagerProxy::StartAbility", 2);
+    let long_proxy = by_arity("AbilityManagerProxy::StartAbility", 3);
+    let short_service = by_arity("AbilityManagerService::StartAbility", 2);
+    let long_service = by_arity("AbilityManagerService::StartAbility", 3);
+    let cross = |caller, callee| {
+        analysis.call_edges.iter().any(|edge| {
+            edge.caller == caller
+                && edge.callee == callee
+                && edge.resolution == ResolutionKind::IpcBridge
+        })
+    };
+    assert!(
+        !cross(short_proxy, long_service),
+        "the 2-parameter proxy must not reach the 3-parameter service overload"
+    );
+    assert!(
+        !cross(long_proxy, short_service),
+        "the 3-parameter proxy must not reach the 2-parameter service overload"
+    );
+}
+
+#[test]
 fn ipc_overloads_retain_every_possible_handler() {
     let (program, pag, analysis) = build("ipc_overloads");
     let proxy_methods: HashSet<_> = program

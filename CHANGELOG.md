@@ -4,6 +4,25 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Pair binder `*Host` stubs and narrow interface-fallback overloads
+
+OpenHarmony spells some remote binder halves `*Host` rather than `*Stub`
+(`AppSchedulerHost`, `RenderSchedulerHost`, `AppStateCallbackHost`). A `*Host`
+class now pairs with its `*Proxy` when it defines `OnRemoteRequest`, defines a
+`HandleX` handler, or reaches `IRemoteStub`/`IPCObjectStub` through ordinary or
+template bases. When both `*Stub` and `*Host` spellings are indexed, both
+candidates are evaluated and their bridges unioned, with a handler both
+resolve emitted once, restoring bridges from the app-side scheduler operations
+that were previously missed. The interface
+fallback also uses the proxy method's declared explicit parameters to select
+among same-named interface and service overloads, so
+`AbilityManagerProxy::StartAbility` pairs with its matching
+`AbilityManagerService::StartAbility` overload instead of every overload at
+once. When derived classes define only a different overload, the inherited
+interface declaration is preferred; the concrete mismatch remains only when no
+ancestor declares the name. Handler-name tiers keep their documented `m �- n`
+may-set. See [OpenHarmony IPC bridges](docs/MODELS.md#openharmony-ipc-bridges).
+
 ### Preserve files and directory context during system-header indexing
 
 Canonical preambles now use exclusively created, run-owned temporary files in
