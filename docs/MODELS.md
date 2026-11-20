@@ -986,8 +986,16 @@ requires sufficient receiver/declaration information. This does not add
 opcode dispatch or parcel-flow analysis. Production verification of this
 pattern is recorded in the [evaluation report](EVAL_REPORT.md#ipc-sends-through-sendtransactcmd--2026-11-06).
 
-Classes are paired by their qualified `*Proxy`/`*Client` and `*Stub`
-names; methods match exactly, with `HandleX` and `XStub` handler fallbacks.
+Classes are paired by their qualified `*Proxy`/`*Client` and `*Stub` names, or
+by a `*Host` name when that class defines `OnRemoteRequest`, defines a
+`HandleX` handler on a declared class, or reaches
+`IRemoteStub`/`IPCObjectStub` through ordinary or template bases
+(`AppSchedulerHost`, `RenderSchedulerHost`). When both the `*Stub` and `*Host`
+spellings are indexed, both are evaluated and their bridges unioned; a handler
+both candidates resolve is emitted once. A `*Host` that no `*Stub` record names
+uses the proxy's `.idl` record for its descriptor and unknown interface,
+unless the Host already has an explicit `IRemoteStub<I>` interface.
+Methods match exactly, with `HandleX` and `XStub` handler fallbacks.
 For a stub with interface-only declarations, defined overrides in classes
 deriving from that stub are preferred; otherwise matching methods on the
 stub's transitive interface bases are retained, including default method
@@ -1071,10 +1079,20 @@ definition, and all retained bridges keep synthetic NULL call sites. Merge
 preserves these conservative summaries rather than revalidating framework absence.
 Source-backed proxy/stub reconstruction follows the [linking rules](ANALYSIS.md#invariants-and-linking-rules).
 
-Because v1 has no opcode or parcel-type information, overloaded handlers at
-the selected naming tier are all retained as a may-analysis result. With `m`
+Because v1 has no opcode or parcel-type information, overloaded handlers at a
+matching handler-name tier are all retained as a may-analysis result. With `m`
 proxy overloads and `n` handler overloads this deliberately emits the full
 `m × n` cross-product, so IPC edge counts can grow for overloaded interfaces.
+The interface fallback narrows instead: a proxy method and the service method
+it implements share the interface's declared explicit parameters, so when at
+least one candidate overload matches them, known candidates with different
+parameters are dropped while the matches and any candidate whose parameters
+are unknown remain. When no candidate matches, every candidate stays in the
+may-set. A candidate whose parameters were not exported (cross-repository
+linking) counts as unknown, not as zero arguments. When derived concrete
+classes define only a different overload, a matching ancestor is preferred;
+if neither the concrete method nor any ancestor matches, the concrete
+implementation remains as the last may-target.
 
 A proxy and stub synthesized from an `.idl` file
 ([IDL-generated interfaces](CXX.md#idl-generated-interfaces)) are registered from

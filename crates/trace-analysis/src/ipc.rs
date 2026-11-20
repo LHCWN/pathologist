@@ -8,7 +8,9 @@
 //!
 //! Detection is purely name-based — no control-flow / opcode analysis:
 //!
-//! - A **stub** class is identified by its name ending in `Stub`.
+//! - A **stub** class is identified by its name ending in `Stub`, or `Host`
+//!   when it defines `OnRemoteRequest`, defines a `HandleX` handler, or
+//!   reaches `IRemoteStub`/`IPCObjectStub` through ordinary or template bases.
 //! - A **proxy** class is identified by its name ending in `Proxy` or `Client` plus
 //!   the presence of an IPC send call (see docs/MODELS.md,
 //!   "OpenHarmony IPC bridges").
@@ -254,61 +256,110 @@ fn detect_named_pairs(program: &Program) -> Vec<IpcBridge> {
 
     // Indexed once a proxy pairs with a stub; ancestries per class, not per
     // method, since a proxy's methods share its ancestry.
+    let mut idl_by_proxy: FxHashMap<&str, &trace_ir::IdlInterface> = FxHashMap::default();
+    for idl in &program.idl_interfaces {
+        idl_by_proxy.entry(idl.proxy.as_str()).or_insert(idl);
+    }
+    let mut candidates_cache: FxHashMap<&str, Vec<String>> = FxHashMap::default();
     let mut hierarchy = None;
-    let mut stub_interfaces: FxHashMap<&str, Vec<String>> = FxHashMap::default();
-    let mut stub_classes: FxHashMap<&str, FxHashSet<String>> = FxHashMap::default();
-    let mut compatible: FxHashMap<&str, bool> = FxHashMap::default();
+    let mut proxy_interfaces: FxHashMap<&str, Vec<String>> = FxHashMap::default();
+    let mut stub_interfaces: FxHashMap<(&str, Option<&str>), Vec<String>> = FxHashMap::default();
+    let mut stub_classes: FxHashMap<(&str, Option<&str>), FxHashSet<String>> = FxHashMap::default();
+    let mut compatible: FxHashMap<(&str, &str, Option<&str>), bool> = FxHashMap::default();
     let mut bridges: Vec<IpcBridge> = Vec::new();
     for (proxy_class, method, proxy_method) in &proxies {
-        let stub_class = derive_stub_class(proxy_class);
-        let Some((&stub_class, handlers)) = stub_index.get_key_value(stub_class.as_str()) else {
-            continue;
-        };
-        let hierarchy = hierarchy.get_or_insert_with(|| Hierarchy::new(program));
-        let stub = stub_interfaces.entry(stub_class).or_insert_with(|| {
-            let mut interfaces = hierarchy.interfaces(stub_class, "IRemoteStub");
-            if let Some(idl) = idl_by_stub.get(stub_class).filter(|i| i.composed_stub) {
-                interfaces.extend(program.types.declared_class(&idl.interface));
+        let candidates = candidates_cache
+            .entry(proxy_class.as_str())
+            .or_insert_with(|| derive_stub_classes(proxy_class));
+        for candidate in candidates {
+            let Some((&stub_class, handlers)) = stub_index.get_key_value(candidate.as_str()) else {
+                continue;
+            };
+            // An IDL record normally names the `*Stub`; a `*Host` with no
+            // record of its own shares the proxy's interface and descriptor.
+            let own_idl = idl_by_stub.get(stub_class).copied();
+            let idl = own_idl.or_else(|| {
+                is_host_stub_class(stub_class)
+                    .then(|| idl_by_proxy.get(proxy_class.as_str()).copied())
+                    .flatten()
+            });
+            let idl_interface = idl.map(|idl| idl.interface.as_str());
+            let hierarchy = hierarchy.get_or_insert_with(|| Hierarchy::new(program));
+            let proxy = proxy_interfaces
+                .entry(proxy_class.as_str())
+                .or_insert_with(|| {
+                    let mut proxy = hierarchy.interfaces(proxy_class, "IRemoteProxy");
+                    proxy.extend(hierarchy.interfaces(proxy_class, "IProxyBroker"));
+                    proxy
+                });
+            let stub = stub_interfaces
+                .entry((stub_class, idl_interface))
+                .or_insert_with(|| {
+                    let mut interfaces = hierarchy.interfaces(stub_class, "IRemoteStub");
+                    // A borrowed proxy IDL may fill in an unknown Host
+                    // interface, but an explicit IRemoteStub<I> base is
+                    // stronger evidence and keeps its interface conflict.
+                    if !interfaces.is_empty() && own_idl.is_none() {
+                        return interfaces;
+                    }
+                    if let Some(idl) = idl.filter(|idl| idl.composed_stub) {
+                        interfaces.extend(program.types.declared_class(&idl.interface));
+                    }
+                    interfaces
+                });
+            let compatible = *compatible
+                .entry((proxy_class.as_str(), stub_class, idl_interface))
+                .or_insert_with(|| !interfaces_differ(program, proxy, stub));
+            if !compatible {
+                continue;
             }
-            interfaces
-        });
-        let compatible = *compatible.entry(proxy_class).or_insert_with(|| {
-            let mut proxy = hierarchy.interfaces(proxy_class, "IRemoteProxy");
-            proxy.extend(hierarchy.interfaces(proxy_class, "IProxyBroker"));
-            !interfaces_differ(program, &proxy, stub)
-        });
-        if !compatible {
-            continue;
-        }
-        let descriptor = idl_by_stub
-            .get(stub_class)
-            .map_or("", |idl| idl.descriptor.as_str());
-        let matched_handlers = find_handlers(program, handlers, method);
-        if !matched_handlers.is_empty() {
-            bridges.extend(matched_handlers.into_iter().map(|stub_handler| IpcBridge {
-                proxy_method: *proxy_method,
-                stub_handler,
-                descriptor: descriptor.to_string(),
-            }));
-            continue;
-        }
-        // Fallback: stub has no handler methods (only dispatcher + boilerplate).
-        // The stub's OnRemoteRequest switch calls interface methods directly on
-        // `this` (inherited from the parent interface). Match proxy methods
-        // against external (interface) functions with the same simple name.
-        let fallback = stub_classes
-            .entry(stub_class)
-            .or_insert_with(|| hierarchy.fallback_classes(stub_class));
-        bridges.extend(
-            find_interface_methods(program, stub_class, fallback, method, &proxy_classes)
+            let composed = idl.filter(|idl| idl.composed_stub);
+            let descriptor = idl.map_or("", |idl| idl.descriptor.as_str());
+            let matched_handlers = find_handlers(program, handlers, method);
+            if !matched_handlers.is_empty() {
+                bridges.extend(matched_handlers.into_iter().map(|stub_handler| IpcBridge {
+                    proxy_method: *proxy_method,
+                    stub_handler,
+                    descriptor: descriptor.to_string(),
+                }));
+                continue;
+            }
+            // Fallback: stub has no handler methods (only dispatcher + boilerplate).
+            // The stub's OnRemoteRequest switch calls interface methods directly on
+            // `this` (inherited from the parent interface). Match proxy methods
+            // against external (interface) functions with the same simple name.
+            let fallback = stub_classes
+                .entry((stub_class, idl_interface))
+                .or_insert_with(|| {
+                    let mut classes = hierarchy.fallback_classes(stub_class);
+                    if let Some(idl) = composed {
+                        classes.extend(hierarchy.fallback_classes(&idl.interface));
+                    }
+                    classes
+                });
+            bridges.extend(
+                find_interface_methods(
+                    program,
+                    stub_class,
+                    fallback,
+                    method,
+                    &proxy_classes,
+                    *proxy_method,
+                    composed,
+                )
                 .into_iter()
                 .map(|stub_handler| IpcBridge {
                     proxy_method: *proxy_method,
                     stub_handler,
                     descriptor: descriptor.to_string(),
                 }),
-        );
+            );
+        }
     }
+    // Both spellings of one remote side can resolve the same handler. Drop the
+    // duplicate here too, keeping the first candidate's descriptor.
+    let mut seen = FxHashSet::default();
+    bridges.retain(|bridge| seen.insert((bridge.proxy_method, bridge.stub_handler)));
     bridges
 }
 
@@ -345,7 +396,18 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
     let mut proxies: ProxyMethods = Vec::new();
 
     for (class, methods) in &methods_by_class {
-        if is_stub_class(class) {
+        let has_dispatcher = methods.iter().any(|(m, _)| is_stub_entry(m));
+        // `*Host` is the other spelling OpenHarmony uses for the remote side
+        // (`AppSchedulerHost`, `RenderSchedulerHost`). The suffix alone is too
+        // common, so require a dispatcher, a `HandleX` handler, or binder-stub
+        // ancestry; the dispatcher may be declared only in another TU or
+        // inherited from a base. A `HandleX` function in a namespace groups
+        // under that name too, so member evidence must name a declared class.
+        let has_handle = methods.iter().any(|(method, _)| is_handle_handler(method))
+            && is_declared_class(program, class);
+        let host_qualifies = is_host_stub_class(class)
+            && (has_dispatcher || has_handle || host_inherits_remote_stub(program, class));
+        if is_stub_class(class) || host_qualifies {
             // A stub class: handlers are its methods that are not the
             // dispatcher/descriptor boilerplate.
             let handlers: Vec<FnId> = methods
@@ -354,11 +416,11 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
                 .map(|(_, id)| *id)
                 .collect();
             // Register stubs with no handler methods too — the interface
-            // fallback needs to find them. A stub must have either handler
-            // methods OR OnRemoteRequest (the dispatcher) to be registered.
-            let has_dispatcher = methods.iter().any(|(m, _)| is_stub_entry(m));
+            // fallback needs to find them. A `*Stub` must have handler
+            // methods or its OnRemoteRequest dispatcher; a `*Host` also
+            // qualifies through Handle* evidence or binder-stub ancestry.
             // `methods_by_class` is keyed by class, so each is visited once.
-            if !handlers.is_empty() || has_dispatcher {
+            if !handlers.is_empty() || has_dispatcher || host_qualifies {
                 stubs.push((class.clone(), handlers));
             }
         } else if is_proxy_class(class) {
@@ -397,16 +459,17 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
     (stubs, proxies)
 }
 
-/// Derive the matching stub class name from a proxy/client class name.
-/// `FooProxy` → `FooStub`, `FooClient` → `FooStub`.
-fn derive_stub_class(proxy_class: &str) -> String {
-    if let Some(base) = proxy_class.strip_suffix("Proxy") {
-        return format!("{base}Stub");
+/// The stub class names a proxy/client's name may derive: the `Stub`
+/// convention first, then the `Host` spelling binder services also use
+/// (`AppSchedulerProxy` → `AppSchedulerHost`).
+fn derive_stub_classes(proxy_class: &str) -> Vec<String> {
+    let base = proxy_class
+        .strip_suffix("Proxy")
+        .or_else(|| proxy_class.strip_suffix("Client"));
+    match base {
+        Some(base) => vec![format!("{base}Stub"), format!("{base}Host")],
+        None => vec![proxy_class.to_string()],
     }
-    if let Some(base) = proxy_class.strip_suffix("Client") {
-        return format!("{base}Stub");
-    }
-    proxy_class.to_string()
 }
 
 /// Find stub handlers matching a proxy method name. Tries, in order:
@@ -455,16 +518,19 @@ fn find_handlers(program: &Program, handlers: &[FnId], method_name: &str) -> Vec
     Vec::new()
 }
 
-/// Fallback for stubs with no handler methods: find an inherited interface
-/// function whose simple name matches the proxy method. The stub's
+/// Fallback when no matching concrete handler is found: find an inherited
+/// interface function whose simple name matches the proxy method. The stub's
 /// `OnRemoteRequest` switch calls these interface methods directly on `this`
-/// (inherited from the parent interface class).
+/// (inherited from the parent interface class). This also runs when derived
+/// classes define only a different overload.
 fn find_interface_methods(
     program: &Program,
     stub_class: &str,
     ancestors: &FxHashSet<String>,
     method_name: &str,
     proxy_classes: &FxHashSet<String>,
+    proxy_method: FnId,
+    idl: Option<&trace_ir::IdlInterface>,
 ) -> Vec<FnId> {
     // Prefer concrete in-tree implementations deriving from the stub. This
     // keeps reachability alive beyond the IPC boundary when the stub itself
@@ -473,11 +539,13 @@ fn find_interface_methods(
     let mut seen = FxHashSet::default();
     // HDI stubs compose an interface implementation rather than inherit it.
     // IDL metadata names that interface without guessing from the class name.
-    let idl = program
-        .idl_interfaces
-        .iter()
-        .find(|i| i.stub == stub_class)
-        .filter(|i| i.composed_stub);
+    let idl = idl.or_else(|| {
+        program
+            .idl_interfaces
+            .iter()
+            .find(|i| i.stub == stub_class)
+            .filter(|i| i.composed_stub)
+    });
     let mut implementations = program.subclass_closure(stub_class);
     if let Some(idl) = idl {
         implementations.extend(program.subclass_closure(&idl.interface));
@@ -493,14 +561,30 @@ fn find_interface_methods(
             }
         }
     }
-    if !concrete.is_empty() {
+    let concrete = narrow_to_proxy_signature(program, proxy_method, concrete);
+    // A derived class may define only a different overload of the name. Do not
+    // stop there: the transaction's matching overload may be the inherited
+    // interface declaration the ancestor fallback can still reach. Unknown
+    // arity keeps the concrete candidates, since nothing rejects them. If no
+    // ancestor declares the name, the concrete mismatch stays the last may-target.
+    let proxy_arity_known = program
+        .symbols
+        .function(proxy_method)
+        .explicit_arity
+        .is_some();
+    let concrete_known_mismatch = !concrete.is_empty()
+        && proxy_arity_known
+        && concrete
+            .iter()
+            .all(|&id| proxy_signature_matches(program, proxy_method, id) == Some(false));
+    if !concrete.is_empty() && !concrete_known_mismatch {
         return concrete;
     }
 
     // Restrict ancestor fallbacks to actual base classes of the stub. A
     // namespace/name heuristic can otherwise select an unrelated class that
     // happens to expose the same method.
-    program
+    let fallback: Vec<FnId> = program
         .symbols
         .functions
         .iter()
@@ -510,6 +594,79 @@ fn find_interface_methods(
                 .is_some_and(|(class, method)| method == method_name && ancestors.contains(class))
         })
         .map(|f| f.id)
+        .collect();
+    let fallback = narrow_to_proxy_signature(program, proxy_method, fallback);
+    let fallback_known_mismatch = !fallback.is_empty()
+        && fallback
+            .iter()
+            .all(|&id| proxy_signature_matches(program, proxy_method, id) == Some(false));
+    // Prefer a matching ancestor. When neither side matches, keep the concrete
+    // implementation rather than a bodyless declaration with the same name.
+    if concrete_known_mismatch && (fallback.is_empty() || fallback_known_mismatch) {
+        concrete
+    } else {
+        fallback
+    }
+}
+
+/// Whether a handler's declared explicit parameters are known to match the
+/// proxy method's. `None` means the index cannot compare them: unknown arity
+/// on either side, or parameter facts that do not line up with the arity. A
+/// `TypeDesc::Unknown` entry is a wildcard in `may_name_same_type`, so an
+/// unavailable type never becomes `Some(false)`.
+fn proxy_signature_matches(program: &Program, proxy_method: FnId, handler: FnId) -> Option<bool> {
+    let proxy = program.symbols.function(proxy_method);
+    proxy.explicit_arity?;
+    let proxy_params = program.symbols.explicit_params(proxy)?;
+    proxy_signature_matches_with(program, &proxy_params, handler)
+}
+
+/// [`proxy_signature_matches`] with the proxy's parameters already computed.
+fn proxy_signature_matches_with(
+    program: &Program,
+    proxy_params: &trace_ir::ExplicitParams<'_>,
+    handler: FnId,
+) -> Option<bool> {
+    let handler = program.symbols.function(handler);
+    handler.explicit_arity?;
+    let handler_params = program.symbols.explicit_params(handler)?;
+    program.symbols.explicit_params_alike_with(
+        proxy_params,
+        &handler_params,
+        &program.types,
+        trace_ir::SpellingTolerance::Override,
+    )
+}
+
+/// Keep the interface-fallback candidates whose declared explicit parameters
+/// match the proxy method's. Both sides implement the same interface member,
+/// so their signatures agree; this is the one overload signal the fallback has
+/// without transaction-opcode or parcel-type analysis. Narrowing requires at
+/// least one known same-signature candidate; a candidate whose arity or types
+/// are unknown stays in the may-set, and no candidate is dropped when nothing
+/// matches.
+fn narrow_to_proxy_signature(
+    program: &Program,
+    proxy_method: FnId,
+    handlers: Vec<FnId>,
+) -> Vec<FnId> {
+    if handlers.len() < 2 {
+        return handlers;
+    }
+    let proxy = program.symbols.function(proxy_method);
+    if proxy.explicit_arity.is_none() {
+        return handlers;
+    }
+    let Some(proxy_params) = program.symbols.explicit_params(proxy) else {
+        return handlers;
+    };
+    let matching = |id: FnId| proxy_signature_matches_with(program, &proxy_params, id);
+    if !handlers.iter().any(|&id| matching(id) == Some(true)) {
+        return handlers;
+    }
+    handlers
+        .into_iter()
+        .filter(|&id| matching(id) != Some(false))
         .collect()
 }
 
@@ -807,8 +964,62 @@ fn is_stub_class(class: &str) -> bool {
     class.ends_with("Stub")
 }
 
+/// The remote half of a binder pair may be spelled `Host` rather than `Stub`
+/// (`AppSchedulerHost`, `RenderSchedulerHost`). The qualification that makes
+/// it a stub lives in `scan`.
+fn is_host_stub_class(class: &str) -> bool {
+    class
+        .strip_suffix("Host")
+        .is_some_and(|base| !base.is_empty() && !base.ends_with("::"))
+}
+
+/// A name `split_qualified` groups under a class may instead be a namespace.
+/// Only a declared class makes a `HandleX` free function into binder evidence.
+fn is_declared_class(program: &Program, class: &str) -> bool {
+    program.types.is_struct_declared(class) || program.types.declared_class(class).is_some()
+}
+
+/// Whether `class` reaches `IRemoteStub` or `IPCObjectStub` through ordinary
+/// or template bases. The dispatcher may be inherited from that wrapper, so a
+/// `*Host` does not have to define `OnRemoteRequest` itself.
+fn host_inherits_remote_stub(program: &Program, class: &str) -> bool {
+    let is_remote_stub = |base: &str| {
+        let base = base.split('<').next().unwrap_or(base);
+        matches!(
+            base.rsplit("::").next().unwrap_or(base),
+            "IRemoteStub" | "IPCObjectStub"
+        )
+    };
+    let mut pending = vec![class.to_string()];
+    let mut expanded = FxHashSet::default();
+    while let Some(class) = pending.pop() {
+        if !expanded.insert(class.clone()) {
+            continue;
+        }
+        let bases = program.bases_of(&class);
+        if bases.iter().any(|base| is_remote_stub(base))
+            || program
+                .template_bases_of(&class)
+                .iter()
+                .any(|fact| is_remote_stub(&fact.spelling))
+        {
+            return true;
+        }
+        pending.extend(bases);
+    }
+    false
+}
+
 fn is_stub_entry(method: &str) -> bool {
     method == "OnRemoteRequest"
+}
+
+/// A `HandleX` handler is binder evidence; `Handler`, `Handle`, or a namespace
+/// `HandleX` free function is not.
+fn is_handle_handler(method: &str) -> bool {
+    method
+        .strip_prefix("Handle")
+        .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
 }
 
 fn is_boilerplate(class: &str, method: &str) -> bool {
@@ -839,13 +1050,42 @@ fn split_qualified(name: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use trace_ir::{Function, Linkage, Span, TypeId};
+    use trace_ir::{Function, Linkage, Span, TypeDesc, TypeId};
 
     fn add_external_method(program: &mut Program, file: trace_ir::FileId, name: &str) -> FnId {
         let id = program.symbols.alloc_fn_id();
         program
             .symbols
             .push_synthetic_function(external_method(id, file, name))
+    }
+
+    fn add_method_with_signature(
+        program: &mut Program,
+        file: trace_ir::FileId,
+        name: &str,
+        arity: Option<u32>,
+        params: Vec<TypeId>,
+    ) -> FnId {
+        let id = program.symbols.alloc_fn_id();
+        let mut function = external_method(id, file, name);
+        function.explicit_arity = arity;
+        function.param_type_ids = params;
+        program.symbols.push_synthetic_function(function)
+    }
+
+    fn add_defined_method_with_signature(
+        program: &mut Program,
+        file: trace_ir::FileId,
+        name: &str,
+        arity: Option<u32>,
+        params: Vec<TypeId>,
+    ) -> FnId {
+        let id = program.symbols.alloc_fn_id();
+        let mut function = external_method(id, file, name);
+        function.explicit_arity = arity;
+        function.param_type_ids = params;
+        function.is_defined = true;
+        program.symbols.add_function(function)
     }
 
     /// As a header's declaration is: found by name.
@@ -932,6 +1172,7 @@ mod tests {
             .add_file(PathBuf::from("/fixture/interface.cpp"));
         let first = add_external_method(&mut program, file, "svc::IFoo::Run");
         let second = add_external_method(&mut program, file, "svc::IFoo::Run");
+        let proxy = add_external_method(&mut program, file, "svc::FooProxy::Run");
         add_external_method(&mut program, file, "svc::Foo::Run");
         add_external_method(&mut program, file, "other::IFoo::Run");
         program.add_inheritance("svc::FooStub", "svc::IFoo");
@@ -943,9 +1184,272 @@ mod tests {
             &ancestors,
             "Run",
             &FxHashSet::default(),
+            proxy,
+            None,
         );
 
         assert_eq!(handlers, vec![first, second]);
+    }
+
+    #[test]
+    fn interface_fallback_keeps_unknown_signatures_when_a_match_exists() {
+        // A cross-repository reconstruction whose parameter facts were not
+        // exported has `explicit_arity: None`. It must not be read as a
+        // false zero-arity overload and dropped once another handler matches.
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program
+            .symbols
+            .add_file(PathBuf::from("/fixture/interface.cpp"));
+        let int = program.types.intern(TypeDesc::Int);
+        let proxy =
+            add_method_with_signature(&mut program, file, "svc::FooProxy::Run", Some(1), vec![int]);
+        let known =
+            add_method_with_signature(&mut program, file, "svc::IFoo::Run", Some(1), vec![int]);
+        let unknown =
+            add_method_with_signature(&mut program, file, "svc::IFoo::Run", None, Vec::new());
+        let unknown_type = program.types.unknown();
+        let double = program.types.intern(TypeDesc::Double);
+        let unknown_param = add_method_with_signature(
+            &mut program,
+            file,
+            "svc::IFoo::Run",
+            Some(1),
+            vec![unknown_type],
+        );
+        let incompatible =
+            add_method_with_signature(&mut program, file, "svc::IFoo::Run", Some(1), vec![double]);
+        program.add_inheritance("svc::FooStub", "svc::IFoo");
+
+        let ancestors = Hierarchy::new(&program).fallback_classes("svc::FooStub");
+        let handlers = find_interface_methods(
+            &program,
+            "svc::FooStub",
+            &ancestors,
+            "Run",
+            &FxHashSet::default(),
+            proxy,
+            None,
+        );
+
+        assert!(handlers.contains(&known), "known match is retained");
+        assert!(
+            handlers.contains(&unknown),
+            "a reconstructed unknown signature stays in the may-set"
+        );
+        assert!(
+            handlers.contains(&unknown_param),
+            "an unavailable parameter type is a wildcard, not a mismatch"
+        );
+        assert!(
+            !handlers.contains(&incompatible),
+            "a known different type is pruned"
+        );
+        assert_eq!(handlers.len(), 3);
+    }
+
+    #[test]
+    fn interface_fallback_skips_concrete_overload_mismatch_for_base_declaration() {
+        // The derived service defines only the other overload. The matching
+        // overload is inherited from the interface, so the ancestor fallback
+        // must still run instead of returning the mismatched concrete method.
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program
+            .symbols
+            .add_file(PathBuf::from("/fixture/interface.cpp"));
+        let int = program.types.intern(TypeDesc::Int);
+        let double = program.types.intern(TypeDesc::Double);
+        let proxy =
+            add_method_with_signature(&mut program, file, "svc::FooProxy::Run", Some(1), vec![int]);
+        let int_decl =
+            add_method_with_signature(&mut program, file, "svc::IFoo::Run", Some(1), vec![int]);
+        let double_decl =
+            add_method_with_signature(&mut program, file, "svc::IFoo::Run", Some(1), vec![double]);
+        let concrete = add_defined_method_with_signature(
+            &mut program,
+            file,
+            "svc::FooService::Run",
+            Some(1),
+            vec![double],
+        );
+        program.add_inheritance("svc::FooStub", "svc::IFoo");
+        program.add_inheritance("svc::FooService", "svc::FooStub");
+
+        let ancestors = Hierarchy::new(&program).fallback_classes("svc::FooStub");
+        let handlers = find_interface_methods(
+            &program,
+            "svc::FooStub",
+            &ancestors,
+            "Run",
+            &FxHashSet::default(),
+            proxy,
+            None,
+        );
+
+        assert_eq!(
+            handlers,
+            vec![int_decl],
+            "the matching base declaration replaces the mismatched concrete overload"
+        );
+        assert!(!handlers.contains(&double_decl));
+        assert!(!handlers.contains(&concrete));
+    }
+
+    #[test]
+    fn interface_fallback_prefers_concrete_when_ancestor_also_mismatches() {
+        // A hand-written client may send a fixed value while the stub calls
+        // Run(int). Both the interface declaration and the concrete override
+        // differ from the client signature; keep the reachable implementation.
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program
+            .symbols
+            .add_file(PathBuf::from("/fixture/interface.cpp"));
+        let int = program.types.intern(TypeDesc::Int);
+        let concrete = add_defined_method_with_signature(
+            &mut program,
+            file,
+            "svc::FooService::Run",
+            Some(1),
+            vec![int],
+        );
+        let declaration =
+            add_method_with_signature(&mut program, file, "svc::IFoo::Run", Some(1), vec![int]);
+        let proxy = add_method_with_signature(
+            &mut program,
+            file,
+            "svc::FooProxy::Run",
+            Some(0),
+            Vec::new(),
+        );
+        program.add_inheritance("svc::FooStub", "svc::IFoo");
+        program.add_inheritance("svc::FooService", "svc::FooStub");
+
+        let ancestors = Hierarchy::new(&program).fallback_classes("svc::FooStub");
+        let handlers = find_interface_methods(
+            &program,
+            "svc::FooStub",
+            &ancestors,
+            "Run",
+            &FxHashSet::default(),
+            proxy,
+            None,
+        );
+
+        assert_eq!(
+            handlers,
+            vec![concrete],
+            "prefer the concrete body when both signatures mismatch"
+        );
+        assert!(!handlers.contains(&declaration));
+    }
+
+    #[test]
+    fn borrowed_host_idl_does_not_override_explicit_interface() {
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program
+            .symbols
+            .add_file(PathBuf::from("/fixture/interface.cpp"));
+        program.types.declare_struct("p::IFoo");
+        program.types.declare_struct("p::IUnrelated");
+        add_declared_method(&mut program, file, "p::FooProxy::Run");
+        let host = add_defined_method_with_signature(
+            &mut program,
+            file,
+            "p::FooHost::HandleRun",
+            Some(0),
+            Vec::new(),
+        );
+        program.add_template_base("p::FooProxy", "IRemoteProxy<p::IFoo>", "p", false, None);
+        program.add_template_base("p::FooHost", "IRemoteStub<p::IUnrelated>", "p", false, None);
+        program.idl_interfaces.push(trace_ir::IdlInterface {
+            composed_stub: false,
+            descriptor: "p.IFoo".into(),
+            interface: "p::IFoo".into(),
+            proxy: "p::FooProxy".into(),
+            stub: "p::FooStub".into(),
+            methods: vec![trace_ir::IdlMethod {
+                name: "Run".into(),
+                ipccode: None,
+            }],
+        });
+
+        let bridges = detect_ipc_pairs(&program);
+
+        assert!(
+            !bridges.iter().any(|bridge| bridge.stub_handler == host),
+            "the borrowed IFoo record must not erase the explicit IUnrelated interface"
+        );
+    }
+
+    #[test]
+    fn interface_fallback_keeps_all_known_mismatches_when_nothing_matches() {
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program
+            .symbols
+            .add_file(PathBuf::from("/fixture/interface.cpp"));
+        let int = program.types.intern(TypeDesc::Int);
+        let double = program.types.intern(TypeDesc::Double);
+        let boolean = program.types.intern(TypeDesc::Bool);
+        let proxy =
+            add_method_with_signature(&mut program, file, "svc::FooProxy::Run", Some(1), vec![int]);
+        let double_handler =
+            add_method_with_signature(&mut program, file, "svc::IFoo::Run", Some(1), vec![double]);
+        let bool_handler =
+            add_method_with_signature(&mut program, file, "svc::IFoo::Run", Some(1), vec![boolean]);
+        program.add_inheritance("svc::FooStub", "svc::IFoo");
+
+        let ancestors = Hierarchy::new(&program).fallback_classes("svc::FooStub");
+        let handlers = find_interface_methods(
+            &program,
+            "svc::FooStub",
+            &ancestors,
+            "Run",
+            &FxHashSet::default(),
+            proxy,
+            None,
+        );
+
+        assert_eq!(handlers.len(), 2, "no exact match keeps the may-set");
+        assert!(handlers.contains(&double_handler));
+        assert!(handlers.contains(&bool_handler));
+    }
+
+    #[test]
+    fn host_uses_proxy_idl_descriptor_when_stub_name_differs() {
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program.symbols.add_file(PathBuf::from("/fixture/host.cpp"));
+        let int = program.types.intern(TypeDesc::Int);
+        add_declared_method(&mut program, file, "p::HostProxy::Run");
+        let host = add_defined_method_with_signature(
+            &mut program,
+            file,
+            "p::HostHost::Run",
+            Some(1),
+            vec![int],
+        );
+        add_defined_method_with_signature(
+            &mut program,
+            file,
+            "p::HostHost::OnRemoteRequest",
+            Some(0),
+            Vec::new(),
+        );
+        program.idl_interfaces.push(trace_ir::IdlInterface {
+            composed_stub: false,
+            descriptor: "p.IHost".into(),
+            interface: "p::IHost".into(),
+            proxy: "p::HostProxy".into(),
+            stub: "p::HostStub".into(),
+            methods: vec![trace_ir::IdlMethod {
+                name: "Run".into(),
+                ipccode: None,
+            }],
+        });
+
+        let bridges = detect_ipc_pairs(&program);
+
+        assert_eq!(bridges.len(), 1);
+        assert_eq!(bridges[0].stub_handler, host);
+        assert_eq!(bridges[0].descriptor, "p.IHost");
     }
 
     #[test]

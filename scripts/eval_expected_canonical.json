@@ -1,5 +1,5 @@
 {
-  "note": "Pinned corpora in canonical system-header mode with the embedded models. Recaptured after rebasing onto local master bb64b1e on Windows 11 x64 with MSYS2 MinGW GCC 15.2.0. Header-dependent totals use that toolchain as the reference. Counts include the 2026-11-20 vector specialization audit. See docs/EVAL_REPORT.md.",
+  "note": "Pinned corpora in canonical system-header mode with the embedded models. Recaptured after rebasing onto local master bb64b1e on Windows 11 x64 with MSYS2 MinGW GCC 15.2.0. Header-dependent totals use that toolchain as the reference. Counts include the 2026-11-20 vector specialization audit. The 2026-11-20 binder Host/interface-overload change recaptured the canonical IPC centers: Camera 808 -> 702 and ability_runtime 1762 -> 1641; ability_runtime edges_total 418036 -> 417915 and diagnostics 11944 -> 11945; HDF and HiView IPC counts are unchanged. See docs/EVAL_REPORT.md.",
   "analyze_args": [
     "--canonical-system-headers",
     "--compiler",
@@ -85,7 +85,7 @@
         "edges_direct": {"cmp": "band", "value": 70060, "tol": 420},
         "edges_indirect": {"cmp": "exact", "value": 500},
         "edges_external": {"cmp": "band", "value": 58581, "tol": 420},
-        "edges_ipc": {"cmp": "exact", "value": 808},
+        "edges_ipc": {"cmp": "exact", "value": 702},
         "arg_flow_edges": {"cmp": "band", "value": 81527, "tol": 250},
         "diagnostics": {"cmp": "exact", "value": 3694},
         "dlsym_edges": {"cmp": "exact", "value": 6},
@@ -118,13 +118,13 @@
         "functions_total": {"cmp": "exact", "value": 89063},
         "functions_defined": {"cmp": "exact", "value": 68649},
         "functions_external": {"cmp": "exact", "value": 20414},
-        "edges_total": {"cmp": "exact", "value": 418036},
+        "edges_total": {"cmp": "exact", "value": 417915},
         "edges_direct": {"cmp": "exact", "value": 255993},
         "edges_indirect": {"cmp": "exact", "value": 2043},
         "edges_external": {"cmp": "exact", "value": 158238},
-        "edges_ipc": {"cmp": "exact", "value": 1762},
+        "edges_ipc": {"cmp": "exact", "value": 1641},
         "arg_flow_edges": {"cmp": "exact", "value": 455892},
-        "diagnostics": {"cmp": "exact", "value": 11944},
+        "diagnostics": {"cmp": "exact", "value": 11945},
         "dlsym_edges": {"cmp": "exact", "value": 107},
         "public_functions_total": {"cmp": "band", "value": 85660, "tol": 400},
         "public_edges_total": {"cmp": "band", "value": 409148, "tol": 1300}
