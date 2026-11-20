@@ -1,5 +1,54 @@
 # Evaluation Report
 
+## Binder `*Host` stubs and overloaded interface fallbacks - 2026-11-20
+
+OpenHarmony spells some binder remote halves `*Host` rather than `*Stub`.
+`ipc_host_stub` covers a `*Host` with handler methods, a dispatcher-only
+`*Host` (interface fallback), `HandleX` evidence without a visible dispatcher,
+a dispatcher inherited through `IRemoteStub`, a `*Host` with no qualifying
+evidence, and a shared `SendTransactCmd` helper. `ipc_stub_and_host` indexes
+both candidates for one proxy, including two dispatcher-only candidates that
+resolve the same inherited handler, and checks that both bridges are retained
+without duplicating the shared one. `ipc_interface_overloads` covers a stub
+whose handlers live on interface base declarations; the fallback now narrows same-named service overloads by the
+proxy method's declared explicit parameters instead of emitting the full
+cross-product, and falls back to the ancestor declaration when derived classes
+only override a different overload. The rules are in
+[OpenHarmony IPC bridges](MODELS.md#openharmony-ipc-bridges).
+
+The pinned `ability_ability_runtime` checkout (`6c18fdc9bdef`) was analyzed with
+the release binary at `--jobs 8 --ignore-logging`. The before column uses a
+binary built from the same revision with only the IPC diff reverted; both runs
+index the same 80,754 functions and 2,043 indirect edges, so the deltas are
+attributable to this change:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| `ipc` call edges | 1,762 | 1,635 |
+| `AbilityManagerProxy::StartAbility` IPC edges | 128 | 30 |
+| ... to `AbilityManagerService::StartAbility` | 28 | 5 |
+| `AppSchedulerProxy` -> `AppSchedulerHost` | 0 | 33 |
+
+The `AbilityManagerProxy::StartAbility` total covers every proxy overload and
+every indexed mock; the five service edges are one per matching overload (the
+`StartOptions` overload has two definitions from separate translation units).
+The `AppSchedulerProxy` count is the pinned revision's direct host handlers;
+the four `ScheduleNotify*` operations reach their interface implementations
+through the fallback instead. Handler-name tiers still retain every overload,
+so the `ipc_overloads` cross-product fixture is unchanged.
+
+All 28 `ipc_tests` pass, including the two new fixtures; `trace-analysis` unit
+tests and strict Clippy pass. The exact IPC centers were recaptured: HDF 58,
+HiView 44, Camera 808 -> 702 and ability_runtime 1,762 -> 1,635. Ability_runtime's
+other centers remain from the earlier measurement, as the note at the top of
+[`scripts/eval_expected.json`](../scripts/eval_expected.json) records.
+
+The release analyze phase at `--jobs 8`, with the same checkouts and the IPC
+diff reverted as the before column, is HDF 4.2s -> 4.2s, HiView 0.3s -> 0.3s,
+Camera 0.7s -> 0.7-1.0s and ability_runtime 6.5s -> 5.1-5.4s. Indexing
+dominates total wall time and varies with cache state; the analyze-phase
+difference is at most 0.3s across repeated runs.
+
 ## PR #257 review follow-up — 2026-11-19
 
 Rebased `issue-246` onto freshly fetched `origin/master` `326f50e`, preserving

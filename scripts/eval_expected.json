@@ -1,5 +1,5 @@
 {
-  "note": "PR #257 expectation centers were recaptured relative to parent aa6f846, including HDF functions_total 12198 -> 12172, indirect edges 5153 -> 5226 and arg_flow_edges 72400 -> 72585; HiView and Camera centers were also recaptured. The 2026-11-13 owner-dependency/reference-alias/receiver-qualification follow-up remeasured every HDF, HiView and Camera global with release analyzer 3980106-dirty including all production changes in this amend, at jobs 1 and 8, matching the preceding 3980106 review snapshot. Existing tolerances were retained. Source/binary identities, strict compiler cases, parent differential residuals and the Camera metadata audit are in docs/EVAL_REPORT.md, Dependent owners, reference aliases and receiver qualification. Other corpora, including ability_runtime, carry forward earlier measurements and were not rerun here.",
+  "note": "PR #257 expectation centers were recaptured relative to parent aa6f846, including HDF functions_total 12198 -> 12172, indirect edges 5153 -> 5226 and arg_flow_edges 72400 -> 72585; HiView and Camera centers were also recaptured. The 2026-11-13 owner-dependency/reference-alias/receiver-qualification follow-up remeasured every HDF, HiView and Camera global with release analyzer 3980106-dirty including all production changes in this amend, at jobs 1 and 8, matching the preceding 3980106 review snapshot. Existing tolerances were retained. Source/binary identities, strict compiler cases, parent differential residuals and the Camera metadata audit are in docs/EVAL_REPORT.md, Dependent owners, reference aliases and receiver qualification. Other corpora, including ability_runtime, carry forward earlier measurements and were not rerun here. The 2026-11-20 binder Host/interface-overload change recaptured only the affected exact IPC centers: Camera 808 -> 702 and ability_runtime 1762 -> 1635, with HDF and HiView unchanged. Ability_runtime's other centers remain from the earlier measurement.",
   "budget_pops": 800000,
   "jobs": 8,
   "corpora": {
@@ -150,7 +150,7 @@
         "edges_direct": {"cmp": "band", "value": 70073, "tol": 420},
         "edges_indirect": {"cmp": "exact", "value": 475},
         "edges_external": {"cmp": "band", "value": 45942, "tol": 420},
-        "edges_ipc": {"cmp": "exact", "value": 808},
+        "edges_ipc": {"cmp": "exact", "value": 702},
         "arg_flow_edges": {"cmp": "band", "value": 60961, "tol": 250},
         "diagnostics": {"cmp": "exact", "value": 5192},
         "dlsym_edges": {"cmp": "exact", "value": 6},
@@ -208,7 +208,7 @@
       "dir": "ability_ability_runtime",
       "analyze_args": ["--ignore-logging", "--timeout-secs", "600"],
       "globals": {
-        "edges_ipc": {"cmp": "exact", "value": 1762},
+        "edges_ipc": {"cmp": "exact", "value": 1635},
         "edges_indirect": {"cmp": "exact", "value": 1849},
         "public_functions_total": {"cmp": "band", "value": 78881, "tol": 400},
         "public_edges_total": {"cmp": "band", "value": 373780, "tol": 1300}
