@@ -8,7 +8,8 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use trace_ir::Program;
+use std::sync::Arc;
+use trace_ir::{ContainerModel, ContainerModels, Program};
 
 /// One parameter relation of a function model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,12 +282,16 @@ pub struct FnModelSet {
     /// member of a class that may be or derive from the model's.
     members: FxHashMap<String, Vec<String>>,
     noise_macros: Vec<String>,
+    containers: Arc<ContainerModels>,
 }
 
 impl FnModelSet {
     /// Built-in libc / secure-libc defaults.
     pub fn builtin() -> Self {
-        let mut set = Self::default();
+        let mut set = Self {
+            containers: Arc::clone(ContainerModels::builtin()),
+            ..Self::default()
+        };
         let mut reg = |name: &str, effects: Vec<Effect>| set.register(FnModel::new(name, effects));
         // Task, thread and timer primitives (`docs/MODELS.md`, "Built-in
         // models"): each runs one callback, in the context it states.
@@ -515,6 +520,10 @@ impl FnModelSet {
         &self.noise_macros
     }
 
+    pub fn container_models(&self) -> &Arc<ContainerModels> {
+        &self.containers
+    }
+
     pub fn add_noise_macro(&mut self, name: impl Into<String>) {
         let name = name.into();
         if !self.noise_macros.contains(&name) {
@@ -526,6 +535,9 @@ impl FnModelSet {
     /// file). Entries override same-name models already in `self`.
     pub fn merge_toml_str(&mut self, s: &str) -> Result<(), String> {
         let cfg: ModelsConfig = toml::from_str(s).map_err(|e| e.to_string())?;
+        for container in cfg.container {
+            Arc::make_mut(&mut self.containers).register(container)?;
+        }
         for raw in cfg.model {
             let effects = raw
                 .effects
@@ -709,6 +721,8 @@ struct ModelsConfig {
     version: Option<u64>,
     #[serde(rename = "model", default)]
     model: Vec<RawModel>,
+    #[serde(default)]
+    container: Vec<ContainerModel>,
     #[serde(default)]
     noise: Option<RawNoise>,
 }

@@ -1603,7 +1603,7 @@ fn merge_unit(
         if !valid_flow(flow) {
             continue;
         }
-        let remapped = remap_flow(flow, &fn_map, &var_map);
+        let remapped = remap_flow(flow, &fn_map, &var_map, &type_map);
         let shared_body = !shared_vars.is_empty() && flow.vars().any(|v| shared_vars.contains(&v));
         let seen = if shared_body {
             Some(&mut program.dedup.header_flow)
@@ -1814,6 +1814,12 @@ fn merge_types(
                 dst.register_alias_qualification(alias, cv);
             }
         }
+        if let Some(spelling) = src
+            .alias_type_spelling(alias)
+            .filter(|_| dst.alias_type_spelling(alias).is_none())
+        {
+            dst.set_alias_type_spelling(alias, spelling);
+        }
         // The callable return category is independent of alias registration.
         // Merge it monotonically even when an earlier unit supplied the name.
         if src.alias_callable_returns_reference(alias) {
@@ -1944,6 +1950,7 @@ fn remap_flow(
     flow: &FlowConstraint,
     fn_map: &FxHashMap<FnId, FnId>,
     var_map: &FxHashMap<VarId, VarId>,
+    type_map: &[TypeId],
 ) -> FlowConstraint {
     let rv = |v: VarId| var_map.get(&v).copied().unwrap_or(v);
     let rf = |f: FnId| fn_map.get(&f).copied().unwrap_or(f);
@@ -1979,6 +1986,24 @@ fn remap_flow(
             field: *field,
             field_name: field_name.clone(),
         },
+        FlowConstraint::ContainerElement {
+            dst,
+            owner,
+            element,
+        } => {
+            use trace_ir::ContainerOwner;
+            FlowConstraint::ContainerElement {
+                dst: rv(*dst),
+                owner: match owner {
+                    ContainerOwner::Variable(var) => ContainerOwner::Variable(rv(*var)),
+                    ContainerOwner::Field { class, name } => ContainerOwner::Field {
+                        class: remap_type(*class, type_map),
+                        name: name.clone(),
+                    },
+                },
+                element: remap_type(*element, type_map),
+            }
+        }
         FlowConstraint::ArrayFnMember { array, callee } => FlowConstraint::ArrayFnMember {
             array: rv(*array),
             callee: rf(*callee),
@@ -2246,7 +2271,7 @@ mod tests {
             src: VarId(2),
         };
         assert_eq!(
-            remap_flow(&flow, &FxHashMap::default(), &var_map),
+            remap_flow(&flow, &FxHashMap::default(), &var_map, &[]),
             FlowConstraint::UnwrapPointer {
                 dst: VarId(11),
                 src: VarId(12),
@@ -2322,6 +2347,27 @@ mod tests {
         without_flag.register_alias_ref_with_reference("Getter", &shape, false);
         merge_types(&mut dst, &without_flag, false, None);
         assert!(dst.alias_callable_returns_reference("Getter"));
+    }
+
+    #[test]
+    fn merge_types_keeps_the_first_known_alias_spelling() {
+        let alias = "Payload";
+        let shape = TypeDesc::Ptr(Box::new(TypeDesc::Int));
+        let mut src = trace_ir::TypeTable::new();
+        src.register_alias_ref(alias, &shape);
+        let mut dst = trace_ir::TypeTable::new();
+        merge_types(&mut dst, &src, false, None);
+        assert!(dst.alias_type_spelling(alias).is_none());
+
+        let first = Arc::<str>::from("unsigned int*");
+        src.set_alias_type_spelling(alias, &first);
+        merge_types(&mut dst, &src, false, None);
+        assert_eq!(dst.alias_type_spelling(alias), Some(&first));
+
+        src.set_alias_type_spelling(alias, &Arc::from("int*"));
+        merge_types(&mut dst, &src, false, None);
+        assert_eq!(dst.alias_type_spelling(alias), Some(&first));
+        assert_eq!(dst.resolve_alias(alias), Some(&shape));
     }
 
     fn int_field(name: &str) -> (String, TypeDesc) {
@@ -2413,6 +2459,15 @@ mod tests {
         ));
         header.intern(tag("Inner", vec![int_field("x")]));
         header.register_alias("OuterAlias", tag("Outer", Vec::new()));
+        let alias_spelling = Arc::<str>::from("Outer");
+        header.set_alias_type_spelling("OuterAlias", &alias_spelling);
+        let specialization = "std::vector<Outer*>";
+        let element = TypeDesc::Ptr(Box::new(tag("Outer", Vec::new())));
+        let element_cv = trace_ir::CvQualification {
+            object_const: false,
+            pointee_const: Some(true),
+        };
+        header.register_template_element(specialization, element.clone(), element_cv);
         header.complete_nested_tags();
 
         let mut full = trace_ir::TypeTable::new();
@@ -2427,6 +2482,15 @@ mod tests {
         assert_eq!(
             compact.resolve_alias("OuterAlias"),
             full.resolve_alias("OuterAlias")
+        );
+        assert_eq!(
+            compact.alias_type_spelling("OuterAlias"),
+            Some(&alias_spelling)
+        );
+        assert_eq!(compact.template_element(specialization), Some(&element));
+        assert_eq!(
+            compact.template_element_cv(specialization),
+            Some(element_cv)
         );
         // Alias lookups skip names no alias can end in; the merge must index
         // a compacted header's aliases in the importing table.

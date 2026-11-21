@@ -5,6 +5,292 @@ use trace_parse::build_program_with_jobs;
 use trace_preproc::PreprocessOptions;
 
 #[test]
+fn system_container_list_initializers_store_field_and_variable_elements() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let system = temp.path().join("system");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&system).unwrap();
+    fs::write(
+        system.join("vector"),
+        r#"
+namespace std {
+template<class T> class initializer_list;
+template<class T> struct allocator {};
+template<class F> class function;
+template<class R, class... Args> class function<R(Args...)> {
+public:
+    function();
+    template<class F> function(F);
+    R operator()(Args...) const;
+};
+template<class T, class Alloc = allocator<T>> struct vector {
+    vector(initializer_list<T>, const Alloc& = Alloc());
+    T& operator[](unsigned);
+};
+template<class K, class V> struct pair { K first; V second; };
+template<class K, class V> pair<K, V> make_pair(K, V);
+template<class K, class V> struct map {
+    void insert(pair<K, V>);
+    V& at(K);
+};
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.cpp"),
+        r#"
+#include <vector>
+using Callback = void (*)();
+void alpha() {}
+void beta() {}
+struct DefaultSlots { std::vector<Callback> slots{alpha}; DefaultSlots() {} };
+struct ExplicitSlots { std::vector<Callback> slots; ExplicitSlots() : slots{beta} {} };
+void read_default() { DefaultSlots holder; holder.slots[0](); }
+void read_explicit() { ExplicitSlots holder; holder.slots[0](); }
+void read_allocator() {
+    std::vector<Callback> values{{alpha, beta}, std::allocator<Callback>{}};
+    values[0]();
+}
+void read_named_allocator() {
+    std::allocator<Callback> alloc;
+    std::vector<Callback> values{{alpha, beta}, alloc};
+    values[0]();
+}
+void read_empty_allocator() {
+    std::vector<Callback> values{{alpha, beta}, {}};
+    values[0]();
+}
+void read_function_empty_allocator() {
+    std::vector<std::function<void()>> values{{alpha, beta}, {}};
+    values[0]();
+}
+void read_function_flat() {
+    std::vector<std::function<void()>> values{{alpha}, {}};
+    values[0]();
+}
+void read_pair_factory() {
+    std::map<int, Callback> values;
+    values.insert(std::make_pair(0, alpha));
+    values.at(0)();
+}
+void read_pair_first() {
+    std::pair<Callback, Callback> pair{alpha, beta};
+    pair.first();
+}
+void read_pair_second() {
+    std::pair<Callback, Callback> pair{alpha, beta};
+    pair.second();
+}
+void read_pair_variable() {
+    std::map<int, Callback> values;
+    std::pair<int, Callback> pair{0, beta};
+    values.insert(pair);
+    values.at(0)();
+}
+"#,
+    )
+    .unwrap();
+    for canonical in [false, true] {
+        let opts = PreprocessOptions::new()
+            .with_compiler_system_include(system.clone())
+            .with_canonical_system_headers(canonical);
+        let program = build_program_with_jobs(&root, &opts, 2).unwrap();
+        let (_, analysis) = analyze(&program);
+        let mut targets: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|edge| edge.resolution == trace_analysis::ResolutionKind::Indirect)
+            .map(|edge| {
+                (
+                    program.symbols.function(edge.caller).name.as_str(),
+                    program.symbols.function(edge.callee).name.as_str(),
+                )
+            })
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            [
+                ("read_allocator", "alpha"),
+                ("read_allocator", "beta"),
+                ("read_default", "alpha"),
+                ("read_empty_allocator", "alpha"),
+                ("read_empty_allocator", "beta"),
+                ("read_explicit", "beta"),
+                ("read_function_empty_allocator", "alpha"),
+                ("read_function_empty_allocator", "beta"),
+                ("read_function_flat", "alpha"),
+                ("read_named_allocator", "alpha"),
+                ("read_named_allocator", "beta"),
+                ("read_pair_factory", "alpha"),
+                ("read_pair_first", "alpha"),
+                ("read_pair_second", "beta"),
+                ("read_pair_variable", "beta"),
+            ],
+            "canonical={canonical}",
+        );
+    }
+}
+
+#[test]
+fn converting_standard_pairs_preserve_field_values_and_braced_constructors() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("pairs.cpp"),
+        r#"
+namespace std {
+template<class K, class V> struct pair {
+    K first;
+    V second;
+    pair() = default;
+    pair(K key, V value) : first(key), second(value) {}
+    template<class A, class B> pair(const pair<A, B>& other)
+        : first(other.first), second(other.second) {}
+    template<class A, class B> pair& operator=(const pair<A, B>& other) {
+        first = other.first;
+        second = other.second;
+        return *this;
+    }
+};
+}
+using Callback = void (*)();
+struct AggregateKey {};
+struct ConstructedKey {};
+namespace std {
+template<> struct pair<AggregateKey, Callback> { AggregateKey first; Callback second; };
+}
+template<> struct std::pair<ConstructedKey, Callback> {
+    ConstructedKey first;
+    Callback second;
+    pair(ConstructedKey key, Callback value) : first(key), second(value) {}
+};
+void alpha() {}
+void beta() {}
+void braced_pair() { std::pair<int, Callback> src{1, alpha}; }
+void braced_aggregate_pair() {
+    std::pair<AggregateKey, Callback> value{AggregateKey{}, alpha};
+    value.second();
+}
+void braced_constructed_pair() {
+    std::pair<ConstructedKey, Callback> value{ConstructedKey{}, beta};
+    value.second();
+}
+void assigned_pair() {
+    std::pair<int, Callback> src(1, alpha);
+    std::pair<long, Callback> dst{};
+    dst = src;
+    dst.second();
+}
+void copied_pair() {
+    std::pair<int, Callback> src{1, alpha};
+    std::pair<unsigned, Callback> dst = src;
+    dst.second();
+}
+void direct_copy_pair() {
+    std::pair<int, Callback> src{1, alpha};
+    std::pair<short, Callback> dst(src);
+    dst.second();
+}
+void braced_copy_pair() {
+    std::pair<Callback, Callback> src{alpha, beta};
+    std::pair<Callback, Callback const> dst{src};
+    dst.first();
+    dst.second();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program_with_jobs(root, &PreprocessOptions::new(), 2).unwrap();
+    let (pag, analysis) = analyze(&program);
+    let constructors: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| {
+            program.symbols.function(edge.caller).name == "braced_pair"
+                && edge.resolution == trace_analysis::ResolutionKind::Direct
+        })
+        .map(|edge| {
+            let callee = program.symbols.function(edge.callee);
+            (callee.name.as_str(), callee.explicit_arity)
+        })
+        .collect();
+    assert_eq!(constructors, [("std::pair::pair", Some(2))]);
+    let specialized_constructors: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter_map(|edge| {
+            let caller = program.symbols.function(edge.caller).name.as_str();
+            let callee = program.symbols.function(edge.callee).name.as_str();
+            (matches!(caller, "braced_aggregate_pair" | "braced_constructed_pair")
+                && callee.starts_with("std::pair"))
+            .then_some((caller, callee))
+        })
+        .collect();
+    assert_eq!(
+        specialized_constructors,
+        [(
+            "braced_constructed_pair",
+            "std::pair<ConstructedKey,void(*)()>::pair"
+        )]
+    );
+    let mut edges: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| edge.resolution == trace_analysis::ResolutionKind::Indirect)
+        .map(|edge| {
+            (
+                program.symbols.function(edge.caller).name.as_str(),
+                program.symbols.function(edge.callee).name.as_str(),
+            )
+        })
+        .collect();
+    edges.sort_unstable();
+    assert_eq!(
+        edges,
+        [
+            ("assigned_pair", "alpha"),
+            ("braced_aggregate_pair", "alpha"),
+            ("braced_constructed_pair", "beta"),
+            ("braced_copy_pair", "alpha"),
+            ("braced_copy_pair", "beta"),
+            ("copied_pair", "alpha"),
+            ("direct_copy_pair", "alpha"),
+        ]
+    );
+
+    let db = crate::common::export_program_full(&program, &pag, &analysis);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    for (caller, expression) in [("copied_pair", "src"), ("braced_copy_pair", "{src}")] {
+        let init = program
+            .symbols
+            .variables
+            .iter()
+            .find(|var| {
+                var.name == "dst"
+                    && var
+                        .fn_id
+                        .is_some_and(|id| program.symbols.function(id).name == caller)
+            })
+            .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT kind) FROM flow_origins WHERE file_id=?1 AND line=?2
+             AND expression=?3 AND kind IN ('load', 'store')",
+                rusqlite::params![init.span.file.0, init.span.line, expression],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "{caller} should attribute both the load and store"
+        );
+    }
+}
+
+#[test]
 fn canonical_scratch_names_do_not_change_exported_analysis() {
     let fixture = crate::common::fixture("preproc/lookup_context");
     let root = fixture.join("project");

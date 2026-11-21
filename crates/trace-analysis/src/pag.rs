@@ -4,8 +4,8 @@ use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{
-    CallSite, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow, StorageClass,
-    TypeDesc, TypeId, VarId,
+    CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow,
+    StorageClass, TargetId, TypeDesc, TypeId, VarId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -761,7 +761,47 @@ impl Pag {
         }
     }
 
+    fn container_element_location(
+        &mut self,
+        program: &Program,
+        owner: &ContainerOwner,
+        element: TypeId,
+        target: Option<TargetId>,
+    ) -> LocId {
+        let (var, name) = match owner {
+            ContainerOwner::Variable(var) => {
+                (Some(*var), program.symbols.variable(*var).name.clone())
+            }
+            ContainerOwner::Field { class, name } => {
+                let class = match program.types.get(*class).desc.as_ref() {
+                    TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => name,
+                    _ => unreachable!("container member has an aggregate owner"),
+                };
+                (None, format!("{class}.{name}"))
+            }
+        };
+        let fn_id = var.and_then(|var| program.symbols.variable(var).fn_id);
+        let desc = if let Some(owner) = fn_id {
+            format!("elements:{}::{name}", program.symbols.function(owner).name)
+        } else {
+            format!("elements:{name}")
+        };
+        let id = LocId(self.locations.len() as u32);
+        self.alloc_loc(AbstractLocation {
+            id,
+            kind: LocKind::ArraySummary,
+            var,
+            fn_id,
+            field: None,
+            type_id: element,
+            desc,
+        });
+        self.set_location_target(id, target);
+        id
+    }
+
     fn build_flow_constraints(&mut self, program: &Program, models: &ModelLookup) {
+        let mut container_elements = FxHashMap::default();
         for flow in &program.flow {
             match flow {
                 FlowConstraint::Copy { dst, src } => {
@@ -810,6 +850,33 @@ impl Pag {
                     let dst_n = self.var_node_id(*dst);
                     let base_n = self.var_node_id(*base);
                     self.add_gep(dst_n, base_n, *field, field_name.clone());
+                }
+                FlowConstraint::ContainerElement {
+                    dst,
+                    owner,
+                    element,
+                } => {
+                    let (owner, target) = match owner {
+                        ContainerOwner::Variable(var) => {
+                            (owner.clone(), program.symbols.variable(*var).target)
+                        }
+                        ContainerOwner::Field { class, name } => {
+                            let owner = ContainerOwner::Field {
+                                class: program.types.tag_identity(*class),
+                                name: name.clone(),
+                            };
+                            // Target merging scopes all retained variables,
+                            // including the temporary holding this cell's address.
+                            (owner, program.symbols.variable(*dst).target)
+                        }
+                    };
+                    let loc = *container_elements
+                        .entry((target, owner.clone(), *element))
+                        .or_insert_with(|| {
+                            self.container_element_location(program, &owner, *element, target)
+                        });
+                    let dst = self.var_node_id(*dst);
+                    self.add_addr_of(dst, self.loc_node[&loc]);
                 }
                 FlowConstraint::ArrayFnMember { array, callee } => {
                     let array_n = self.var_node_id(*array);

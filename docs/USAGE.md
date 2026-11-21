@@ -913,6 +913,8 @@ children's, so an argument's calls precede the call they are passed to.
   of `noexcept(e)`, the requirements of a `requires` expression, the
   controlling expression of `_Generic`, and the operand of `sizeof`,
   `alignof`, `decltype` and GNU `typeof`/`__typeof__` when it is a call.
+  Modeled C++ subscripts are also kept as unevaluated calls inside `sizeof`,
+  `alignof` and `decltype`.
   Those four do not evaluate their operand unless its type is variably
   modified (C11 6.5.3.4p2; GNU `typeof` likewise), and lowering does not
   know types: a call's result is never variably modified (parentheses

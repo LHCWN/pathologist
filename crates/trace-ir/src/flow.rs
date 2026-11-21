@@ -1,4 +1,5 @@
-use crate::{FieldId, FnId, VarId};
+use crate::{FieldId, FnId, TypeId, VarId};
+use std::sync::Arc;
 
 /// Abstract value returned from a function body (may-analysis: union all return sites).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -23,6 +24,13 @@ pub enum ReturnFlow {
     LvalueAddress(Box<ReturnFlow>),
 }
 
+/// Storage identity for a container with index-insensitive element flow.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ContainerOwner {
+    Variable(VarId),
+    Field { class: TypeId, name: Arc<str> },
+}
+
 /// Statement-level flow facts extracted during IR lowering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FlowConstraint {
@@ -45,6 +53,12 @@ pub enum FlowConstraint {
         base: VarId,
         field: FieldId,
         field_name: String,
+    },
+    /// `dst` points to the owner's summary cell for elements of `element` type.
+    ContainerElement {
+        dst: VarId,
+        owner: ContainerOwner,
+        element: TypeId,
     },
     /// Function-pointer array initializer: any subscript may target any listed callee.
     ArrayFnMember { array: VarId, callee: FnId },
@@ -98,6 +112,10 @@ impl FlowConstraint {
             | FlowConstraint::AddrOfVar { dst, src }
             | FlowConstraint::UnwrapPointer { dst, src } => (dst, Some(src)),
             FlowConstraint::GepField { dst, base, .. } => (dst, Some(base)),
+            FlowConstraint::ContainerElement { dst, ref owner, .. } => match owner {
+                ContainerOwner::Variable(var) => (dst, Some(*var)),
+                ContainerOwner::Field { .. } => (dst, None),
+            },
             FlowConstraint::CallReturnIndirect { dst, callee_var } => (dst, Some(callee_var)),
             FlowConstraint::ArrayFnMember { array, .. } => (array, None),
             FlowConstraint::AddrOfFn { dst, .. }

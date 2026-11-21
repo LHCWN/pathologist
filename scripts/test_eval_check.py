@@ -5,6 +5,7 @@ import io
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import eval_check
 
@@ -79,11 +80,45 @@ class RelationsTest(unittest.TestCase):
         got = eval_check.globals_from_db(self.db)
         self.assertEqual((got["public_functions_total"], got["public_edges_total"]), (2, 1))
 
+    def test_global_can_use_an_exact_platform_value(self):
+        spec = {"cmp": "exact", "value": 1910, "platform_values": {"win32": 1919}}
+        with patch.object(eval_check.sys, "platform", "win32"):
+            eval_check.check_global("diagnostics", 1919, spec)
+            self.assertEqual(eval_check.FAILS, 0)
+            eval_check.check_global("diagnostics", 1920, spec)
+            self.assertEqual(eval_check.FAILS, 1)
+        with patch.object(eval_check.sys, "platform", "linux"):
+            eval_check.check_global("diagnostics", 1910, spec)
+            self.assertEqual(eval_check.FAILS, 1)
+            eval_check.check_global("diagnostics", 1919, spec)
+            self.assertEqual(eval_check.FAILS, 2)
+
+    def test_global_can_have_only_platform_values(self):
+        spec = {"cmp": "exact", "platform_values": {"win32": 0}}
+        with patch.object(eval_check.sys, "platform", "win32"):
+            eval_check.check_global("diagnostics", 0, spec)
+            self.assertEqual(eval_check.FAILS, 0)
+            eval_check.check_global("diagnostics", 1, spec)
+            self.assertEqual(eval_check.FAILS, 1)
+        with patch.object(eval_check.sys, "platform", "linux"):
+            eval_check.check_global("diagnostics", 0, spec)
+            self.assertEqual(eval_check.FAILS, 2)
+
     def test_probe_reads_the_complete_graph_by_default(self):
         self.assertEqual(self.probe(3), 0)
 
     def test_probe_can_ask_for_the_public_graph(self):
         self.assertEqual(self.probe(2, relations="public"), 0)
+
+    def test_file_suffix_probes_work_with_windows_paths(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE files SET path = ?", (r"D:\src\a.cpp",))
+            conn.commit()
+
+        for relations in ("raw", "public"):
+            with self.subTest(relations=relations), closing(eval_check.connect(self.db, relations)) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM files WHERE path LIKE '%/src/a.cpp'").fetchone(), (1,))
+                self.assertEqual(conn.execute("SELECT path FROM main.files").fetchone(), (r"D:\src\a.cpp",))
 
     def test_probe_rejects_an_unknown_graph(self):
         with self.assertRaises(ValueError):

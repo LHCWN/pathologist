@@ -1,5 +1,5 @@
 {
-  "note": "PR #257 expectation centers were recaptured relative to parent aa6f846, including HDF functions_total 12198 -> 12172, indirect edges 5153 -> 5226 and arg_flow_edges 72400 -> 72585; HiView and Camera centers were also recaptured. The 2026-11-13 owner-dependency/reference-alias/receiver-qualification follow-up remeasured every HDF, HiView and Camera global with release analyzer 3980106-dirty including all production changes in this amend, at jobs 1 and 8, matching the preceding 3980106 review snapshot. Existing tolerances were retained. Source/binary identities, strict compiler cases, parent differential residuals and the Camera metadata audit are in docs/EVAL_REPORT.md, Dependent owners, reference aliases and receiver qualification. Other corpora, including ability_runtime, carry forward earlier measurements and were not rerun here.",
+  "note": "PR #257 expectation centers were recaptured relative to parent aa6f846, including HDF functions_total 12198 -> 12172, indirect edges 5153 -> 5226 and arg_flow_edges 72400 -> 72585; HiView and Camera centers were also recaptured. The 2026-11-13 owner-dependency/reference-alias/receiver-qualification follow-up remeasured every HDF, HiView and Camera global with release analyzer 3980106-dirty including all production changes in this amend, at jobs 1 and 8, matching the preceding 3980106 review snapshot. Existing tolerances were retained. Source/binary identities, strict compiler cases, parent differential residuals and the Camera metadata audit are in docs/EVAL_REPORT.md, Dependent owners, reference aliases and receiver qualification. Ability Runtime was recaptured from local master bb64b1e on 2026-11-19 with unchanged tolerances. See docs/EVAL_REPORT.md for the rebase comparison.",
   "budget_pops": 800000,
   "jobs": 8,
   "corpora": {
@@ -19,7 +19,7 @@
         "edges_external": {"cmp": "band", "value": 23874, "tol": 200},
         "edges_ipc": {"cmp": "exact", "value": 58},
         "arg_flow_edges": {"cmp": "band", "value": 72585, "tol": 150},
-        "diagnostics": {"cmp": "exact", "value": 1910},
+        "diagnostics": {"cmp": "exact", "value": 1910, "platform_values": {"win32": 1919}},
         "dlsym_edges": {"cmp": "exact", "value": 6},
         "public_functions_total": {"cmp": "band", "value": 12131, "tol": 20},
         "public_edges_total": {"cmp": "band", "value": 78844, "tol": 80}
@@ -209,9 +209,9 @@
       "analyze_args": ["--ignore-logging", "--timeout-secs", "600"],
       "globals": {
         "edges_ipc": {"cmp": "exact", "value": 1762},
-        "edges_indirect": {"cmp": "exact", "value": 1849},
-        "public_functions_total": {"cmp": "band", "value": 78881, "tol": 400},
-        "public_edges_total": {"cmp": "band", "value": 373780, "tol": 1300}
+        "edges_indirect": {"cmp": "exact", "value": 2043},
+        "public_functions_total": {"cmp": "band", "value": 77351, "tol": 400},
+        "public_edges_total": {"cmp": "band", "value": 376130, "tol": 1300}
       },
       "probes": [
         {"name": "a wrapped callable starts no execution context (#283)", "sql": "SELECT COUNT(*) FROM execution_contexts WHERE model IN ('std::bind','std::packaged_task::packaged_task')", "cmp": "exact", "value": 0},
@@ -223,7 +223,7 @@
         {"name": "integer StartAbility arguments exclude six remote-token overload edges (#244)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id WHERE ((c.name='OHOS::AAFwk::AbilityManagerShellCommand::RunAsStartAbility' AND s.line=486) OR (c.name='OHOS::AAFwk::AbilityManagerShellCommand::StartAbilityWithWait' AND s.line=2753) OR (c.name='OHOS::AAFwk::ClawAaShellCommand::StartAbilityWithWait' AND s.line=1086) OR (c.name='OHOS::AAFwk::AbilityUtil::StartAppgallery' AND s.line=387)) AND t.name='OHOS::AAFwk::AbilityManagerClient::StartAbility' AND t.signature LIKE '%IRemoteObject%'", "cmp": "exact", "value": 0},
         {"name": "integer StartAbility arguments retain nine matching production/mock definitions (#244)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id WHERE ((c.name='OHOS::AAFwk::AbilityManagerShellCommand::RunAsStartAbility' AND s.line=486) OR (c.name='OHOS::AAFwk::AbilityManagerShellCommand::StartAbilityWithWait' AND s.line=2753) OR (c.name='OHOS::AAFwk::ClawAaShellCommand::StartAbilityWithWait' AND s.line=1086) OR (c.name='OHOS::AAFwk::AbilityUtil::StartAppgallery' AND s.line=387)) AND t.name='OHOS::AAFwk::AbilityManagerClient::StartAbility'", "cmp": "exact", "value": 9},
         {"name": "DataObsOption header defaults retain evaluated constructors in the raw graph (#244)", "sql": "SELECT COUNT(*) FROM raw_call_edges e JOIN raw_call_sites s ON s.id=e.call_site_id JOIN files p ON p.id=s.file_id JOIN raw_functions t ON t.id=e.callee_fn_id WHERE t.name='OHOS::AAFwk::DataObsOption::DataObsOption' AND p.path LIKE '%.h'", "cmp": "exact", "value": 75},
-        {"name": "known imprecision: four default LifecycleFlow aggregate calls (#244)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN files p ON p.id=s.file_id JOIN functions t ON t.id=e.callee_fn_id WHERE p.path LIKE '%/services/appdfr/include/appfreeze_manager.h' AND s.line=111 AND t.name='FreezeUtil::LifecycleFlow' AND e.resolution='external'", "cmp": "exact", "value": 4},
+        {"name": "known imprecision: five default LifecycleFlow aggregate calls (#244)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN call_sites s ON s.id=e.call_site_id JOIN files p ON p.id=s.file_id JOIN functions t ON t.id=e.callee_fn_id WHERE p.path LIKE '%/services/appdfr/include/appfreeze_manager.h' AND s.line=111 AND t.name='FreezeUtil::LifecycleFlow' AND e.resolution='external'", "cmp": "exact", "value": 5},
         {"name": "SendTransactCmd-only sender functions with IPC bridges", "sql": "WITH senders AS (SELECT caller_fn_id FROM call_sites GROUP BY caller_fn_id HAVING MAX(callee_text LIKE '%SendTransactCmd')=1 AND MAX(callee_text LIKE '%SendRequest')=0) SELECT COUNT(DISTINCT e.caller_fn_id) FROM call_edges e JOIN senders s ON s.caller_fn_id=e.caller_fn_id WHERE e.resolution='ipc'", "cmp": "exact", "value": 187},
         {"name": "scheduler operations calling SendTransactCmd", "sql": "WITH senders AS (SELECT DISTINCT s.caller_fn_id FROM call_sites s JOIN files f ON f.id=s.file_id WHERE f.path LIKE '%/services/abilitymgr/src/ability_scheduler_proxy.cpp' AND s.callee_text LIKE '%SendTransactCmd'), counts AS (SELECT s.caller_fn_id, COUNT(e.id) AS bridges FROM senders s LEFT JOIN call_edges e ON e.caller_fn_id=s.caller_fn_id AND e.resolution='ipc' GROUP BY s.caller_fn_id) SELECT COUNT(*) FROM counts", "cmp": "exact", "value": 39},
         {"name": "scheduler operations with IPC bridges", "sql": "WITH senders AS (SELECT DISTINCT s.caller_fn_id FROM call_sites s JOIN files f ON f.id=s.file_id WHERE f.path LIKE '%/services/abilitymgr/src/ability_scheduler_proxy.cpp' AND s.callee_text LIKE '%SendTransactCmd'), counts AS (SELECT s.caller_fn_id, COUNT(e.id) AS bridges FROM senders s LEFT JOIN call_edges e ON e.caller_fn_id=s.caller_fn_id AND e.resolution='ipc' GROUP BY s.caller_fn_id) SELECT SUM(bridges > 0) FROM counts", "cmp": "exact", "value": 39},

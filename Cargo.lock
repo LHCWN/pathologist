@@ -958,7 +958,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "tempfile",
- "thiserror",
+ "toml",
 ]
 
 [[package]]

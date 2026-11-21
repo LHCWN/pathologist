@@ -1,0 +1,30 @@
+[[container]]
+name = "std::deque"
+element = 0
+operations = [
+    { kind = "store", method = "push_front", arity = 1, value = 0 },
+    { kind = "access", method = "front", arity = 0 },
+    { kind = "access", method = "operator[]", arity = 1 },
+]
+
+[[container]]
+name = "std::map"
+element = 1
+operations = [
+    { kind = "store", method = "insert_or_assign", arity = 2, value = 1 },
+    { kind = "access", method = "operator[]", arity = 1 },
+]
+
+[[container]]
+name = "std::vector"
+element = 0
+operations = []
+
+[[container]]
+name = "app::Box"
+element = 0
+operations = [
+    { kind = "store", method = "put", arity = 1, value = 0 },
+    { kind = "store", method = "put_extra", arity = 2, value = 0 },
+    { kind = "access", method = "get", arity = 0 },
+]
