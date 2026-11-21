@@ -1628,21 +1628,13 @@ fn solve(
                                         models,
                                         &mut visited,
                                     );
-                                    // Index any new constraints added by expand_return_flows
-                                    // and push their sources onto the worklist so the solver
-                                    // processes them.
-                                    if pag.constraints.len() > constraint_before {
-                                        // `return &v` / `return fn` hand out an
-                                        // address: seed it like the ones present
-                                        // at solve start.
-                                        for c in &pag.constraints[constraint_before..] {
-                                            seed_addr_of(pag, program, &mut st, &mut scratch, c);
-                                        }
-                                        let new_srcs = pag.index_new_constraints(constraint_before);
-                                        for src in new_srcs {
-                                            st.push(src);
-                                        }
-                                    }
+                                    activate_return_constraints(
+                                        pag,
+                                        program,
+                                        &mut st,
+                                        &mut scratch,
+                                        constraint_before,
+                                    );
                                 }
                             }
                         }
@@ -1656,14 +1648,13 @@ fn solve(
                                 models,
                                 &mut FxHashSet::default(),
                             );
-                            if pag.constraints.len() > before {
-                                for c in &pag.constraints[before..] {
-                                    seed_addr_of(pag, program, &mut st, &mut scratch, c);
-                                }
-                                for src in pag.index_new_constraints(before) {
-                                    st.push(src);
-                                }
-                            }
+                            activate_return_constraints(
+                                pag,
+                                program,
+                                &mut st,
+                                &mut scratch,
+                                before,
+                            );
                         }
                         apply_fn_model(
                             pag,
@@ -1998,6 +1989,28 @@ fn wire_epoll_copy(
             dst,
             scratch.wire_src.iter().copied(),
         );
+    }
+}
+
+/// A callee may resolve after a returned value's source has already settled.
+/// Replay those facts through the newly indexed edges as well as future deltas.
+fn activate_return_constraints(
+    pag: &mut Pag,
+    program: &Program,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    from: usize,
+) {
+    for constraint in &pag.constraints[from..] {
+        seed_addr_of(pag, program, st, scratch, constraint);
+    }
+    for src in pag.index_new_constraints(from) {
+        if let Some(pts) = st.pts.get(&src) {
+            scratch.wire_src.clear();
+            scratch.wire_src.extend(pts.iter().copied());
+            st.record_delta(src, &scratch.wire_src);
+            st.push(src);
+        }
     }
 }
 

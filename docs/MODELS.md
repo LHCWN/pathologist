@@ -520,6 +520,73 @@ names one member of the parameter's pointee (no whitespace, one name, not a
 path). Anything else, or both tests on one effect, is rejected when the file is
 loaded.
 
+### Container element models
+
+A `--models` file can also define `[[container]]` tables alongside function
+models. Container models apply
+during C++ lowering because an accessor must supply both an element type and
+an address. Each table names a class template and the zero-based position of
+its element type argument. Operations name declared members and count explicit
+arguments. Declaration matching accounts for default arguments and variadic
+tails. An `access` operation reads or writes the element cell through its
+result. A `store` operation writes the value of the selected argument.
+
+```toml
+[[container]]
+name = "std::deque"
+element = 0
+initializer_list = true
+operations = [
+  { kind = "store", method = "push_front", arity = 1, value = 0 },
+  { kind = "store", method = "push_back", arity = 1, value = 0 },
+  { kind = "access", method = "operator[]", arity = 1 },
+  { kind = "access", method = "front", arity = 0 },
+]
+```
+
+`initializer_list` enables braced elements for named variables, default member
+initializers, and constructor member initializers when an initializer-list
+constructor is declared. Parenthesized construction accepts an explicit
+allocator after the list. Braced construction can also use a nested list
+followed by a typed allocator when an indexed list constructor accepts both
+arguments. `initializer_allocator` gives the zero-based template argument for
+that allocator when the constructor's parameter type depends on the template.
+Named `std::allocator<T>` objects keep their template arguments for this match.
+An empty second argument `{}` uses the indexed constructor parameter when the
+outer braces cannot initialize the elements directly. For example,
+`std::vector<std::function<void()>> v{{alpha, beta}, {}}` stores both callbacks
+from the inner list.
+Omit `initializer_list` to leave brace handling to ordinary lowering.
+A later table for the same class replaces its
+element, initializer, and operation settings. Omit `declaration_aliases`
+to inherit the previous aliases, supply a list to replace them, or use
+`declaration_aliases = []` to clear them. An empty operation list with
+`initializer_list` omitted disables the model for that class.
+`declaration_aliases` can list alternate qualified owners in standard-library
+implementations. The built-ins recognize libc++'s `std::__1` owners and
+libstdc++'s `std::__cxx11::list`.
+
+`initializer_entry` selects a zero-based value in each braced entry of an
+initializer list. A `store` operation can use `entry` to select a value from a
+braced argument, as in `map.insert({key, callback})`. A missing template
+argument or entry slot contributes no model effect. Diagnostics for invalid
+indices that depend on the indexed C++ declaration are a follow-up. An
+`iterator` operation connects a lookup result to the container cell and names the field that
+projects it, as in `find(...)->second`. With `member` omitted, dereferencing
+the iterator reads the cell, as in `*set.find(key)`. A local `auto` iterator
+keeps that connection through ordinary copies and assignments.
+
+The model supports pointer, function-pointer, and directly spelled
+`std::function` elements and uses a single
+cell across all indices or keys of one modeled container. Erasure and
+replacement keep previously stored values reachable. A map model can choose
+the mapped type argument and select the value argument in `insert_or_assign`.
+The built-ins cover `std::vector`, `std::deque`, `std::list`,
+`std::forward_list`, `std::queue`, `std::set`, `std::unordered_set`,
+`std::map`, and `std::unordered_map`.
+See [Container elements](CXX.md#container-elements) for storage
+identity and canonical indexing.
+
 ### Modeling recipes (examples)
 
 The tables below are examples, not additional rules: each is expressed with the

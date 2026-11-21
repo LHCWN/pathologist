@@ -22,6 +22,652 @@ fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) ->
 analyzed_fixture!(cpp_wrapper_construction);
 analyzed_fixture!(cpp_declared_wrapper);
 analyzed_fixture!(cpp_wrapper_boundaries);
+#[test]
+fn vector_elements_keep_targets_and_storage_boundaries() {
+    let root = fixture("cpp_vector_elements");
+    let program = &build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (caller, expected) in [
+        ("array_control", &["alpha"][..]),
+        ("ArrayHolder::fire", &["alpha", "beta"][..]),
+        ("stored", &["alpha"][..]),
+        ("braced_insertion", &["alpha"][..]),
+        ("inline_function_pointer", &["beta"][..]),
+        ("element_type_in_declaration_scope", &["alpha"][..]),
+        ("unknown_index", &["alpha", "beta"][..]),
+        ("assigned", &["beta"][..]),
+        ("initialized", &["alpha", "beta"][..]),
+        ("initialized_with_braced_elements", &["alpha", "beta"][..]),
+        ("parenthesized_list", &["alpha"][..]),
+        ("parenthesized_list_with_allocator", &["beta"][..]),
+        ("braced_list_with_allocator", &["alpha", "beta"][..]),
+        ("braced_list_with_empty_allocator", &["alpha", "beta"][..]),
+        ("braced_list_with_empty_callback", &["alpha"][..]),
+        ("read_default_member_initializer", &["alpha"][..]),
+        ("read_explicit_member_initializer", &["beta"][..]),
+        ("read_implicit_member_initializer", &["beta"][..]),
+        ("inserted_member", &["beta"][..]),
+        ("initialized_member", &["beta"][..]),
+        ("isolated", &["alpha"][..]),
+        ("unevaluated", &["alpha"][..]),
+        ("invoke", &["beta"][..]),
+        ("read_global", &["beta"][..]),
+        ("invoke_returned", &["beta"][..]),
+        ("read_field", &["alpha"][..]),
+        ("user_vector", &[][..]),
+    ] {
+        let mut targets: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(program, edge.caller) == caller)
+            .map(|edge| fn_name(program, edge.callee))
+            .filter(|name| matches!(name.as_str(), "alpha" | "beta" | "unrelated"))
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        assert_eq!(targets, expected, "{caller}");
+    }
+    assert!(has_any_edge(
+        program,
+        &analysis,
+        "pointer_element",
+        "Handler::run"
+    ));
+    assert!(has_any_edge(
+        program,
+        &analysis,
+        "stored",
+        "std::vector::operator[]"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "pointer_element",
+        "OtherHandler::run"
+    ));
+    assert!(pag
+        .locations
+        .iter()
+        .any(|loc| loc.desc == "elements:stored::callbacks"));
+    for ns in ["plain_first", "alias_first"] {
+        for (caller, expected, wrong) in [("plain", "Left", "Right"), ("aliased", "Right", "Left")]
+        {
+            let caller = format!("{ns}::{caller}");
+            assert!(
+                has_any_edge(
+                    program,
+                    &analysis,
+                    &caller,
+                    &format!("{ns}::{expected}::hit")
+                ),
+                "{caller}"
+            );
+            assert!(
+                must_not_have_edge(program, &analysis, &caller, &format!("{ns}::{wrong}::hit")),
+                "{caller}"
+            );
+        }
+    }
+    let selected = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "selected")
+        .unwrap();
+    let pointees: Vec<_> = analysis.points_to[&pag.var_node[&selected.id]]
+        .iter()
+        .map(|loc| pag.locations[loc.0 as usize].desc.as_str())
+        .collect();
+    assert_eq!(pointees, ["item"]);
+
+    let overloads = program.symbols.functions_named("select_vector");
+    assert_eq!(overloads.len(), 2);
+    let selected: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(program, edge.caller) == "only_signed_vector")
+        .filter(|edge| fn_name(program, edge.callee) == "select_vector")
+        .map(|edge| {
+            let target = program.symbols.function(edge.callee);
+            program.symbols.files[target.file.0 as usize]
+                .path
+                .file_name()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(selected, ["signed_overload.cpp"]);
+
+    assert_eq!(program.symbols.functions_named("match_const").len(), 1);
+    assert_eq!(
+        program.symbols.functions_named("match_callback_cv").len(),
+        1
+    );
+    assert_eq!(
+        program.symbols.functions_named("match_pointer_const").len(),
+        2
+    );
+    let mut cv_targets: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(program, edge.caller) == "cross_tu_cv")
+        .filter_map(|edge| {
+            let callee = program.symbols.function(edge.callee);
+            callee.name.starts_with("match_").then(|| {
+                assert_eq!(edge.resolution, ResolutionKind::Direct);
+                assert!(program.symbols.files[callee.file.0 as usize]
+                    .path
+                    .ends_with("signed_overload.cpp"));
+                callee.name.as_str()
+            })
+        })
+        .collect();
+    cv_targets.sort_unstable();
+    assert_eq!(
+        cv_targets,
+        ["match_callback_cv", "match_const", "match_pointer_const"]
+    );
+
+    let source = include_str!("../../../../tests/fixtures/cpp_vector_elements/main.cpp");
+    let (definition_line, definition) = source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.starts_with("#define SUBSCRIPT_CALLS"))
+        .unwrap();
+    let invocation_line = source
+        .lines()
+        .position(|line| line.trim().starts_with("SUBSCRIPT_CALLS("))
+        .unwrap();
+    let mut macro_sites: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| {
+            fn_name(program, edge.caller) == "macro_subscripts"
+                && fn_name(program, edge.callee) == "std::vector::operator[]"
+        })
+        .map(|edge| {
+            let site = program.symbols.call_site_by_id(edge.call_site).unwrap();
+            assert_eq!(site.span.line, definition_line as u32 + 1);
+            let invocation = site.expansion_span.expect("macro invocation span");
+            assert_eq!(
+                (invocation.line, invocation.col),
+                (invocation_line as u32 + 1, 5)
+            );
+            site.span.col
+        })
+        .collect();
+    macro_sites.sort_unstable();
+    let brackets: Vec<_> = definition
+        .match_indices('[')
+        .map(|(column, _)| column as u32 + 1)
+        .collect();
+    assert_eq!(macro_sites, brackets);
+}
+
+#[test]
+fn braced_vector_construction_checks_element_conversions() {
+    let root = fixture("cpp_vector_elements");
+    let program = build_program(&root, &default_opts(&root)).unwrap();
+    for (name, expected) in [
+        ("braced_size_constructor", &[Some(1)][..]),
+        ("braced_size_enum", &[Some(1)][..]),
+        ("braced_size_call", &[Some(1)][..]),
+        ("braced_size_expression", &[Some(1)][..]),
+        ("braced_overloaded_sum", &[Some(2)][..]),
+        ("braced_builtin_enum_sum", &[Some(1)][..]),
+        ("braced_nonviable_enum_sum", &[Some(1)][..]),
+        ("braced_nonviable_integer_sum", &[Some(1)][..]),
+        ("braced_enum_sum_with_null", &[Some(2)][..]),
+        ("braced_nonviable_pointer_sum", &[Some(2)][..]),
+        ("braced_scoped_enum_constant", &[Some(2)][..]),
+        ("braced_scoped_enum_variable", &[Some(2)][..]),
+        ("braced_scoped_enum_no_promotion", &[Some(2)][..]),
+        (
+            "scoped_operations::braced_scoped_enum_local",
+            &[Some(2)][..],
+        ),
+        ("braced_array_decay", &[Some(2)][..]),
+        ("braced_null_constructor", &[Some(2)][..]),
+        ("braced_list_with_allocator", &[Some(2)][..]),
+        ("braced_list_with_empty_allocator", &[Some(2)][..]),
+        ("braced_list_with_empty_callback", &[Some(2)][..]),
+        ("braced_uncertain_conversion", &[Some(1), Some(2)][..]),
+    ] {
+        let mut arities: Vec<_> = program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|site| {
+                fn_name(&program, site.caller) == name
+                    && site.callee_name.as_str() == "std::vector::vector"
+            })
+            .map(|site| {
+                program
+                    .symbols
+                    .function(site.callee_fn_id.unwrap())
+                    .explicit_arity
+            })
+            .collect();
+        arities.sort_unstable();
+        assert_eq!(arities, expected, "{name}");
+    }
+    for (caller, uses_default) in [
+        ("braced_list_with_allocator", false),
+        ("braced_list_with_empty_allocator", false),
+        ("braced_list_with_empty_callback", true),
+    ] {
+        let evaluated_default = program.symbols.call_sites.iter().any(|site| {
+            fn_name(&program, site.caller) == caller
+                && site
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.default_origin.is_some())
+        });
+        assert_eq!(evaluated_default, uses_default, "{caller}");
+    }
+}
+
+#[test]
+fn vector_default_template_arguments_match_across_translation_units() {
+    let root = fixture("cpp_vector_elements");
+    let program = &build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(program);
+    for (caller, expected, definition_line) in [
+        ("call_default_allocator", "match_default_allocator", 3),
+        ("call_dependent_default", "match_dependent_default", 5),
+    ] {
+        assert_eq!(
+            program.symbols.functions_named(expected).len(),
+            2,
+            "{caller}"
+        );
+        let callees: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(program, edge.caller) == caller)
+            .map(|edge| {
+                assert_eq!(edge.resolution, ResolutionKind::Direct);
+                let callee = program.symbols.function(edge.callee);
+                assert!(callee.is_defined);
+                assert!(program.symbols.files[callee.file.0 as usize]
+                    .path
+                    .ends_with("default_arg_defs.cpp"));
+                assert_eq!(callee.span.line, definition_line);
+                callee.name.as_str()
+            })
+            .collect();
+        assert_eq!(callees, [expected]);
+    }
+}
+
+#[test]
+fn vector_subscripts_resolve_on_the_instantiated_owner() {
+    let root = fixture("cpp_vector_elements");
+    let program = build_program(&root, &default_opts(&root)).unwrap();
+    let (_, analysis) = analyze(&program);
+    for (name, specialized) in [
+        ("stored", false),
+        ("inline_function_pointer", false),
+        ("bool_subscript", true),
+    ] {
+        let targets: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(&program, edge.caller) == name)
+            .map(|edge| fn_name(&program, edge.callee))
+            .filter(|callee| callee.ends_with("::operator[]"))
+            .collect();
+        assert_eq!(targets.len(), 1, "{name}: {targets:?}");
+        assert_eq!(targets[0].starts_with("std::vector<bool,"), specialized);
+        if specialized {
+            assert!(has_edge(
+                &program,
+                &analysis,
+                name,
+                &targets[0],
+                ResolutionKind::Direct
+            ));
+        }
+    }
+}
+
+#[test]
+fn ignored_subscript_brackets_suppress_container_reads_and_writes() {
+    let root = fixture("cpp_vector_elements");
+    let opts = default_opts(&root).with_ignored_macros(["IGNORED_VECTOR_SLOT".to_owned()]);
+    let program = build_program(&root, &opts).unwrap();
+    let (_, analysis) = analyze(&program);
+    let mut targets = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "ignored_vector_subscripts")
+        .map(|edge| fn_name(&program, edge.callee))
+        .filter(|callee| {
+            matches!(
+                callee.as_str(),
+                "alpha" | "beta" | "std::vector::operator[]"
+            )
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    assert_eq!(targets, ["alpha", "std::vector::operator[]"]);
+}
+
+#[test]
+fn container_element_models_configure_deque_and_map_through_cli() {
+    let root = fixture("cpp_container_models");
+    let models = root.join("models.toml");
+    let targets = |args: &[&str]| {
+        let db = common::cli_analyze(&root, args);
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        let mut query = conn
+            .prepare(
+                "SELECT DISTINCT caller.name, callee.name FROM raw_call_edges AS edge \
+             JOIN raw_functions AS caller ON caller.id = edge.caller_fn_id \
+             JOIN raw_functions AS callee ON callee.id = edge.callee_fn_id \
+             WHERE callee.name IN ('alpha', 'beta', 'unrelated') \
+             ORDER BY caller.name, callee.name",
+            )
+            .unwrap();
+        query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>()
+    };
+    let expected = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(caller, callee)| (caller.to_string(), callee.to_string()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        targets(&[]),
+        expected(&[
+            ("deque_dispatch", "alpha"),
+            ("deque_dispatch", "beta"),
+            ("map_dispatch", "beta"),
+            ("vector_dispatch", "alpha")
+        ])
+    );
+    assert_eq!(
+        targets(&["--models", models.to_str().unwrap()]),
+        expected(&[
+            ("defaulted_box_dispatch", "alpha"),
+            ("defaulted_box_dispatch", "beta"),
+            ("deque_dispatch", "alpha"),
+            ("deque_dispatch", "beta"),
+            ("map_dispatch", "beta")
+        ]),
+    );
+}
+
+#[test]
+fn cached_container_headers_keep_libcpp_declarations_and_ordinary_receivers() {
+    let root = fixture("cpp_container_headers");
+    let db = common::cli_analyze(&root, &["--jobs", "4", "--timeout-secs", "10"]);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let targets = common::text_rows(
+        &conn,
+        "SELECT DISTINCT caller.name, callee.name, edge.resolution FROM raw_call_edges edge
+         JOIN raw_functions caller ON caller.id = edge.caller_fn_id
+         JOIN raw_functions callee ON callee.id = edge.callee_fn_id
+         WHERE caller.name IN ('run_from_header', 'ordinary_second_chain', 'ordinary_front_chain')
+         AND callee.name IN ('alpha', 'Node::run', 'Chain::run') ORDER BY caller.name",
+    );
+    assert_eq!(
+        targets,
+        [
+            [
+                r#"Text("ordinary_front_chain")"#,
+                r#"Text("Chain::run")"#,
+                r#"Text("direct")"#,
+            ],
+            [
+                r#"Text("ordinary_second_chain")"#,
+                r#"Text("Node::run")"#,
+                r#"Text("direct")"#
+            ],
+            [
+                r#"Text("run_from_header")"#,
+                r#"Text("alpha")"#,
+                r#"Text("indirect")"#
+            ],
+        ]
+    );
+}
+
+#[test]
+fn container_model_override_inherits_libcpp_aliases_unless_cleared() {
+    let root = fixture("cpp_container_headers");
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models.toml");
+    let config = r#"
+[[container]]
+name = "std::vector"
+element = 0
+operations = [
+    { kind = "store", method = "push_back", arity = 1, value = 0 },
+    { kind = "access", method = "operator[]", arity = 1 },
+]
+"#;
+    for (aliases, expected) in [("", 1), ("declaration_aliases = []", 0)] {
+        std::fs::write(&models, format!("{config}\n{aliases}\n")).unwrap();
+        let db = common::cli_analyze(&root, &["--models", models.to_str().unwrap()]);
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        let count: u32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT callee.id) FROM raw_call_edges edge
+                 JOIN raw_functions caller ON caller.id = edge.caller_fn_id
+                 JOIN raw_functions callee ON callee.id = edge.callee_fn_id
+                 WHERE caller.name = 'run_from_header' AND callee.name = 'alpha'
+                 AND edge.resolution = 'indirect'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, expected, "declaration aliases: {aliases:?}");
+    }
+}
+
+#[test]
+fn field_owned_container_elements_stay_within_the_link_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("holder.h"),
+        r#"#pragma once
+namespace std {
+template<class T> struct vector {
+    void push_back(T);
+    T& operator[](unsigned);
+};
+}
+struct Holder { std::vector<void (*)()> slots; };
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("reader.cpp"),
+        "#include \"holder.h\"\nvoid read_slots() { Holder value; value.slots[0](); }",
+    )
+    .unwrap();
+    for callback in ["alpha", "beta"] {
+        std::fs::write(
+            root.join(format!("{callback}.cpp")),
+            format!(
+                "#include \"holder.h\"\nvoid {callback}() {{}}\n\
+                 void store() {{ Holder value; value.slots.push_back({callback}); }}"
+            ),
+        )
+        .unwrap();
+    }
+    let compiles = ["reader", "alpha", "beta"].map(|name| {
+        let file = format!("{name}.cpp");
+        let output = format!("{name}.o");
+        serde_json::json!({
+            "directory":root, "file":file, "output":output,
+            "arguments":["c++","-c",file,"-o",output],
+        })
+    });
+    let links = ["alpha", "beta"].map(|name| {
+        serde_json::json!({
+            "directory":root, "output":name,
+            "arguments":["c++","reader.o",format!("{name}.o"),"-o",name],
+        })
+    });
+    for (file, data) in [
+        ("compile_commands.json", serde_json::to_vec(&compiles)),
+        ("link_commands.json", serde_json::to_vec(&links)),
+    ] {
+        std::fs::write(root.join(file), data.unwrap()).unwrap();
+    }
+
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let temporary_targets: std::collections::BTreeSet<_> = program
+        .flow
+        .iter()
+        .filter_map(|flow| match flow {
+            trace_ir::FlowConstraint::ContainerElement {
+                dst,
+                owner: trace_ir::ContainerOwner::Field { .. },
+                ..
+            } => {
+                let temp = program.symbols.variable(*dst);
+                assert!(temp.is_synthetic);
+                let caller = program.symbols.function(temp.fn_id.unwrap());
+                assert_eq!(temp.target, caller.target);
+                Some(
+                    temp.target
+                        .expect("field address temporary has a link target"),
+                )
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(temporary_targets.len(), 2);
+
+    let (pag, analysis) = analyze(&program);
+    assert_eq!(
+        pag.locations
+            .iter()
+            .filter(|loc| loc.desc == "elements:Holder.slots")
+            .count(),
+        2
+    );
+    let mut callbacks: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter_map(|edge| {
+            let caller = program.symbols.function(edge.caller);
+            if caller.name != "read_slots" || edge.resolution != ResolutionKind::Indirect {
+                return None;
+            }
+            let callee = program.symbols.function(edge.callee);
+            assert_eq!(
+                caller.target, callee.target,
+                "field cell crossed link targets"
+            );
+            Some(callee.name.as_str())
+        })
+        .collect();
+    callbacks.sort_unstable();
+    assert_eq!(callbacks, ["alpha", "beta"]);
+}
+
+#[test]
+fn container_lookup_preserves_ownership_and_callable_values() {
+    let root = fixture("cpp_container_lookup");
+    let program = &build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(program);
+    assert_eq!(
+        direct_targets(program, &analysis, "map_lookup"),
+        ["std::map::map"]
+    );
+    let targets = |caller: &str| {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|edge| {
+                fn_name(program, edge.caller) == caller
+                    && edge.resolution == ResolutionKind::Indirect
+            })
+            .map(|edge| fn_name(program, edge.callee))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    for (caller, expected) in [
+        ("list_dispatch", &["alpha"][..]),
+        ("forward_list_dispatch", &["beta"][..]),
+        ("vector_position_dispatch", &["alpha", "beta"][..]),
+        ("vector_insert_list", &["alpha", "beta"][..]),
+        ("set_insert_list", &["alpha", "beta"][..]),
+        ("map_insert_factory_pair", &["alpha"][..]),
+        ("map_insert_named_pair", &["beta"][..]),
+        ("map_insert_list", &["alpha", "beta"][..]),
+        ("queue_front_dispatch", &["alpha", "beta"][..]),
+        ("queue_back_dispatch", &["beta"][..]),
+        ("set_iterator_dispatch", &["alpha"][..]),
+        ("set_lookup_dispatch", &["alpha", "beta"][..]),
+        ("invoke_set_element", &["alpha", "beta"][..]),
+        ("map_lookup", &["alpha", "beta"][..]),
+        ("map_braced_mapped_values", &["alpha", "beta"][..]),
+        ("explicitly_typed_iterator", &["alpha"][..]),
+        ("explicitly_typed_const_iterator", &["beta"][..]),
+        ("aliased_iterator", &["alpha"][..]),
+        ("locally_aliased_const_iterator", &["beta"][..]),
+        ("iterator_isolation", &["alpha"][..]),
+        ("iterator_reassignment", &["alpha", "beta"][..]),
+        ("map_insertion", &["alpha", "beta"][..]),
+        ("immediate_lookup", &["alpha"][..]),
+        ("iterator_write", &["alpha", "beta"][..]),
+    ] {
+        let actual: Vec<_> = targets(caller).into_iter().collect();
+        assert_eq!(actual, expected, "{caller}");
+    }
+    let dispatch = targets("unordered_dispatch");
+    for caller in ["map_pointer_cv_arrow", "map_pointer_cv_deref"] {
+        assert!(
+            has_any_edge(program, &analysis, caller, "Right::hit"),
+            "{caller}"
+        );
+        assert!(
+            must_not_have_edge(program, &analysis, caller, "Left::hit"),
+            "{caller}"
+        );
+    }
+    assert!(has_any_edge(
+        program,
+        &analysis,
+        "set_pointer_dispatch",
+        "Handler::run"
+    ));
+    let lambdas: Vec<_> = dispatch
+        .iter()
+        .filter(|name| name.contains("::$lambda"))
+        .collect();
+    assert_eq!(lambdas.len(), 2, "{dispatch:?}");
+    for lambda in lambdas {
+        assert_eq!(
+            targets(lambda).into_iter().collect::<Vec<_>>(),
+            ["from_argument"]
+        );
+    }
+    assert_eq!(
+        dispatch
+            .iter()
+            .filter(|name| !name.contains("::$lambda"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["beta", "from_capture"]
+    );
+}
 
 #[test]
 fn cpp_declared_wrapper_keeps_template_arguments_for_pointee_calls() {

@@ -48,6 +48,12 @@ template<class T> struct shared_ptr {
 template<class T> struct unique_ptr {
     T* get() const; T* operator->() const; T& operator*() const;
 };
+template<class T> struct vector { T& operator[](unsigned); T& at(unsigned); };
+template<class K, class V> struct map {
+    struct Entry { K first; V second; };
+    struct iterator { Entry* operator->(); Entry& operator*(); };
+    iterator find(K);
+};
 }
 struct R { void Good(); }; struct S { void Good(); };
 struct T { void Good(); }; struct U { void Good(); };
@@ -189,6 +195,20 @@ def make_cases(sets):
         for declaration in ["@C@& p", "const @C@& p"]:
             add("subscript_result[%s]" % declaration,
                 "void Run_@N@(%s) { %s }" % (declaration, use("(&p)[0].f(@a@)")))
+        for element in ["@C@*", "const @C@*", "@C@ const*", "A@N@*", "P@N@"]:
+            for read in ["v[0]", "v.at(0)"]:
+                call = read + "->f(@a@)"
+                add("container_element[%s]|%s" % (element, read),
+                    "void Run_@N@() { std::vector<%s> v; %s }"
+                    % (element, use(call)))
+                add("container_element_chain[%s]|%s" % (element, read),
+                    "void Run_@N@() { std::vector<%s> v; %s->Good(); Show<decltype(%s)> s; }"
+                    % (element, call, call))
+        for read in ["it->second", "(*it).second"]:
+            call = read + "->f(@a@)"
+            add("container_iterator_chain|%s" % read,
+                "void Run_@N@() { std::map<int, const @C@*> m; auto it = m.find(0); "
+                "%s->Good(); Show<decltype(%s)> s; }" % (call, call))
         for p in OBJ_PARAMS:
             for acc in OBJ_ACC:
                 add("param[%s]|%s" % (p, acc),

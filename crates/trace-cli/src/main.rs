@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, ResolutionKind};
 use trace_db::{basename, export_to_sqlite, open_db, ExportOptions};
-use trace_parse::build_program_for_analysis_with_jobs;
+use trace_parse::build_program_for_analysis_with_models;
 use trace_preproc::PreprocessOptions;
 
 mod build_info;
@@ -732,8 +732,9 @@ fn run_analyze(
     let mut include_candidates = missing_headers::IncludeCandidates::default();
     let mut pass = 0;
     let mut program = loop {
-        let program = build_program_for_analysis_with_jobs(&target, &opts, jobs)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let program =
+            build_program_for_analysis_with_models(&target, &opts, jobs, models.container_models())
+                .map_err(|e| anyhow::anyhow!(e))?;
         check_input_boundary()?;
         if !apply_include_candidates {
             break program;

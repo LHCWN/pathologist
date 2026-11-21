@@ -68,6 +68,255 @@ reported mismatch match the preceding snapshot. Pinned corpus inputs remain
 unavailable, so this follow-up has no new corpus counts and does not change
 expectation centers or tolerances.
 
+## Pinned evaluation profiles and master comparison — 2026-11-19
+
+Both profiles use the same revisions of HiView, Camera, HDF, and Ability
+Runtime. Fetch the checkouts once and use separate output directories for the
+two profiles.
+
+```sh
+cargo build -p trace-cli --release
+python scripts/fetch_corpora.py --base target/eval-corpora
+python scripts/eval_check.py --corpus-base target/eval-corpora --outdir target/eval-default
+python scripts/eval_check.py --corpus-base target/eval-corpora --outdir target/eval-canonical --expected scripts/eval_expected_canonical.json
+```
+
+The canonical profile adds `--canonical-system-headers --compiler g++` to
+the default profile's arguments and uses the embedded models. Its
+header-dependent totals were captured with MSYS2 MinGW GCC 15.2.0 on
+Windows 11 x64. It also checks the named callback targets and argument flow
+in the raw graph. [Default expectations](../scripts/eval_expected.json) ·
+[Canonical expectations](../scripts/eval_expected_canonical.json)
+
+### Call graph checks against master
+
+The comparison uses release builds of clean master `326f50e` and the
+container-model working tree. Within a profile, both builds used eight jobs,
+minimal export, the same corpus-specific flags, and an 800,000-pop solver
+budget. Each solve reached its fixpoint.
+
+| Pinned corpus | Default indirect edges, master → working tree | Canonical indirect edges, master → working tree | Canonical bindings added / lost |
+|---|---:|---:|---:|
+| HiView | 265 → 265 | 265 → 348 | 83 / 0 |
+| Camera | 462 → 462 | 462 → 487 | 25 / 0 |
+| HDF | 5,153 → 5,153 | 5,153 → 5,153 | 0 / 0 |
+| Ability Runtime | 1,849 → 1,849 | 1,847 → 1,849 | 2 / 0 |
+
+On the pinned HiView revision, `decoded_event.cpp:162` and `:201` each
+reach their four local lambdas and forward `param` to each target. The
+canonical Ability Runtime profile reaches the app-death callback at both
+dispatch sites. The default-mode total for that corpus has the same count
+with a different set of targets.
+
+The canonical profile passes all 76 graph checks and four checkout checks.
+The pinned HiView exports at one and eight jobs also match across all
+logical relations apart from the `raw_analysis_run` creation timestamp.
+The default profile checks HDF against 1,910 diagnostics on the reference
+configuration and exactly 1,919 on Windows, where both binaries reported
+that total. The metric uses `platform_values` keyed by Python's
+`sys.platform`. File suffix probes use the same slash convention for
+Windows and Unix exports.
+
+The follow-up review fixes add field loads before `visited.insert(ptr)` in
+the two Ability Runtime `ScopedVisited` constructors. Each insertion adds
+a field-address, load, and store edge. The canonical solve now converges in
+800,001 pops, so the canonical profile allows 850,000. The converged raw
+call graph matches the original capture, as do the argument-flow and
+diagnostic counts.
+
+### Time and peak memory against master
+
+Measured on the Windows and MinGW setup above with a Ryzen 7 8845HS, one
+analyzer process at a time. Wall time runs from process launch through export.
+Memory comes from the analyzer's Windows peak working set and peak commit
+counters. The HiView and HDF rows use adjacent master and final-build runs.
+HiView canonical has two final pairs with opposite order. Camera and Ability
+Runtime use earlier master samples with a later final-build measurement, so
+their wall times are observations across sessions. The earlier paired runs
+for those two corpora measured 20.5–20.8 s versus 20.8–21.3 s in default Camera,
+21.9–24.7 s versus 22.0–23.7 s in canonical Camera, 89.1 s versus 86.8 s in
+default Ability Runtime, and 105.4 s versus 91.0 s in canonical Ability Runtime.
+
+| Corpus | Mode | Wall s, master → final | Peak working set MiB, master → final | Peak commit MiB, master → final |
+|---|---|---:|---:|---:|
+| HiView | Default | 5.2 → 5.5 | 238 → 238 | 239 → 239 |
+| HiView | Canonical | 7.4 → 8.8 / 7.4 → 8.0 | 435 → 370 / 422 → 361 | 442 → 362 / 427 → 362 |
+| HDF | Default | 9.4 → 9.7 | 307 → 311 | 328 → 332 |
+| HDF | Canonical | 12.1 → 12.3 | 353 → 356 | 373 → 376 |
+| Camera | Default | 20.8 → 19.8 | 632 → 640 | 655 → 652 |
+| Camera | Canonical | 21.9 → 20.6 | 648 → 646 | 663 → 665 |
+| Ability Runtime | Default | 89.1 → 79.7 | 1,624 → 1,621 | 1,789 → 1,769 |
+| Ability Runtime | Canonical | 105.4 → 83.2 | 1,638 → 1,651 | 1,738 → 1,750 |
+
+In these earlier runs the prelude published modeled declarations before
+compacting its unit. Project-header lowering could start immediately and waited at the first
+lookup that needs those declarations. Both final HiView canonical runs
+still spent 0.6 s longer in the project-header phase and finished 0.6–1.4 s
+after master, with 61–65 MiB less peak working set. HDF took 0.2–0.3 s longer
+in the final pairs and processed more solver worklist items. Across the rows
+where peak working set grew, the increases were at most 13 MiB and 1.4%.
+[Canonical declaration handoff](CANONICAL_SYSTEM_PRELUDE.md#one-prelude-run-per-language)
+
+The [later canonical recheck](#canonical-performance-recheck-against-bb64b1e--2026-11-20)
+measures the rebased branch against `bb64b1e` and supersedes these canonical timings.
+
+The 24-link ordinary member-call chain in `cpp_container_headers` timed out
+after five seconds on release commit `b9a94de`. With the receiver type reused,
+the same fixture took 0.062 seconds with one indexing job and reached the
+direct `Chain::run` target.
+
+### Rebase onto local master `bb64b1e`
+
+The canonical expectations use fresh release exports of the same four pinned
+checkouts with MinGW GCC 15.2.0, eight indexing jobs, and the existing solver
+budget. All named site and container-flow probes still pass, including both
+HiView `DecodedEvent` dispatches and both Ability Runtime app-death dispatches.
+The metric tolerances stayed the same.
+
+| Corpus | Indirect edges, before rebase → after rebase | Indirect bindings added / lost |
+|---|---:|---:|
+| HDF | 5,153 → 5,226 | 73 / 0 |
+| HiView | 348 → 349 | 1 / 0 |
+| Camera | 487 → 500 | 13 / 0 |
+| Ability Runtime | 1,849 → 2,043 | 246 / 52 |
+
+HDF adds targets at the RTC proxy and AST traversal dispatches. HiView
+recovers `IoCollector::DefaultDiskStatsFilter`. Camera gains twelve
+`CameraNapiAdaptor` member-pointer bindings and a callback at
+`HCameraDevice::ReportMechMetadata`. In Ability Runtime, the largest
+additions are at mission-listener and connection-observer dispatches.
+The removed bindings are at CJ runtime loader calls in `cj_environment.cpp`,
+where the previous graph included targets such as `printf` and unrelated
+CJ entry points.
+
+Default-mode Ability Runtime has identical global counts and all 2,043
+indirect bindings on local master and the rebased branch. Both builds add
+the fifth conservative `FreezeUtil::LifecycleFlow` call at
+`appfreeze_manager.h:111` from `FuzzLifecycleTimeoutHandle`. The default
+profile uses those master values.
+
+### Vector specialization review — 2026-11-20
+
+The canonical profile uses fresh release exports from the same four pinned
+checkouts and MinGW GCC 15.2.0. The external edge changes all target
+`stl_vector.h` or `stl_bvector.h`. Ordinary vectors lose the unrelated
+`vector<bool>` candidates. Actual boolean vectors in Camera and Ability
+Runtime resolve under the specialized owner. All four indirect edge sets and
+named container-flow probes match the previous exports.
+Out-of-line definitions in `vector.tcc` now join their declarations under
+the same specialized owner.
+
+| Corpus | Raw external edges before → after | Argument-flow rows before → after |
+|---|---:|---:|
+| HDF | 24,968 → 24,774 | 76,232 → 76,129 |
+| HiView | 22,510 → 21,182 | 45,467 → 44,856 |
+| Camera | 64,320 → 58,581 | 83,340 → 81,527 |
+| Ability Runtime | 167,356 → 158,238 | 460,812 → 455,892 |
+
+The default profile passes all 189 checks. The canonical profile keeps its
+existing tolerances and named probes at the new count centers.
+
+### Canonical performance recheck against `bb64b1e` — 2026-11-20
+
+The recheck compares release builds of local master `bb64b1e` and feature
+commit `63db906` on the four pinned checkouts. Both use the canonical profile
+with MSYS2 MinGW GCC 15.2.0, eight jobs, minimal export, and the same
+850,000-pop solver budget. Each pair ran back to back on a Ryzen 7 8845HS
+under Windows 11, with the run order reversed for the second of three pairs.
+Wall time covers process launch through database export. Peak memory is the
+analyzer process's Windows peak working set and peak commit.
+
+| Corpus | Median wall s, master → feature | Wall change | Median peak working set MiB, master → feature | Median peak commit MiB, master → feature |
+|---|---:|---:|---:|---:|
+| HDF | 13.66 → 13.50 | −1.2% | 398.9 → 400.6 | 424.7 → 426.4 |
+| HiView | 8.68 → 10.27 | +18.3% | 526.1 → 434.1 | 530.8 → 436.3 |
+| Camera | 23.14 → 22.49 | −2.8% | 652.7 → 655.3 | 676.9 → 676.8 |
+| Ability Runtime | 94.74 → 91.56 | −3.4% | 1,667.8 → 1,664.5 | 1,772.3 → 1,766.3 |
+
+HiView took 1.3–1.8 s longer in every pair and used 90–94 MiB less peak
+working set. Its median indexing time grew from 6.3 to 8.1 s, with the
+project-header phase (`pch-done`) rising from 0.4 to 3.0 s. Ability Runtime
+finished 1.7–4.2 s sooner in every pair, and its median indexing time fell
+from 70.5 to 68.4 s. The largest median increase in either memory counter
+was 0.4%. Individual pairs included a 2.9% peak commit increase on HDF
+and a 1.2% increase on Ability Runtime.
+
+All 24 runs used the canonical prelude and reached a solver fixpoint.
+The feature exports from the final round passed all 80 canonical checks.
+
+## Embedded container models with canonical system headers — 2026-11-19
+
+The paired runs used the same `trace-cli` release build from the working tree
+at `326f50e` with the embedded container changes. Both runs used
+`--canonical-system-headers --compiler g++ --jobs 8 --timeout-secs 1200` and
+minimal export on Windows 11 x86-64, an AMD Ryzen 7 8845HS, and MSYS2 MinGW
+GCC 15.2.0. The on run used the default embedded models. The off run added
+`--models` with one override per embedded container, keeping its `name` and
+`element` and setting `operations = []` with no `initializer_list`. The
+canonical prelude and default function models were active in both runs.
+[Embedded model definitions](../crates/trace-ir/src/container_models.toml) ·
+[Model override format](MODELS.md#container-element-models)
+
+The inputs were clean local checkouts under `D:\projects`. They had no
+compilation databases or shared flags. Runs with the host headers reported
+unresolved OpenHarmony SDK and generated includes. The local revisions below
+differ from the suite pinned in `scripts/eval_expected.json`.
+
+| Checkout | Revision |
+|---|---|
+| `hiviewdfx_hiview` | `c33975eee421d2ba314958d3bbcba511eb2c8dca` |
+| `multimedia_camera_framework` | `085a5d0e2dc1c90a4b676bad55675a1cf12a6380` |
+| `drivers_hdf_core` | `e14801f662a84540349248d843e7143dbb927b40` |
+| `ability_ability_runtime` | `a0047a48162ef9b18dd403c14925058d506c3d0f` |
+
+### Raw graph results
+
+Every run built a canonical prelude and reached the solver fixpoint. Counts
+use the raw SQLite relations, which preserve lambda targets. Added and lost
+bindings compare the call's file, line, column and caller with the target's
+qualified name, signature and definition location across the two exports.
+Wall times are single-run observations with the off run first in each pair.
+
+| Corpus | All call edges, off → on | Indirect edges, off → on | Indirect call sites, off → on | Bindings added / lost | Argument-flow rows, off → on | Element cells, off → on | Diagnostics in each run | Wall s, off → on |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| HiView | 47,063 → 47,182 | 265 → 348 | 132 → 144 | 83 / 0 | 44,098 → 44,230 | 0 → 33 | 1,527 | 13.7 → 8.6 |
+| Camera | 137,592 → 137,642 | 474 → 499 | 247 → 251 | 25 / 0 | 83,717 → 83,765 | 0 → 7 | 3,861 | 25.7 → 26.5 |
+| HDF | 80,742 → 80,742 | 5,203 → 5,203 | 1,770 → 1,770 | 0 / 0 | 76,778 → 76,779 | 0 → 3 | 1,333 | 21.3 → 18.3 |
+| Ability Runtime | 767,760 → 767,785 | 1,825 → 1,827 | 679 → 681 | 2 / 0 | 567,913 → 567,934 | 0 → 40 | 12,508 | 129.8 → 103.9 |
+
+A HiView rerun with the models on and `--jobs 1` matched the `--jobs 8`
+export across all logical SQLite relations apart from the creation timestamp
+in `raw_analysis_run`, using `scripts/compare_analysis_databases.py`.
+
+### Site-level changes
+
+- **HiView.** `decoded_event.cpp:163` and `:202` each go from zero targets to
+  the four lambdas in their own `allFuncs` initializer. The raw argument-flow
+  graph connects the caller's `param` to all eight lambda parameters across
+  the two `iter->second(param)` sites. The two dispatches in
+  `raw_data_builder.cpp` each gain four targets and the two JSON parser
+  dispatches each gain three. `xperf_dispatcher.cpp:59` gains 16 parser
+  targets and `test_plugin.cpp:97` gains 14 handlers. The models summarize
+  all mapped values of a container in one cell, so a lookup can reach all
+  compatible entries even when a runtime key selects only one.
+- **Camera.** Subscript dispatch in `camera_manager_napi.cpp:922` gains
+  three session factories and `camera_session_for_sys_napi.cpp:2419` gains
+  19. The callback loaded from `g_deviceProtectionToCallBack_` flows through
+  construction of `DeviceProtectionAbilityConnection` to the call at
+  `device_protection_ability_connection.cpp:41`, which gains the fault and
+  eject callbacks. At `camera_rotate_param_manager.cpp:282`, the `std::bind`
+  model sees `HandleParamUpdate` through the map iterator. The nested-map
+  dispatch at `hcamera_service.cpp:3864` has only the external `taskCallback`
+  placeholder in both runs. That site reads a callback through a range-for
+  structured binding.
+- **HDF.** Three modeled element cells and one argument-flow row are added.
+  The indirect target set is unchanged.
+- **Ability Runtime.** `AppRecoveryMgr` emplaces the callback in
+  `dieCallbacks_` and returns it through `FindCallback`. Both dispatches in
+  `app_recovery_mgr.cpp:103` and `:108` now reach the lambda registered by
+  `AbilityManagerService::SetAppDeathRecipient`. The first dispatch invokes
+  the callback captured by the task lambda.
+
 ## Call-site lookup by ID — 2026-11-12
 
 Conditional lowering (#256, `07a7935`) added two loops in

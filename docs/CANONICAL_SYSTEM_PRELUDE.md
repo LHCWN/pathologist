@@ -109,9 +109,12 @@ enters the shared state. It produces three things:
    initializer ranges). Lowering runs on its own thread with the indexing
    stack size while the sequential warm pass proceeds; it needs only the
    dependency roots and path interning, so it uses a private graph instead of
-   the growing project graph. The unit is merged into the final `Program`
-   once, after project headers and translation units, so it never enlarges
-   the dedup tables those merges consult. Its diagnostics (`#warning`s,
+   the growing project graph. The lowerer publishes the small index of modeled
+   C++ container declarations before compacting the prelude. Project headers
+   and translation units wait for that index only when
+   [container element lowering](CXX.md#container-elements) needs it. The unit is merged
+   into the final `Program` once, after project headers and translation units, so
+   it never enlarges the dedup tables those merges consult. Its diagnostics (`#warning`s,
    missing nested includes) are imported with it, once: covered headers
    never run again, so the prelude is the only place they can report.
 2. **Macro closure.** `PreprocessOptions::record_macro_ops` captures the
