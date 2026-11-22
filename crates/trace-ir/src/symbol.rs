@@ -2220,7 +2220,20 @@ impl SymbolTable {
         tolerance: SpellingTolerance,
     ) -> Option<bool> {
         let (a, b) = (self.explicit_params(a)?, self.explicit_params(b)?);
-        Some(a.matches(&b, |x, y| {
+        self.explicit_params_alike_with(&a, &b, types, tolerance)
+    }
+
+    /// [`explicit_params_alike`](Self::explicit_params_alike) with both sides'
+    /// parameters already computed, for callers comparing one reference
+    /// signature against many candidates.
+    pub fn explicit_params_alike_with(
+        &self,
+        a: &ExplicitParams<'_>,
+        b: &ExplicitParams<'_>,
+        types: &crate::TypeTable,
+        tolerance: SpellingTolerance,
+    ) -> Option<bool> {
+        Some(a.matches(b, |x, y| {
             spelled_alike(
                 types,
                 types.get(x).desc.as_ref(),
