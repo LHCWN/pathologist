@@ -206,6 +206,8 @@ pub struct Function {
     /// is not user-provided, so the class is still an aggregate (C++17) and
     /// braces initialize its fields rather than call it.
     pub defaulted_in_class: bool,
+    /// A constructor with a known true or unconditional explicit specifier.
+    pub is_explicit_constructor: bool,
     /// Declared in its class body: a member, whatever its parameter list
     /// shows. An in-class prototype lowers no parameter variables, so this is
     /// the only record that a parameterless entry is a member rather than a
@@ -216,6 +218,8 @@ pub struct Function {
     /// non-template that is as good a match, so an inherited non-template a
     /// class body imports can win over it.
     pub is_member_template: bool,
+    /// A namespace-scope function template eligible for a template-id call.
+    pub is_free_function_template: bool,
     /// Declared `static` in its class body: a member with no receiver. Its
     /// entry still takes a `this` slot ([`SymbolTable::has_this_param`]), as
     /// every member's does; this is what tells a static member's unused one
@@ -246,6 +250,8 @@ pub struct Function {
     /// reference parameter from a value one before any body is seen
     /// (docs/IR.md, "Dereferenced operands").
     pub reference_params: Vec<bool>,
+    /// Written reference category and referent cv at explicit parameter positions.
+    pub parameter_references: Vec<Option<crate::ReferenceParameter>>,
     /// Declared `virtual` (C++ methods). Virtual dispatch expansion treats a
     /// method as virtual if *any* entry with its qualified name carries this
     /// flag, so out-of-class definitions without the token still participate.
@@ -658,6 +664,26 @@ fn absorb_redeclaration(
     if existing.explicit_arity.is_none() || (variadic_read && !has_tail) {
         existing.reference_params = func.reference_params.clone();
     }
+    if existing.parameter_references.is_empty() {
+        existing
+            .parameter_references
+            .clone_from(&func.parameter_references);
+    } else {
+        for (known, new) in existing
+            .parameter_references
+            .iter_mut()
+            .zip(&func.parameter_references)
+        {
+            match (known, new) {
+                (Some(known), Some(new)) => {
+                    known.is_const = known.is_const.or(new.is_const);
+                    known.pointee_const = known.pointee_const.or(new.pointee_const);
+                }
+                (known @ None, new) => *known = *new,
+                _ => {}
+            }
+        }
+    }
     if existing.explicit_arity.is_none() {
         existing.explicit_arity = func.explicit_arity;
     }
@@ -667,6 +693,7 @@ fn absorb_redeclaration(
     }
     // User-provided once any declaration of it is.
     existing.defaulted_in_class &= func.defaulted_in_class;
+    existing.is_explicit_constructor |= func.is_explicit_constructor;
     existing.is_static_member |= func.is_static_member;
     existing.is_const_member |= func.is_const_member;
     if existing.ref_qualifier.is_none() {
@@ -677,6 +704,7 @@ fn absorb_redeclaration(
         existing.return_cv.pointee_const = func.return_cv.pointee_const;
     }
     existing.is_member_template |= func.is_member_template;
+    existing.is_free_function_template |= func.is_free_function_template;
     existing.default_args = existing.default_args.max(func.default_args);
     existing.is_virtual |= func.is_virtual;
     existing.is_final |= func.is_final;
@@ -2026,6 +2054,7 @@ impl SymbolTable {
                     // declarations too.
                     if existing.is_const_member != func.is_const_member
                         || existing.ref_qualifier != func.ref_qualifier
+                        || !Self::reference_forms_alike(existing, func)
                         || existing.is_member_template != func.is_member_template
                     {
                         return false;
@@ -2219,6 +2248,9 @@ impl SymbolTable {
         types: &crate::TypeTable,
         tolerance: SpellingTolerance,
     ) -> Option<bool> {
+        if !Self::reference_forms_alike(a, b) {
+            return Some(false);
+        }
         let (a, b) = (self.explicit_params(a)?, self.explicit_params(b)?);
         self.explicit_params_alike_with(&a, &b, types, tolerance)
     }
@@ -2454,12 +2486,18 @@ impl SymbolTable {
     /// which an override binds. A side that recorded none, having read no
     /// declaration, agrees with any.
     pub fn references_alike(a: &Function, b: &Function) -> bool {
-        a.reference_params.is_empty()
-            || b.reference_params.is_empty()
-            || a.reference_params
+        Self::reference_forms_alike(a, b)
+            && a.reference_params
                 .iter()
                 .zip(&b.reference_params)
                 .all(|(x, y)| x == y)
+    }
+
+    fn reference_forms_alike(a: &Function, b: &Function) -> bool {
+        a.parameter_references
+            .iter()
+            .zip(&b.parameter_references)
+            .all(|(a, b)| a.zip(*b).is_none_or(|(a, b)| a.compatible_with(b)))
     }
 
     /// Type of a parameter variable, for overload signature comparison.
@@ -3252,6 +3290,7 @@ impl SymbolTable {
                     if both_cpp
                         && (f.is_const_member != cand.is_const_member
                             || f.ref_qualifier != cand.ref_qualifier
+                            || !Self::reference_forms_alike(f, cand)
                             || f.is_member_template != cand.is_member_template)
                     {
                         return false;
@@ -4935,11 +4974,14 @@ mod tests {
             explicit_arity: None,
             default_args: 0,
             reference_params: Vec::new(),
+            parameter_references: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            is_explicit_constructor: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_free_function_template: false,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,

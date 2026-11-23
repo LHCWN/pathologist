@@ -49,7 +49,7 @@ namespace other {
 int epoll_wait(int, epoll_event *, int, int);
 void wait_events(int epfd) {
     epoll_event events[8];
-    epoll_wait(epfd, events, 8, -1);
+    other::epoll_wait(epfd, events, 8, -1);
     LevelHandler *handler = (LevelHandler *)events[0].data.ptr;
     handler->handler(handler->data, events[0].events);
 }

@@ -822,10 +822,34 @@ C++-aware only where it must be — everything else reuses the C machinery.
 - **Call-result receivers**: `S::GetInstance().Open()` and pointer-returning
   chains reuse declared return-type inference. Ambiguous return types stay
   unknown; receiver probes do not mutate the index.
-- **Move/forward receivers**: qualified `std::move` and `std::forward` reuse
-  their argument's static receiver type for general member calls, including
-  `std::move(d).M()`. Only the move/forward's own argument is inspected,
-  preserving any cast beneath it; unsupported cast targets remain unknown.
+- **Move/forward receivers.** Lowering recognizes one-argument calls to
+  `std::move` and `std::forward` through qualification, namespace aliases,
+  using-declarations, and using-directives. Qualified names and imports resolve
+  each namespace alias in the path. Competing declarations that can take the
+  operand keep ordinary overload resolution. ADL includes the global
+  namespace for global types and the associated namespaces of class and enum
+  template type arguments. Built-in dereference and address-of expressions
+  preserve the specialization used for lookup. The lookup can rule out
+  incompatible raw class pointers and reference bindings. Explicit template arguments
+  restrict competitors to function templates. Parenthesized names use
+  ordinary lookup without ADL.
+  The receiver uses the explicit template argument's referent when it can
+  be resolved, as in `std::forward<Base>(derived).M()`. Otherwise it uses
+  the operand's static type, including any cast inside the operand.
+  Forwarding through an lvalue reference, including an alias or a resolved
+  `decltype`, yields an lvalue. A resolved `decltype` supplies the referent
+  type and qualification, including applicable explicit qualifiers.
+  `std::move` and forwarding through a known
+  value or rvalue reference type yield rvalues. Dependent and unresolved
+  forward types retain both possible categories. Known receiver categories
+  narrow ref-qualified members for call edges and return flow. Unknown
+  forwarding receiver categories and constness keep the winners of each
+  viable receiver, including calls that pass ordinary arguments. These facts
+  follow a comma expression's right operand, either arm of a conditional,
+  and data member access through the forwarded object.
+  The same lookup supports functor expressions
+  such as `std::move(f)()`, `(f)()`, and `static_cast<F&&>(f)()`.
+  See [moved-from values](FAQ.md#known-imprecision) for ownership semantics.
 - **Templates**: lowered once per primary name. Class-template members
   returning a bare type parameter (`T Get()`, `T *Get()`) preserve its
   parameter position and pointer depth as type metadata across header merges.

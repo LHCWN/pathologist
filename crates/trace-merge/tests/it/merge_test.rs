@@ -353,6 +353,235 @@ fn shared_header_images_do_not_collide_or_make_external_calls_ambiguous() {
 }
 
 #[test]
+fn ambiguous_legacy_declaration_stays_separate_in_either_input_order() {
+    let tmp = tempdir().unwrap();
+    let include = tmp.path().join("include");
+    fs::create_dir(&include).unwrap();
+    fs::write(
+        include.join("common.h"),
+        "struct Q {};\n#ifndef EXTRA\n#define EXTRA\n#endif\nvoid take(Q*&); EXTRA\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for (name, source) in [
+        (
+            "legacy",
+            "#include \"common.h\"\nint main() { Q* p = nullptr; take(p); }\n",
+        ),
+        (
+            "current",
+            "#define EXTRA void take(Q*&&);\n#include \"common.h\"\nint main() {}\n",
+        ),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("main.cpp"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_executable(&repo, &include, &db, false);
+        if name == "legacy" {
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE functions SET signature = 'take(Q*)' WHERE name = 'take'",
+                    []
+                )
+                .unwrap(),
+                1,
+            );
+            trace_db::record_database_identity(&conn).unwrap();
+        }
+        inputs.push(db);
+    }
+    for reverse in [false, true] {
+        if reverse {
+            inputs.reverse();
+        }
+        let output = tmp.path().join(format!("merged-{reverse}.db"));
+        merge_databases(
+            &inputs,
+            &MergeOptions {
+                output: output.clone(),
+                verbose: false,
+            },
+        )
+        .unwrap();
+        let conn = Connection::open(output).unwrap();
+        let declarations: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT file_id || ':' || line_start)
+                 FROM functions WHERE name = 'take' AND is_defined = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(declarations, (3, 1));
+        let linked_declaration: String = conn
+            .query_row(
+                "SELECT f.signature FROM call_edges e JOIN functions f ON f.id = e.callee_fn_id
+                 WHERE f.name = 'take'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_declaration, "take(Q*)");
+    }
+}
+
+#[test]
+fn strong_definition_collisions_include_legacy_signatures() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for name in ["legacy", "current"] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("code.cpp"), "struct Q {}; void take(Q*) {}").unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        if name == "legacy" {
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE functions SET signature = 'take(Q*)'
+                     WHERE signature = 'take(Q*) [refs=value]'",
+                    [],
+                )
+                .unwrap(),
+                1,
+            );
+            trace_db::record_database_identity(&conn).unwrap();
+        }
+        inputs.push(db);
+    }
+    let report = merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: tmp.path().join("merged.db"),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let collisions: Vec<_> = report
+        .warnings
+        .iter()
+        .filter(|warning| warning.kind == WarningKind::MultipleDefinitions)
+        .collect();
+    assert_eq!(collisions.len(), 1);
+    assert_eq!(collisions[0].symbol.as_deref(), Some("take"));
+}
+
+#[test]
+fn shared_header_copies_keep_one_definition_origin_across_reference_signature_versions() {
+    let tmp = tempdir().unwrap();
+    let include = tmp.path().join("include");
+    fs::create_dir(&include).unwrap();
+    fs::write(
+        include.join("common.h"),
+        "struct Q {}; inline int take(Q*) { return 1; } int shared_decl(Q*);\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for name in ["legacy", "current"] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            r#"#include "common.h"
+int main() { return take(nullptr) + shared_decl(nullptr); }
+"#,
+        )
+        .unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_executable(&repo, &include, &db, false);
+        if name == "legacy" {
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE functions SET signature = name || '(Q*)'
+                     WHERE name IN ('take', 'shared_decl') AND signature = name || '(Q*) [refs=value]'",
+                    [],
+                )
+                .unwrap(),
+                2
+            );
+            trace_db::record_database_identity(&conn).unwrap();
+        }
+        inputs.push(db);
+    }
+    let caller = tmp.path().join("caller");
+    fs::create_dir(&caller).unwrap();
+    fs::write(
+        caller.join("caller.cpp"),
+        "struct Q; int take(Q*); int run(Q* p) { return take(p); }",
+    )
+    .unwrap();
+    let caller_db = tmp.path().join("caller.db");
+    analyze_repo(&caller, &caller_db);
+    inputs.push(caller_db);
+    let output = tmp.path().join("merged.db");
+    let mut first_edge_ids = None;
+    for _ in 0..2 {
+        let report = merge_databases(
+            &inputs,
+            &MergeOptions {
+                output: output.clone(),
+                verbose: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.ambiguous_calls, 0);
+        let conn = Connection::open(&output).unwrap();
+        let direct_images: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT callee.target_id) FROM call_edges e
+                 JOIN functions caller ON caller.id = e.caller_fn_id
+                 JOIN functions callee ON callee.id = e.callee_fn_id
+                 WHERE caller.name = 'run' AND callee.name = 'take' AND e.resolution = 'direct'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(direct_images, 2);
+        let declaration: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT signature, target_id FROM functions
+                 WHERE name = 'shared_decl' AND is_defined = 0 AND line_start > 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            declaration,
+            ("shared_decl(Q*) [refs=value]".to_owned(), None)
+        );
+        let edge_ids: Vec<i64> = conn
+            .prepare(
+                "SELECT e.id FROM call_edges e JOIN functions f ON f.id = e.callee_fn_id
+                 WHERE f.name = 'shared_decl' ORDER BY e.id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(edge_ids.len(), 2);
+        assert_eq!(
+            *first_edge_ids.get_or_insert_with(|| edge_ids.clone()),
+            edge_ids
+        );
+        let copies: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM functions
+             WHERE name = 'shared_decl' AND is_defined = 0 AND line_start > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copies, 1);
+        inputs.reverse();
+    }
+}
+
+#[test]
 fn shared_header_unresolved_callgraph_matches_joint_analysis() {
     let tmp = tempdir().unwrap();
     let sources = tmp.path().join("sources");
@@ -630,6 +859,63 @@ fn merge_keeps_all_exact_candidates_in_the_callers_target() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(rows, [(3, "ambiguous".into()), (4, "ambiguous".into())]);
+}
+
+#[test]
+fn fallback_suppresses_a_legacy_weak_copy_of_a_strong_signature() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for (name, source) in [
+        ("caller", "int take(...); int run() { return take(); }"),
+        (
+            "legacy",
+            "struct Q {}; __attribute__((weak)) int take(Q*) { return 1; }",
+        ),
+        ("current", "struct Q {}; int take(Q*) { return 2; }"),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("code.cpp"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        if name == "legacy" {
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE functions SET signature = 'take(Q*)'
+                     WHERE signature = 'take(Q*) [refs=value]' AND is_weak = 1",
+                    [],
+                )
+                .unwrap(),
+                1
+            );
+            trace_db::record_database_identity(&conn).unwrap();
+        }
+        inputs.push(db);
+    }
+    let output = tmp.path().join("merged.db");
+    let report = merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.ambiguous_calls, 0);
+    let conn = Connection::open(output).unwrap();
+    let targets: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT target.is_weak, e.resolution FROM call_edges e
+             JOIN functions caller ON caller.id = e.caller_fn_id
+             JOIN functions target ON target.id = e.callee_fn_id WHERE caller.name = 'run'",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(targets, [(0, "direct".to_owned())]);
 }
 
 #[test]
@@ -4548,4 +4834,80 @@ fn merged_member_template_overloads_on_same_source_line_remain_distinct() {
     );
     assert_eq!(fns[0].1, "A::f()");
     assert_eq!(fns[1].1, "A::f() <template>");
+}
+
+#[test]
+fn separate_databases_preserve_selected_reference_overloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for (name, source) in [
+        (
+            "caller",
+            r#"
+struct T {};
+void take(T&);
+void take(T&&);
+void run(T& t) { take(std::move(t)); }
+void pointer(T*&&);
+void run_pointer(T* t) { pointer(std::move(t)); }
+void qualified_pointer(const T*&&);
+void run_qualified(const T* t) { qualified_pointer(std::move(t)); }
+"#,
+        ),
+        (
+            "provider",
+            r#"
+struct T {};
+void take(T&) {}
+void take(T&&) {}
+void pointer(T*) {}
+void pointer(T*&&) {}
+void qualified_pointer(T*&&) {}
+void qualified_pointer(const T*&&) {}
+"#,
+        ),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("code.cpp"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let out = tmp.path().join("out.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: out.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let conn = Connection::open(&out).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT caller.name, callee.line_start, e.resolution
+         FROM call_edges e
+         JOIN functions caller ON caller.id = e.caller_fn_id
+         JOIN functions callee ON callee.id = e.callee_fn_id
+         WHERE callee.is_defined = 1 AND
+               ((caller.name = 'run' AND callee.name = 'take') OR
+                (caller.name = 'run_pointer' AND callee.name = 'pointer') OR
+                (caller.name = 'run_qualified' AND callee.name = 'qualified_pointer'))
+         ORDER BY caller.name, callee.line_start",
+        )
+        .unwrap();
+    let targets: Vec<(String, i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        targets,
+        [
+            ("run".into(), 4, "direct".into()),
+            ("run_pointer".into(), 6, "direct".into()),
+            ("run_qualified".into(), 8, "direct".into()),
+        ]
+    );
 }

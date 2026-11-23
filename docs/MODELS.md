@@ -345,7 +345,8 @@ still the callee of an `ipc` edge.
   `q.submit(f)`, `handler` in `handler->PostTask(f)`, `this` in
   `this->PostTask(f)` or a bare `Run()` in a member body, the object a
   constructor builds (`std::thread t(f)`), through parentheses, casts and
-  `std::move`. It is identity only, not bound to the callee's `this`. A field
+  [standard move and forward calls](CXX.md#c-support-first-step). This
+  records receiver identity for model matching. A field
   (`handler_->PostTask(f)`, `this->handler_`), a call result or any other
   expression records none, so tasks queued on a member handler are not told
   apart here; nor is a pointer variable's pointee: two variables naming one

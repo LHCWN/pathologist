@@ -59,6 +59,139 @@ its interface member and a `TaskHandlerService` override; the integration
 test asserts the resulting edge. Default and canonical eval rechecks pass
 over all four pinned corpora after the recapture.
 
+## Standard move and forward lowering for #293 (2026-11-23)
+
+The comparison uses base commit `269ee8f` and the fix on the pinned OpenHarmony
+sources. Both runs used eight jobs and the default profile's 800,000-pop solver
+budget. The release check reads the raw graph for its default counts and the
+public graph for its projection counts.
+
+| Pinned corpus | Raw call edges | Raw argument-flow rows | Public call edges |
+|---|---:|---:|---:|
+| HDF | 78,974 → 79,070 | 72,585 → 72,708 | 78,844 → 78,940 |
+| HiView | 39,495 → 39,501 | 33,779 → 33,786 | 38,886 → 38,892 |
+| Camera | 117,112 → 117,167 | 60,891 → 60,939 | 115,412 → 115,467 |
+| Ability Runtime | 385,237 → 385,259 | 389,194 → 389,221 | 377,471 → 377,493 |
+
+HDF gains 66 `AutoPtr::operator=` edges, 27 `AutoPtr` constructor edges,
+and three `NativeBuffer::operator=` edges. HiView gains six copy construction
+and assignment edges, including the `RawData` copy/move cases in
+`event_raw_base_test.cpp`. Camera gains assignment edges for `Profile` and
+`VideoProfile` and narrows the `ImageInfo` move-constructor alternatives in
+`photo_process_result.cpp`. Indirect and IPC edge counts agree across all
+four corpora. The default expectations recapture the changed counts at their
+existing tolerances. A second release run passed all 190 checks.
+
+The strict compiler differential had 4,569 valid cases. Exact results
+increased from 4,460 to 4,480 and wrong overloads fell from 22 to two.
+The same 87 receiver expressions remained untyped.
+
+On macOS arm64, the debug canonical runs used Apple Clang 17.0.0 through
+`g++` and the canonical profile's 850,000-pop budget. HiView's raw edges
+moved from 39,824 to 39,850 and argument-flow rows from 34,909 to 34,933.
+Camera's raw edges moved from 117,313 to 117,371 and argument-flow rows
+from 61,653 to 61,704. The two binaries passed the same call-site and
+callback probes and matched on indirect edges, IPC edges and diagnostics.
+Both runs had the same 18 aggregate discrepancies against the Windows
+MinGW reference. The canonical expectation centers remain on that toolchain.
+
+### Review follow-up
+
+A one-file release benchmark on macOS arm64 used one job and timed three
+analyses at each depth. The median at 15 nested unqualified `move` calls
+after `using std::move;` fell from 6.843 s at `618568c` to 0.018 s after
+reusing the operand type. The median at 32 calls was 0.037 s with the fix.
+
+The replay of all 190 default checks passed. Ability Runtime's raw call
+edges moved from 385,259 to 385,258, its argument-flow rows from 389,221
+to 389,219, and its public call edges from 377,493 to 377,492. The removed
+edge targeted the explicit `JsUIAbility(JsRuntime&)` constructor from a
+reference binding in `app_recovery.cpp:623`. The named canonical probes,
+canonical aggregate counts and Clang differential matched the preceding run.
+
+The glvalue and reference-binding follow-up recovered ten constructor edges
+in Ability Runtime, including the copy from `request.startOptions` in
+`implicit_start_processor.cpp:787`. The reference binding in
+`dynamic_feature_manager_test.cpp:719` lost its spurious constructor edge.
+Raw call edges moved from 385,258 to 385,267, argument-flow rows from
+389,219 to 389,237, and public call edges from 377,492 to 377,501. HDF,
+HiView and Camera retained their measured totals. All 190 default checks
+passed. The canonical probes and Clang differential matched the preceding
+run.
+
+The assignment, lookup and reference-signature follow-up passed all 190
+default checks. All four corpora retained their measured counts and their
+source-attributed call edges. The HiView and Camera canonical results and
+the Clang differential matched the preceding run. In a fresh one-file
+release run, the median analysis time was 0.020 s for 15 nested unqualified
+`move` calls and 0.037 s for 32.
+
+The receiver qualification, assignment and linking follow-up passed all 190
+default checks. Source-attributed call edges and aggregate counts were
+identical to the preceding run in the four default corpora and the two
+debug canonical corpora. The strict Clang differential retained 4,480
+exact matches, 87 untyped cases and two wrong overloads.
+
+The base-qualified receiver, dependent forwarding and ADL follow-up passed
+all 190 default checks. The four default corpora and the two debug canonical
+corpora retained their aggregate counts and source-attributed call edges.
+The strict Clang differential reported the same results.
+
+The ordinary-argument forwarding, default binding, ADL and conditional
+copy-initialization follow-up passed all 190 default checks. All measured
+default and debug canonical counts and source-attributed call edges matched
+the preceding run, as did the strict Clang differential. The epoll fixture
+now qualifies its call to the non-libc wait function because the unqualified
+call is ambiguous once ADL includes the global namespace.
+
+The virtual overload, comma receiver and template ADL follow-up passed all
+190 default checks. In Ability Runtime, the three calls to
+`CreateRunningProcessInfoArray` in `ets_app_manager.cpp` now reach the
+`OHOS::AppExecFwk` definition through the associated namespace of
+`std::vector<AppExecFwk::RunningProcessInfo>`. This replaces three external
+edges with direct edges and adds six argument-flow rows. One synthesized
+external function disappears, moving the public function count from 77,350
+to 77,349. The other default corpora, the two debug canonical corpora and
+the strict Clang differential match the preceding run.
+
+The qualified base call, forwarded data member, template ADL and
+mixed-version linking follow-up passed all 190 default checks. The default
+and debug canonical corpora retained their measured counts and
+source-attributed call edges. The strict Clang differential also matched
+the preceding run.
+
+The lexical base qualifier, conditional receiver, address-of ADL and
+mixed-version declaration and weak-symbol follow-up passed all 190 default
+checks. The four default corpora and two debug canonical corpora retained
+their measured counts and source-attributed call edges. The strict Clang
+differential reported the same results.
+
+The block-scope move import, pointer-reference qualification and
+mixed-version merge follow-up passed all 190 default checks. The four
+default corpora and two debug canonical corpora retained their aggregate
+counts and source-attributed call edges. The strict Clang differential
+again reported 4,480 exact matches, 87 untyped cases and two wrong overloads.
+
+### Rebase onto master at `31a999e`
+
+The pinned default runs on macOS arm64 used a debug build and eight jobs.
+All 165 checks for HDF, HiView, and Camera passed. Their expectation bands
+use the measured counts for the combined analyzer with the existing
+tolerances. Ability Runtime retains the master bands because the
+combined run ran out of disk space while spilling preprocessed sources.
+
+| Pinned corpus | Raw call edges | Raw argument-flow rows | Public call edges |
+|---|---:|---:|---:|
+| HDF | 79,070 | 72,708 | 78,940 |
+| HiView | 39,511 | 33,799 | 38,902 |
+| Camera | 117,184 | 60,964 | 115,484 |
+
+The debug canonical HiView and Camera runs passed all named probes. HiView
+reported 39,860 raw edges and 34,946 argument-flow rows. Camera reported
+117,388 raw edges and 61,729 argument-flow rows. Each corpus had the same
+nine aggregate checks outside the Windows MinGW reference ranges as before
+the rebase.
+
 ## AAFwk task handler callback edges - 2026-11-23
 
 `AmsMgrScheduler::StartSpecifiedAbility` hands a lambda to

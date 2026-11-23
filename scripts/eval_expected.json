@@ -1,5 +1,5 @@
 {
-  "note": "PR #257 expectation centers were recaptured relative to parent aa6f846, including HDF functions_total 12198 -> 12172, indirect edges 5153 -> 5226 and arg_flow_edges 72400 -> 72585; HiView and Camera centers were also recaptured. The 2026-11-13 owner-dependency/reference-alias/receiver-qualification follow-up remeasured every HDF, HiView and Camera global with release analyzer 3980106-dirty including all production changes in this amend, at jobs 1 and 8, matching the preceding 3980106 review snapshot. Existing tolerances were retained. Source/binary identities, strict compiler cases, parent differential residuals and the Camera metadata audit are in docs/EVAL_REPORT.md, Dependent owners, reference aliases and receiver qualification. Ability Runtime was recaptured from local master bb64b1e on 2026-11-19 with unchanged tolerances. See docs/EVAL_REPORT.md for the rebase comparison. The 2026-11-20 binder Host/interface-overload change recaptured only the affected exact IPC centers: Camera 808 -> 702 and ability_runtime 1762 -> 1641, with HDF and HiView unchanged. Ability_runtime's SendTransactCmd-only probes moved to 661 edges and 233 sender functions. The 2026-11-23 AAFwk TaskHandlerWrap::SubmitTask/SubmitTaskJust invoke models recaptured ability_runtime edges_indirect 2043 -> 2533 and public_edges_total 376130 -> 377471; the new probe pins AmsMgrScheduler::StartSpecifiedAbility reaching AppMgrServiceInner::StartSpecifiedAbility through its submitted lambda. The 2026-11-23 binder-wrapper member-resolution change recaptured ability_runtime public_functions_total 77351 -> 76978 and public_edges_total 377471 -> 379668, and one evaluated DataObsOption default constructor (75 -> 76); IPC and indirect centers are unchanged and the TaskHandler probe still passes.",
+  "note": "PR #257 expectation centers were recaptured relative to parent aa6f846, including HDF functions_total 12198 -> 12172, indirect edges 5153 -> 5226 and arg_flow_edges 72400 -> 72585; HiView and Camera centers were also recaptured. The 2026-11-13 owner-dependency/reference-alias/receiver-qualification follow-up remeasured every HDF, HiView and Camera global with release analyzer 3980106-dirty including all production changes in this amend, at jobs 1 and 8, matching the preceding 3980106 review snapshot. Existing tolerances were retained. Source/binary identities, strict compiler cases, parent differential residuals and the Camera metadata audit are in docs/EVAL_REPORT.md, Dependent owners, reference aliases and receiver qualification. Ability Runtime was recaptured from local master bb64b1e on 2026-11-19 with unchanged tolerances. See docs/EVAL_REPORT.md for the rebase comparison. The 2026-11-20 binder Host/interface-overload change recaptured only the affected exact IPC centers: Camera 808 -> 702 and ability_runtime 1762 -> 1641, with HDF and HiView unchanged. Ability_runtime's SendTransactCmd-only probes moved to 661 edges and 233 sender functions. The 2026-11-23 AAFwk TaskHandlerWrap::SubmitTask/SubmitTaskJust invoke models recaptured ability_runtime edges_indirect 2043 -> 2533 and public_edges_total 376130 -> 377471; the new probe pins AmsMgrScheduler::StartSpecifiedAbility reaching AppMgrServiceInner::StartSpecifiedAbility through its submitted lambda. The 2026-11-23 binder-wrapper member-resolution change recaptured ability_runtime public_functions_total 77351 -> 76978 and public_edges_total 377471 -> 379668, and one evaluated DataObsOption default constructor (75 -> 76); IPC and indirect centers are unchanged and the TaskHandler probe still passes. Move/forward issue #293 recaptured the affected counts from the pinned default profile with unchanged tolerances. The #293 review follow-up recaptured Ability Runtime public_edges_total from 377493 to 377492. The glvalue and reference-binding follow-up recaptured that count to 377501. Template argument ADL moved Ability Runtime public_functions_total from 77350 to 77349. See docs/EVAL_REPORT.md. The #293 rebase onto 31a999e recaptured the changed HDF, HiView, and Camera default bands with unchanged tolerances and retained the master Ability Runtime bands pending a combined run.",
   "budget_pops": 800000,
   "jobs": 8,
   "corpora": {
@@ -10,19 +10,19 @@
       "dir": "drivers_hdf_core",
       "globals": {
         "files": {"cmp": "exact", "value": 1510},
-        "functions_total": {"cmp": "band", "value": 12172, "tol": 40},
+        "functions_total": {"cmp": "band", "value": 12171, "tol": 40},
         "functions_defined": {"cmp": "band", "value": 10306, "tol": 40},
-        "functions_external": {"cmp": "band", "value": 1866, "tol": 40},
-        "edges_total": {"cmp": "band", "value": 78974, "tol": 240},
-        "edges_direct": {"cmp": "band", "value": 49816, "tol": 240},
+        "functions_external": {"cmp": "band", "value": 1865, "tol": 40},
+        "edges_total": {"cmp": "band", "value": 79070, "tol": 240},
+        "edges_direct": {"cmp": "band", "value": 49912, "tol": 240},
         "edges_indirect": {"cmp": "exact", "value": 5226},
         "edges_external": {"cmp": "band", "value": 23874, "tol": 200},
         "edges_ipc": {"cmp": "exact", "value": 58},
-        "arg_flow_edges": {"cmp": "band", "value": 72585, "tol": 150},
+        "arg_flow_edges": {"cmp": "band", "value": 72708, "tol": 150},
         "diagnostics": {"cmp": "exact", "value": 1910, "platform_values": {"win32": 1919}},
         "dlsym_edges": {"cmp": "exact", "value": 6},
-        "public_functions_total": {"cmp": "band", "value": 12131, "tol": 20},
-        "public_edges_total": {"cmp": "band", "value": 78844, "tol": 80}
+        "public_functions_total": {"cmp": "band", "value": 12130, "tol": 20},
+        "public_edges_total": {"cmp": "band", "value": 78940, "tol": 80}
       },
       "sites": [
       {"case": "HdfRemoteServiceCheckInterfaceToken -> the C++ adapter body (#83: the `extern \"C\"` prototype in hdf_remote_adapter_if.h and the definition in hdf_remote_adapter.cpp interned `struct HdfRemoteService *` under two ids, so the overload check split them and this call stopped at the undefined prototype)", "caller": "%HdfRemoteServiceCheckInterfaceToken", "line": 68, "resolution": "direct", "expected": 1},
@@ -69,7 +69,7 @@
       {"name": "no external name carries both a definition and a declaration-only entity (#83: a prototype the overload check refused to merge with its own definition leaves callers bound to the undefined entity; hdf's C-over-C++ IPC interface put 10 names in this state)", "sql": "SELECT COUNT(*) FROM (SELECT name FROM functions WHERE linkage='external' GROUP BY name HAVING SUM(is_defined)>0 AND SUM(1-is_defined)>0)", "cmp": "exact", "value": 0},
         {"name": "DevHostServiceAddDevice reaches the driver loader's GetDriver and both ReclaimDriver bodies (#127 review: the constructor stores them through `HdfDriverLoader.super`, the call loads them through `IDriverLoader *`; two interned snapshots of `IDriverLoader` split the field summary, which the pointer-static seed used to paper over)", "sql": "SELECT COUNT(DISTINCT tf.name) FROM call_edges e JOIN functions cf ON cf.id=e.caller_fn_id JOIN functions tf ON tf.id=e.callee_fn_id WHERE cf.name='DevHostServiceAddDevice' AND e.resolution='indirect' AND tf.name IN ('HdfDriverLoaderGetDriver', 'HdfDriverLoaderReclaimDriver', 'HdfDriverLoaderFullReclaimDriver')", "cmp": "exact", "value": 3},
         {"name": "flow_graph_nodes", "sql": "SELECT COUNT(*) FROM flow_nodes", "cmp": "min", "value": 100000},
-        {"name": "arg_flow_rows_per_call_edge", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites cs ON cs.id=a.call_site_id", "cmp": "band", "value": 72585, "tol": 150},
+        {"name": "arg_flow_rows_per_call_edge", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites cs ON cs.id=a.call_site_id", "cmp": "band", "value": 72708, "tol": 150},
         {"name": "no member indexed under a declarator fragment (#46: a conversion operator's `operator_cast` declarator was unknown to both member walks, so `operator bool() const {...}` fell out of a generic walk as `X::()const`; the real `operator()` stays, and so does a conversion whose target is a function pointer or reference — `X::operator void(*)` is the correct name for one)", "sql": "SELECT COUNT(*) FROM functions WHERE name GLOB '*(*' AND name NOT GLOB '*operator()' AND name NOT GLOB '*operator *(*'", "cmp": "exact", "value": 0},
         {"name": "no member indexed under the bare keyword `operator` (#46: `normalize_qualified` stripped `<...>` as a template-argument span, truncating the whole `operator<` / `<=` / `<<` / `<=>` family to the keyword and collapsing a class's comparison operators into one symbol)", "sql": "SELECT COUNT(*) FROM functions WHERE name='operator' OR name GLOB '*::operator'", "cmp": "exact", "value": 0},
         {"name": "no member indexed under a standard attribute (#46 review: `[[deprecated]] void LockForControl();` parses cleanly -- no error recovery involved -- but the attribute holds an identifier in front of the declaration and the member walk took it, collapsing every annotated member of a class into one symbol; camera lost 26 `CameraInput` / `CameraManager` members to 7 such phantoms)", "sql": "SELECT COUNT(*) FROM functions WHERE name GLOB '*::deprecated' OR name GLOB '*::nodiscard' OR name GLOB '*::maybe_unused' OR name GLOB '*::noreturn' OR name GLOB '*::fallthrough' OR name GLOB '*::visibility' OR name GLOB '*::dllexport' OR name GLOB '*::dllimport'", "cmp": "exact", "value": 0},
@@ -83,19 +83,19 @@
       "dir": "hiviewdfx_hiview",
       "globals": {
         "files": {"cmp": "exact", "value": 1452},
-        "functions_total": {"cmp": "band", "value": 9762, "tol": 120},
+        "functions_total": {"cmp": "band", "value": 9755, "tol": 120},
         "functions_defined": {"cmp": "band", "value": 7992, "tol": 120},
-        "functions_external": {"cmp": "band", "value": 1770, "tol": 120},
-        "edges_total": {"cmp": "band", "value": 39500, "tol": 160},
-        "edges_direct": {"cmp": "band", "value": 24105, "tol": 160},
+        "functions_external": {"cmp": "band", "value": 1763, "tol": 120},
+        "edges_total": {"cmp": "band", "value": 39511, "tol": 160},
+        "edges_direct": {"cmp": "band", "value": 24116, "tol": 160},
         "edges_indirect": {"cmp": "exact", "value": 266},
         "edges_external": {"cmp": "band", "value": 15085, "tol": 160},
         "edges_ipc": {"cmp": "exact", "value": 44},
-        "arg_flow_edges": {"cmp": "band", "value": 33789, "tol": 120},
+        "arg_flow_edges": {"cmp": "band", "value": 33799, "tol": 120},
         "diagnostics": {"cmp": "exact", "value": 3559},
         "dlsym_edges": {"cmp": "exact", "value": 3},
-        "public_functions_total": {"cmp": "band", "value": 9344, "tol": 120},
-        "public_edges_total": {"cmp": "band", "value": 38891, "tol": 160}
+        "public_functions_total": {"cmp": "band", "value": 9337, "tol": 120},
+        "public_edges_total": {"cmp": "band", "value": 38902, "tol": 160}
       },
       "sites": [
         {"case": "Plugin::OnEventProxy dispatch", "caller": "%Plugin::OnEventProxy", "line": 68, "resolution": "all", "expected": 13},
@@ -143,19 +143,19 @@
       "dir": "multimedia_camera_framework",
       "globals": {
         "files": {"cmp": "exact", "value": 1703},
-        "functions_total": {"cmp": "band", "value": 23539, "tol": 120},
+        "functions_total": {"cmp": "band", "value": 23536, "tol": 120},
         "functions_defined": {"cmp": "band", "value": 19806, "tol": 120},
-        "functions_external": {"cmp": "band", "value": 3733, "tol": 120},
-        "edges_total": {"cmp": "band", "value": 117298, "tol": 420},
-        "edges_direct": {"cmp": "band", "value": 70073, "tol": 420},
+        "functions_external": {"cmp": "band", "value": 3730, "tol": 120},
+        "edges_total": {"cmp": "band", "value": 117184, "tol": 420},
+        "edges_direct": {"cmp": "band", "value": 70095, "tol": 420},
         "edges_indirect": {"cmp": "exact", "value": 475},
-        "edges_external": {"cmp": "band", "value": 45942, "tol": 420},
+        "edges_external": {"cmp": "band", "value": 45912, "tol": 420},
         "edges_ipc": {"cmp": "exact", "value": 702},
-        "arg_flow_edges": {"cmp": "band", "value": 60961, "tol": 250},
+        "arg_flow_edges": {"cmp": "band", "value": 60964, "tol": 250},
         "diagnostics": {"cmp": "exact", "value": 5192},
         "dlsym_edges": {"cmp": "exact", "value": 6},
-        "public_functions_total": {"cmp": "band", "value": 22693, "tol": 120},
-        "public_edges_total": {"cmp": "band", "value": 115599, "tol": 420}
+        "public_functions_total": {"cmp": "band", "value": 22690, "tol": 120},
+        "public_edges_total": {"cmp": "band", "value": 115484, "tol": 420}
       },
       "sites": [
         {"case": "Command::Do GetCommandName", "caller": "%DeferredProcessing::Command::Do", "line": 35, "resolution": "all", "expected": 31},

@@ -1081,6 +1081,29 @@ fn function_signature(func: &trace_ir::Function, program: &Program) -> String {
     if func.is_member_template {
         sig.push_str(" <template>");
     }
+    if func.is_cpp {
+        if let Some(params) = program.symbols.explicit_params(func) {
+            let bindings = (0..params.len()).map(|index| {
+                let mut slot = index;
+                for &pack in &func.pack_positions {
+                    if slot < pack as usize {
+                        break;
+                    }
+                    slot += 1;
+                }
+                let reference = func.parameter_references.get(slot).copied().flatten();
+                let value = func.reference_params.get(slot) == Some(&false)
+                    && params
+                        .get(index)
+                        .and_then(|ty| program.types.all().get(ty.0 as usize))
+                        .is_some_and(|ty| {
+                            ty.desc.is_pointer_like() || matches!(*ty.desc, TypeDesc::Array { .. })
+                        });
+                (reference, value)
+            });
+            trace_ir::append_signature_references(&mut sig, bindings);
+        }
+    }
     sig
 }
 
@@ -2078,8 +2101,10 @@ mod tests {
                 owner_unresolved: false,
                 variadic: false,
                 pack_positions: Vec::new(),
+                is_explicit_constructor: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
+                is_free_function_template: false,
                 is_member_template: false,
                 is_const_member: false,
                 ref_qualifier: None,
@@ -2087,6 +2112,7 @@ mod tests {
                 is_static_member: false,
                 default_args: 0,
                 reference_params: Vec::new(),
+                parameter_references: Vec::new(),
                 is_virtual: false,
                 is_final: false,
                 is_cpp: false,

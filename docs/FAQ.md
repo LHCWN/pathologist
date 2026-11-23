@@ -17,7 +17,13 @@ Known limits of the analysis and practical guidance. Part of the [analysis docum
 - All paths merged; no null-check refinement.
 - Call order (`--sequencing`) is control-flow reachability, not path feasibility; see [Call sequencing](USAGE.md#call-sequencing-control-flow-sidecar), "Limits".
 - `free` does not invalidate pointers.
-- `FieldSummary` may connect unrelated struct instances.
+- `FieldSummary` may connect unrelated struct instances. After a move
+  from one object to another, both the old and new writes to a callback
+  field may reach a call on the destination object.
+- **Moved-from values.** The may-analysis preserves the source's
+  possible pointees after `std::move`. A moved-from `std::unique_ptr`
+  may still resolve calls on its former pointee. Ownership transfer
+  and moved-from invalidation are outside the model.
 - **Lazily created field cells carry no slot guard** (see
   [Variable cells](POINTERS.md#propagation-highlights)): their recorded type is not reliable enough to guard by.
 - Multiple vtable/ops targets reported for one indirect site (may-analysis).

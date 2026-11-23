@@ -204,6 +204,11 @@ Copies with the same caller, callee text and full spelling path/line/column
 share one leaf, including shared-header sites copied from multiple merge
 inputs. The lowest call-site ID supplies that leaf's query-local ID.
 
+Recognized `std::move` and `std::forward` calls keep ordinary call sites and
+edges, using their canonical names even through aliases and using-declarations.
+The edge can resolve to a declaration or an external function. The associated
+value flow is represented by the operand's flow.
+
 ## Lambda-free call graph views
 
 Version 9 makes the existing public relations the lambda-free consumer
@@ -460,13 +465,21 @@ query them.
 | `line_start` | INTEGER | Start line (always original-file coordinates via LineMap); `0` iff the function was synthesized (never declared in-tree) |
 | `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes and synthesized externals (both `0` for a synthesized external) |
 | `linkage` | TEXT | `external`, `internal`, `none` |
-| `signature` | TEXT | Normalized function signature with parameter types (e.g. `name(int, char*)`). Decays top-level array parameters to pointers (`int[]` -> `int*`); drops qualifiers (`const`, `volatile`) and signedness, representing function pointers as `fn_ptr`. Used for best-effort C++ overload disambiguation during cross-repository linking |
+| `signature` | TEXT | Normalized function signature with parameter storage types (e.g. `name(int, char*)`) and reference binding metadata where available. Decays top-level arrays to pointers and drops qualifiers and signedness in storage types. Represents function pointers as `fn_ptr`. Used for C++ overload disambiguation during cross-repository linking |
 | `is_defined` | INTEGER | 1 if a body exists under the analyzed root. 0 rows include prototype-only declarations, synthesized externals (libc/logging backends never declared in-tree), and dependency declarations |
 | `is_dep` | INTEGER | 1 if function originates from a dependency root (`--dep`), 0 otherwise |
 | `is_weak` | INTEGER | 1 for a weak symbol, 0 otherwise; recorded only for external linkage — a `static` has none to weaken. |
 | `target_id` | INTEGER FK → `link_targets` | Owning link target; `NULL` when no target is known. |
 
 **Index:** `functions(name)`
+
+The optional signature suffix ` [refs=...]` lists explicit parameter bindings
+in declaration order. `&` and `&&` record lvalue and rvalue references,
+`const` marks a const referent, `?` marks unknown qualification, `:c` and `:m`
+mark a const or mutable pointee on a pointer reference, and `value`
+distinguishes by-value pointer parameters from references with the same
+storage type. `-` and older signatures without the suffix provide no binding
+fact for matching.
 
 Header-defined functions are deduplicated across TUs within their link target
 at merge time (later copies redirect), so they appear once per origin and target.

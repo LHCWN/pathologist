@@ -268,18 +268,27 @@ origin cannot be distinguished by body text in the database.
 External declarations at one origin deduplicate across input databases and
 link images. A declaration shared by different targets has `target_id = NULL`
 in the merged output; relinking uses the original input records and the
-caller's target. Definitions additionally require the same remapped target
+caller's target. A legacy declaration can share a row with a current export
+at the same file and line when its storage signature identifies one annotated
+candidate across all inputs. The shared row retains the current export's
+signature and identity. Definitions additionally require the same remapped target
 to deduplicate. Each image keeps its own function ID and outgoing calls,
 even when the source origin agrees. `header_functions_deduped` counts rows
 actually unified, so retained definition copies in distinct images do not
 increase it.
 
 Copies of one source definition are not a `MultipleDefinitions` collision.
+The collision check groups unannotated legacy definitions with a current
+signature when it is the only annotated signature with the same storage type.
 For an external call, selected candidates from just one source origin use
 `direct` resolution (or preserve `indirect` / `ipc`) and count as one resolved
 call, while emitting edges to every selected image copy. This retains paths
 through different image-local callees. Distinct source origins remain
 ambiguous. Unknown source positions cannot establish shared identity.
+For call classification, copies with the same file, line, and normalized
+storage signature agree on their origin when their available reference
+binding facts agree. This allows older exports that omit the facts to link
+alongside current exports.
 
 File dependency ownership is unified before function ingestion. When any
 input owns a shared file as project code (`is_dep = 0`), all function copies
@@ -1034,7 +1043,7 @@ covers the DataShare framework route. For partial checkouts, choose among
   - `trace-merge` groups exported definitions by `(name, signature)` before collision detection. Valid C++ overloads do not trigger false `MultipleDefinitions` warnings.
   - Calls to overloaded external functions first match candidates by exact signature (`orig_callee.signature == candidate.signature`). If no candidate matches by exact signature, `trace-merge` over-approximates by falling back to every same-name candidate rather than dropping the call, preventing lossy spelling discrepancies from stranding calls as unresolved.
   - When candidates originate from the same-name fallback rather than an exact signature match, `trace-merge` retains every selected candidate rather than applying same-database/same-target preference (which applies only to conflicting definitions of the same overload). Distinct source origins make the call ambiguous; copies of one source origin retain a resolved classification as described in [Database merger header copies](#database-merger-header-copies).
-  - Strong-over-weak preference applies separately to each signature in the fallback pool. A strong `query(int)` cannot suppress a weak `query(double)` when either could match the call.
+  - Strong-over-weak preference applies separately to each normalized storage signature and compatible reference binding in the fallback pool. Older signatures without binding facts can match current exports.
 - **Problem detection and diagnostic reporting**:
   - `MultipleDefinitions`: Multiple strong definitions with the same signature and distinct source origins found across different repositories. Shared-origin image copies do not constitute a collision. Reported as a collision warning and recorded with `stage = 'merge'`.
   - `UnresolvedExternal`: External function references that have no matching definition in any merged database.

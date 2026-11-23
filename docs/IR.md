@@ -329,7 +329,31 @@ subDev->subDevOps = GetSensorDeviceOps();  // return &g_sensorDeviceOps
 subDev.subDevOps->setConfig(subDev);
 ```
 
-Nested call arguments (`consume(make())`, `Register(obj->GetHandler())`, `consume(table[i]())`, `std::move(make())`) materialize a temporary variable assigned via `CallReturn`, `CallReturnIndirect`, or member call return destinations, which is then passed as the actual argument into the outer call site, matching the semantics of `Callback f = make(); consume(f);` both within a translation unit and across units. Member call returns (`consume(obj->GetHandler())`, `consume(base->virtual_method())`, `x = obj->method()`, `return obj->method()`) are classified as `ResolvedCallReturn::Member` during lowering: candidate methods are ranked by argument count and overload resolution (`rank_per_class`), attaching `return_dst` to the resulting `CallSite`. Class Hierarchy Analysis (`expand_virtual_overrides`) replicates `return_dst` across all concrete derived overrides, and `Pag::expand_call_site_returns` expands return flows into `return_dst` across all candidates and overrides at PAG construction time, properly connecting return values from derived implementations (including pure virtual base interface declarations `= 0`). Candidate grouping, visited cycle-guards, and model fallback decisions are scoped to each syntactic call occurrence (`(dst_var, caller, occurrence)`), ensuring a real return from one call does not suppress models for a separate bodyless call assigning the same variable. Only qualified `std::move` and `std::forward` invocations (`std::` or `::std::`) with forwarding reference semantics (`T&&`) are treated as rvalue cast expressions in `peel_casts`, preserving ordinary user-defined `move` and `forward` functions. Returned call expressions (`return make()`, `return (*factory)()`, `return obj->method()`) resolve through the shared `resolve_call_for_return`, ensuring indirect and member call returns materialize into temporaries with `ReturnFlow::Copy` and preventing local variable or field names from leaking into direct function resolution. Temporaries are allocated only after confirming resolution, preventing orphaned variables in symbol tables.
+Nested call arguments (`consume(make())`, `Register(obj->GetHandler())`, `consume(table[i]())`, `std::move(make())`) materialize a temporary variable assigned via `CallReturn`, `CallReturnIndirect`, or member call return destinations, which is then passed as the actual argument into the outer call site, matching the semantics of `Callback f = make(); consume(f);` both within a translation unit and across units. Member call returns (`consume(obj->GetHandler())`, `consume(base->virtual_method())`, `x = obj->method()`, `return obj->method()`) are classified as `ResolvedCallReturn::Member` during lowering: candidate methods are ranked by argument count and overload resolution (`rank_per_class`), attaching `return_dst` to the resulting `CallSite`. Class Hierarchy Analysis (`expand_virtual_overrides`) replicates `return_dst` across all concrete derived overrides, and `Pag::expand_call_site_returns` expands return flows into `return_dst` across all candidates and overrides at PAG construction time, properly connecting return values from derived implementations (including pure virtual base interface declarations `= 0`). Candidate grouping, visited cycle-guards, and model fallback decisions are scoped to each syntactic call occurrence (`(dst_var, caller, occurrence)`), ensuring a real return from one call does not suppress models for a separate bodyless call assigning the same variable. Returned call expressions (`return make()`, `return (*factory)()`, `return obj->method()`) resolve through the shared `resolve_call_for_return`, ensuring indirect and member call returns materialize into temporaries with `ReturnFlow::Copy` and preventing local variable or field names from leaking into direct function resolution. Temporaries are allocated only after confirming resolution, preventing orphaned variables in symbol tables.
+
+Value lowering peels [standard move and forward calls](CXX.md#c-support-first-step)
+to their operand. Argument ranking retains the known lvalue or rvalue
+category and referent qualification. Parameter metadata uses the
+collapsed reference category for declarations such as `Ref&&` with
+`using Ref = T&`. Pointer-reference parameters keep this category and known
+pointee constness in overload metadata even when lowered as pointer values
+for flow analysis. For member calls ranking checks receiver viability before
+preferring an argument binding. Base qualifiers resolve in their lexical scope, with a leading
+`::` starting lookup at global scope. Result type and constness
+inference use the same selection. Default arguments come from declarations
+matching the selected member overload. Reference viability also checks direct
+bindings to base subobjects. Virtual dispatch expands the overload selected
+from the static receiver's declarations to its override family.
+A same-class glvalue such as a named object, member access, reference-returning
+call, or conditional glvalue converted to a common base selects a copy or move
+constructor when it initializes an object. The candidates are user-provided constructors
+eligible for implicit conversion. Reference declarations bind directly to
+the initializer, and same-type prvalues construct the destination directly
+under C++17 copy elision. Same-class assignments record
+declared copy or move `operator=` sites where a visible user-provided overload
+can accept a same-class argument and wins overload selection. Defaulted
+assignments participate in selection and have no synthetic call site. This
+supplements the existing may-flow for assignment.
 
 **`CallReturnIndirect`** is the indirect-call analogue of `CallReturn`. The callee is resolved by the solver when indirect call targets are known (via function-pointer analysis). The `callee_var` is a synthetic load variable that holds the resolved function pointer; the solver wires return flows from each resolved target into `dst`.
 

@@ -440,7 +440,7 @@ fn list_element_conversions(
             let value = peel_expression(value);
             if is_null_constant(source, value)
                 || value.cached_kind() == "lambda_expression"
-                || fn_designator(source, value)
+                || fn_designator(program, ctx, source, value)
                     .is_some_and(|name| resolve_fn_ref(program, ctx, source, name).is_some())
             {
                 return true;
