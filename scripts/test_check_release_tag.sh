@@ -40,6 +40,9 @@ expect_success matching-version sh "$validator" v0.1.0 "$valid_manifest"
 expect_failure missing-v-prefix sh "$validator" 0.1.0 "$valid_manifest"
 expect_failure incomplete-version sh "$validator" v0.1 "$valid_manifest"
 expect_failure mismatched-version sh "$validator" v0.1.1 "$valid_manifest"
+expect_failure tag-with-shell-meta sh "$validator" 'v0.1.0$(id)' "$valid_manifest"
+expect_failure tag-with-quote sh "$validator" 'v0.1.0"' "$valid_manifest"
+expect_failure tag-with-suffix sh "$validator" v0.1.0-rc.1 "$valid_manifest"
 expect_failure missing-workspace-version sh "$validator" v0.1.0 "$missing_workspace_manifest"
 
 printf 'release tag validation tests passed\n'

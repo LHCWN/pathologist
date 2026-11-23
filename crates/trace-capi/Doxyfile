@@ -1,7 +1,7 @@
 # Doxyfile for trace C API documentation
 
 PROJECT_NAME           = "trace"
-PROJECT_NUMBER         = "0.1.0"
+PROJECT_NUMBER         = "0.2.0"
 PROJECT_BRIEF          = "C API for the trace static-analysis engine"
 
 OUTPUT_DIRECTORY       = ../../target/doxygen

@@ -1,0 +1,93 @@
+name: Release
+
+# CI builds and validates the release archives on every tag push. This workflow
+# waits for that CI run to succeed, then publishes a normal GitHub release for
+# the tag and reuses the CI-built archives, so a release is never created from a
+# tag that failed the full CI gate. It ignores branch pushes (even branches
+# named like tags) and only publishes a tag that still points at the built
+# commit.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  release:
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Validate the exact revision this CI run built.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Detect release tag
+        id: tag
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # head_branch is the tag name only for a tag push; for a branch push it
+          # is the branch name. Publish only when a tag of that name exists and
+          # still points at the commit this run built.
+          remote=$(git ls-remote --tags origin)
+          tag_ref="refs/tags/$HEAD_BRANCH"
+          tag_commit=$(printf '%s\n' "$remote" | awk -v peeled="$tag_ref^{}" '$2 == peeled { print $1; exit }')
+          if [ -z "$tag_commit" ]; then
+            tag_commit=$(printf '%s\n' "$remote" | awk -v ref="$tag_ref" '$2 == ref { print $1; exit }')
+          fi
+          if [ -z "$tag_commit" ]; then
+            echo "name=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$tag_commit" != "$HEAD_SHA" ]; then
+            echo "tag $HEAD_BRANCH points at $tag_commit, not the built $HEAD_SHA; skipping" >&2
+            echo "name=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "name=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag
+        if: steps.tag.outputs.name != ''
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: sh scripts/check_release_tag.sh "$TAG"
+
+      - name: Download CI artifacts
+        if: steps.tag.outputs.name != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create tagged release
+        if: steps.tag.outputs.name != ''
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; leaving it unchanged"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes \
+            artifacts/*
+
+      - name: Nothing to publish
+        if: steps.tag.outputs.name == ''
+        run: echo "CI succeeded for a branch or a commit whose v* tag does not match it; nothing to publish."

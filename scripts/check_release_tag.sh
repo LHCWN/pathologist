@@ -9,6 +9,13 @@ fi
 tag=$1
 manifest=${2:-Cargo.toml}
 
+# Only accept the documented vMAJOR.MINOR.PATCH shape. The tag is passed to
+# scripts that run with write access, so keep the accepted surface narrow.
+if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    printf 'invalid release tag %s (expected vMAJOR.MINOR.PATCH)\n' "$tag" >&2
+    exit 1
+fi
+
 if [ ! -f "$manifest" ]; then
     printf 'manifest not found: %s\n' "$manifest" >&2
     exit 2

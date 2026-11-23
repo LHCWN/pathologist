@@ -2,7 +2,9 @@
 
 All workspace crates share the version in `[workspace.package]` in the root
 `Cargo.toml`. A release tag must be exactly that version prefixed by `v`; for
-example, workspace version `0.2.0` is released as `v0.2.0`.
+example, workspace version `0.2.0` is released as `v0.2.0`. The validator also
+requires the `vMAJOR.MINOR.PATCH` shape and rejects any other tag before
+reading the manifest.
 
 ## Release checklist
 
@@ -24,9 +26,13 @@ example, workspace version `0.2.0` is released as `v0.2.0`.
    by `git push origin vX.Y.Z`.
 
 CI rejects a tag that differs from the workspace version. A valid tag builds
-the same Linux x64, Linux arm64, and Windows x64 archives as `master-latest`,
-then creates a normal GitHub release with generated notes. Pushes to `master`
-continue to replace the rolling `master-latest` prerelease.
+the same Linux x64, Linux arm64, and Windows x64 archives as `master-latest`.
+Once that CI run succeeds, `.github/workflows/release.yml` publishes a normal
+GitHub release for the tag, attaching the CI-built archives with generated
+notes. It publishes only when the run's head branch names a tag that still
+points at the built commit, so branch pushes (including branches named `v*`)
+never publish. Pushes to `master` continue to replace the rolling
+`master-latest` prerelease.
 
 ## Build provenance
 

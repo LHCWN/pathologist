@@ -4,6 +4,8 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-23
+
 ### Resolve binder-wrapper interface members during lowering
 
 A handler body such as
@@ -44,6 +46,17 @@ are unchanged. The default profile recaptures
 `cpp_template_base_fallback` gains a handler-body case and an integration
 test. See [Template-parameter bases](docs/CXX.md#template-parameter-bases) and
 [OpenHarmony IPC bridges](docs/MODELS.md#openharmony-ipc-bridges).
+
+### Publish tag releases from a dedicated workflow
+
+A pushed `v*` tag still runs the full CI gate, which validates the tag against
+the workspace version and builds the Linux x64, Linux arm64, and Windows x64
+archives. `release.yml` then publishes the GitHub release for that tag with the
+CI-built archives and generated notes once that tag's own CI run succeeds. It
+publishes only when a tag with the run's head branch name still points at the
+commit that run built, so a `master` push or a branch whose name starts with
+`v` cannot publish. `master` pushes keep updating the rolling `master-latest`
+prerelease. See [Releasing](docs/RELEASING.md).
 
 ### Pair binder `*Host` stubs and narrow interface-fallback overloads
 
