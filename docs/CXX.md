@@ -1545,7 +1545,10 @@ FieldStub<IField>` body, `x` is `FieldStub`'s own `x`, not `IField::x`.
 Effect. `derives_from` and `subclass_closure` see the subclass, so
 [smart-pointer unwrap](IR.md#smart-pointer-unwrap) admits its objects for the
 interface's pointee type and CHA virtual dispatch through the interface
-reaches its overrides.
+reaches its overrides. For the recognized binder wrappers this includes
+member lookups inside the wrapper itself, so a handler body's unqualified
+interface call is not left as an external free-function call (see
+[Undefined templates](#template-parameter-bases)).
 
 Undefined templates (#122). OpenHarmony's `IRemoteProxy` and `IRemoteStub`
 are defined in the ipc component, outside most trees, so a
@@ -1577,8 +1580,22 @@ spelling like the [undeclared wrapper](IR.md#smart-pointer-unwrap) rule (#86):
   `template <class T> struct Plain {};` means `Plain<IFoo>` does not derive
   from `IFoo`, and the declared rules above decide.
 
-It runs once, after merge, so a definition any unit (or dependency root)
-contributes is seen first; lowering makes no provisional guess.
+The guess for an arbitrary undefined template runs once, after merge, so a
+definition any unit (or dependency root) contributes is seen first; lowering
+makes no provisional guess for it. The recognized binder wrappers
+(`IRemoteStub<I>`, `IRemoteProxy<I>`, `IProxyBroker<I>`) are the exception:
+their first template argument is an interface by construction (trailing
+policy arguments such as `IRemoteStub<IFoo, Policy>` are ignored), so lowering
+adds it as a base immediately, with the same cycle guard. Unlike the
+arbitrary-template guess it does not require override evidence: a wrapper
+holder gains the edge, but contributes no dispatch target unless it overrides
+the interface. A handler body such as
+`AppSchedulerHost::HandleScheduleAbilityStage` therefore resolves its
+unqualified `ScheduleAbilityStage(...)` call to the interface member instead
+of a free function, and virtual-override expansion reaches
+`MainThread::ScheduleAbilityStage`. `trace-merge` also recovers that edge from
+the exported base fact and implicit member call, but analysis needs the base
+earlier to keep the call's dispatch and value flow.
 
 Limits:
 

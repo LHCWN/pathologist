@@ -1,5 +1,64 @@
 # Evaluation Report
 
+## Binder-wrapper interface members during lowering - 2026-11-23
+
+`AppSchedulerHost::HandleScheduleAbilityStage`
+(`interfaces/inner_api/app_manager/src/appmgr/app_scheduler_host.cpp`)
+calls `ScheduleAbilityStage(*abilityStage)` unqualified. The class derives
+from `IRemoteStub<IAppScheduler>`, whose definition is outside the pinned
+tree. The merge-time template-base guess added
+`AppSchedulerHost -> IAppScheduler`, but lowering had already bound the call
+to an external free function, so the exported default and canonical graphs
+had no `AppSchedulerHost::HandleScheduleAbilityStage ->
+MainThread::ScheduleAbilityStage` edge.
+
+`trace-merge` could recover the edge from the exported linking facts even on
+a single input: merging the pre-change database restored the same 39
+`AppSchedulerHost::Handle* -> MainThread::*` edges. It did so only as call
+edges, after the solver had run. Lowering now adds a recognized binder
+wrapper's interface argument as a base immediately
+([Undefined templates](CXX.md#template-parameter-bases)), so the call resolves
+to the interface member, virtual-override expansion reaches `MainThread`, and
+the edge keeps its argument flow. Other undefined templates still wait for
+the merge-time evidence rule.
+
+Pinned `ability_ability_runtime` (`6c18fdc9bdef`, release binary, `--jobs 8`,
+`--ignore-logging`):
+
+| Measurement | Before | After |
+|---|---:|---:|
+| `AppSchedulerHost::Handle* -> MainThread::*` | 0 | 39 |
+| `HandleScheduleAbilityStage -> MainThread::ScheduleAbilityStage` | 0 | 1 |
+| `public_functions_total` | 77,351 | 76,978 |
+| `public_edges_total` (lambda-free) | 377,471 | 379,668 |
+| `edges_ipc` | 1,641 | 1,641 |
+| `edges_indirect` | 2,533 | 2,533 |
+
+The default edge total rises by 2,197 (1,085 direct and 1,112 external): each
+resolved handler call now reaches its concrete override and keeps the
+interface declaration as a may-target instead of an external free-function
+placeholder. One more `DataObsOption` default constructor is evaluated in a
+header (75 -> 76). Canonical system-header mode
+(`--canonical-system-headers --compiler g++`) follows:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| `functions_total` | 89,063 | 88,690 |
+| `functions_external` | 20,414 | 20,041 |
+| `edges_total` | 418,405 | 420,602 |
+| `edges_direct` | 255,993 | 257,078 |
+| `edges_external` | 158,238 | 159,350 |
+| `arg_flow_edges` | 455,892 | 457,968 |
+| `public_functions_total` | 85,660 | 85,287 |
+| `public_edges_total` | 410,574 | 412,771 |
+| `diagnostics` | 11,944 | 11,944 |
+| `edges_ipc` | 1,641 | 1,641 |
+
+`cpp_template_base_fallback` adds a `TaskHandler` whose handler body calls
+its interface member and a `TaskHandlerService` override; the integration
+test asserts the resulting edge. Default and canonical eval rechecks pass
+over all four pinned corpora after the recapture.
+
 ## AAFwk task handler callback edges - 2026-11-23
 
 `AmsMgrScheduler::StartSpecifiedAbility` hands a lambda to

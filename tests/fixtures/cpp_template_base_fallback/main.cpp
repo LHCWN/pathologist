@@ -130,6 +130,57 @@ public:
 };
 void calltask(ITask *t) { t->Perform(); }
 
+// A handler body calls the interface member unqualified. The wrapper's
+// definition is out of tree, so the argument must still be a base while the
+// unit lowers this body, not only when the merge-time guess runs.
+class TaskHandler : public IRemoteStub<ITask> {
+public:
+    int OnRemoteRequest();
+    void HandlePerform();
+};
+void TaskHandler::HandlePerform() { Perform(); }
+class TaskHandlerService : public TaskHandler {
+public:
+    void Perform() override {}
+};
+
+// `IRemoteProxy<I>` (communication_ipc) and HDF's `IProxyBroker<I>` also
+// derive from their first template argument. Both handler bodies resolve the
+// unqualified interface call while lowering their own unit.
+class ProxyTaskHandler : public IRemoteProxy<ITask> {
+public:
+    void HandlePerform();
+};
+void ProxyTaskHandler::HandlePerform() { Perform(); }
+class ProxyTaskHandlerService : public ProxyTaskHandler {
+public:
+    void Perform() override {}
+};
+
+template <typename T> class IProxyBroker;
+class BrokerTaskHandler : public IProxyBroker<ITask> {
+public:
+    void HandlePerform();
+};
+void BrokerTaskHandler::HandlePerform() { Perform(); }
+class BrokerTaskHandlerService : public BrokerTaskHandler {
+public:
+    void Perform() override {}
+};
+
+// An arbitrary undefined template keeps the merge-time evidence rule, so its
+// handler body still needs merge recovery for the same inherited call.
+template <typename T> class OpaqueWrap;
+class LateHandler : public OpaqueWrap<ITask> {
+public:
+    void HandlePerform();
+};
+void LateHandler::HandlePerform() { Perform(); }
+class LateHandlerService : public LateHandler {
+public:
+    void Perform() override {}
+};
+
 // A member of a template instance is not the template: no guess.
 template <class T> struct Traits {
     using Base = Other;

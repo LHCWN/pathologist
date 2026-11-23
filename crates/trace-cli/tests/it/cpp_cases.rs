@@ -17990,6 +17990,54 @@ fn cpp_template_base_override_may_be_in_a_subclass() {
 }
 
 #[test]
+fn cpp_template_base_handler_body_calls_the_interface_member() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(p.derives_from("TaskHandler", "ITask"));
+    assert!(
+        has_any_edge(
+            p,
+            a,
+            "TaskHandler::HandlePerform",
+            "TaskHandlerService::Perform"
+        ),
+        "{:?}",
+        common::callees_of(p, a, "TaskHandler::HandlePerform")
+    );
+}
+
+#[test]
+fn cpp_template_base_proxy_and_broker_handler_bodies_call_the_interface_member() {
+    let (p, a) = cpp_template_base_fallback();
+    for (handler, service) in [
+        ("ProxyTaskHandler", "ProxyTaskHandlerService::Perform"),
+        ("BrokerTaskHandler", "BrokerTaskHandlerService::Perform"),
+    ] {
+        assert!(p.derives_from(handler, "ITask"), "{handler}");
+        let caller = format!("{handler}::HandlePerform");
+        assert!(
+            has_any_edge(p, a, &caller, service),
+            "{caller}: {:?}",
+            common::callees_of(p, a, &caller)
+        );
+    }
+}
+
+#[test]
+fn cpp_template_base_generic_wrapper_handler_waits_for_merge() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(p.derives_from("LateHandler", "ITask"));
+    assert!(
+        must_not_have_edge(
+            p,
+            a,
+            "LateHandler::HandlePerform",
+            "LateHandlerService::Perform"
+        ),
+        "the call was already bound before the merge-time base guess"
+    );
+}
+
+#[test]
 fn cpp_template_base_member_of_an_instance_is_not_guessed() {
     let (p, _) = cpp_template_base_fallback();
     assert!(!p.derives_from("TraitImpl", "IBaz"));
