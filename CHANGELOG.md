@@ -4,6 +4,47 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Resolve binder-wrapper interface members during lowering
+
+A handler body such as
+`AppSchedulerHost::HandleScheduleAbilityStage` calls `ScheduleAbilityStage`
+unqualified. The class derives from `IRemoteStub<IAppScheduler>`, whose
+definition is normally outside the analyzed tree, so the interface was only
+known after the merge-time template-base guess. Lowering therefore resolved
+the call to an external free function and `MainThread::ScheduleAbilityStage`
+was unreachable; only a `trace-merge` of the exported facts restored the edge.
+
+Lowering now adds the first template argument of the recognized binder wrappers
+(`IRemoteStub<I>`, `IRemoteProxy<I>`, `IProxyBroker<I>`), ignoring trailing
+policy arguments such as `IRemoteStub<IFoo, Policy>`, as a base when the
+wrapper is undefined, with the same cycle guard as the merge-time guess. The
+whitelisted wrappers derive from that argument by construction, so lowering
+does not require the arbitrary-template override evidence; a holder gains the
+edge but contributes no dispatch target unless it overrides the interface. The
+handler's call resolves to the interface member, so virtual-override expansion
+reaches the service and the edge keeps the call's dispatch and value flow.
+Other undefined templates keep the post-merge evidence rule. The exported
+linking facts still let `trace-merge` recover the edge from databases written
+by earlier versions.
+
+On the pinned `ability_ability_runtime` checkout (`6c18fdc9bdef`,
+`--jobs 8 --ignore-logging`), `AppSchedulerHost::Handle* -> MainThread::*`
+goes from 0 to 39 edges, including
+`AppSchedulerHost::HandleScheduleAbilityStage -> MainThread::ScheduleAbilityStage`;
+IPC and indirect centers
+are unchanged. The default profile recaptures
+`public_functions_total` 77,351 -> 76,978 and `public_edges_total`
+377,471 -> 379,668, plus one evaluated `DataObsOption` default constructor
+(75 -> 76). Canonical system-header mode recaptures `functions_total`
+89,063 -> 88,690, `functions_external` 20,414 -> 20,041, `edges_total`
+418,405 -> 420,602, `edges_direct` 255,993 -> 257,078, `edges_external`
+158,238 -> 159,350, `arg_flow_edges` 455,892 -> 457,968,
+`public_functions_total` 85,660 -> 85,287 and `public_edges_total`
+410,574 -> 412,771; diagnostics, IPC and indirect centers are unchanged.
+`cpp_template_base_fallback` gains a handler-body case and an integration
+test. See [Template-parameter bases](docs/CXX.md#template-parameter-bases) and
+[OpenHarmony IPC bridges](docs/MODELS.md#openharmony-ipc-bridges).
+
 ### Pair binder `*Host` stubs and narrow interface-fallback overloads
 
 OpenHarmony spells some remote binder halves `*Host` rather than `*Stub`

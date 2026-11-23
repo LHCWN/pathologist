@@ -4223,11 +4223,11 @@ fn single_input_merge_recovers_implicit_inherited_members() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input.db");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/cpp_singleton_ipc");
+        .join("../../tests/fixtures/cpp_template_base_fallback");
     analyze_repo(&fixture, &input);
     let recovered = (
-        "FooStub::OnRemoteRequest".into(),
-        "FooService::Start".into(),
+        "LateHandler::HandlePerform".into(),
+        "LateHandlerService::Perform".into(),
         "direct".into(),
     );
     assert!(!named_edges(&input).contains(&recovered));

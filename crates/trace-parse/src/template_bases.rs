@@ -137,15 +137,62 @@ pub(crate) fn add_parameter_bases(
     (file, unit): (FileId, &[FileId]),
     anonymous: bool,
 ) {
-    if program.class_templates.is_empty() && program.anonymous_class_templates.is_empty() {
-        return;
+    let mut bases =
+        if program.class_templates.is_empty() && program.anonymous_class_templates.is_empty() {
+            Vec::new()
+        } else {
+            parameter_bases(program, spelling, scope, Templates::Unit { file, unit })
+        };
+    // A binder wrapper's argument is an interface, and its definition is
+    // usually in the ipc component outside the tree. Member lookups later in
+    // the unit must see it even though only the post-merge guess will record
+    // the edge for an arbitrary undefined template: a handler body calls the
+    // interface's members unqualified.
+    if let Some(base) = undefined_binder_base(program, derived, spelling, scope) {
+        // As the merge-time guess: an edge that closes a cycle is not a base.
+        if !program.derives_from(&base, derived) {
+            bases.push(base);
+        }
     }
-    for base in parameter_bases(program, spelling, scope, Templates::Unit { file, unit }) {
+    for base in bases {
         if anonymous {
             program.add_anonymous_base(derived, file, &base);
         }
         program.add_inheritance(derived, &base);
     }
+}
+
+/// The interface a recognized binder wrapper's first template argument names,
+/// when the wrapper itself is not defined in this tree: `IRemoteStub<IFoo>`,
+/// `IRemoteProxy<IFoo>` and `IProxyBroker<IFoo>` all derive from `IFoo`;
+/// trailing policy arguments are ignored.
+/// Lowering adds it as a base so member lookups in the unit resolve; the
+/// post-merge guess uses the broader [`undefined_template_base`] evidence
+/// rule for any other undefined template.
+fn undefined_binder_base(
+    program: &Program,
+    derived: &str,
+    spelling: &str,
+    scope: &str,
+) -> Option<String> {
+    let template = receiver_lookup_name(spelling);
+    let wrapper = template.rsplit("::").next().unwrap_or(&template);
+    if !matches!(wrapper, "IRemoteStub" | "IRemoteProxy" | "IProxyBroker")
+        || !is_undefined_wrapper(program, spelling, &template)
+    {
+        return None;
+    }
+    // The interface is the first argument, as the IPC detector reads it;
+    // trailing policy arguments (`IRemoteStub<IFoo, Policy>`) do not change
+    // which interface the wrapper derives from.
+    let argument = template_arguments(spelling).into_iter().next()?;
+    if is_compound(&argument) {
+        return None;
+    }
+    let argument = sanitize_type_name(&argument);
+    let class = held_class_in_declaration_scope(program, scope, &argument)?;
+    let class = receiver_lookup_name(&class).into_owned();
+    (class != derived && program.types.declares_class(&class)).then_some(class)
 }
 
 /// [`add_parameter_bases`] for every concrete templated base once merged,
@@ -629,6 +676,57 @@ mod tests {
         assert!(
             program.bases_of("Generic").is_empty(),
             "dependent facts name no concrete class"
+        );
+    }
+
+    #[test]
+    fn lowering_adds_an_undefined_binder_wrapper_argument_as_a_base() {
+        let mut program = Program::default();
+        for cls in [
+            "svc::IAppScheduler",
+            "svc::AppSchedulerHost",
+            "svc::MultiAppSchedulerHost",
+            "svc::Boxed",
+        ] {
+            program.types.define_struct(cls);
+        }
+        add_parameter_bases(
+            &mut program,
+            "svc::AppSchedulerHost",
+            "svc::IRemoteStub<svc::IAppScheduler>",
+            "svc",
+            (FileId(0), &[]),
+            false,
+        );
+        assert!(
+            program.derives_from("svc::AppSchedulerHost", "svc::IAppScheduler"),
+            "a handler body sees the interface member"
+        );
+
+        add_parameter_bases(
+            &mut program,
+            "svc::MultiAppSchedulerHost",
+            "svc::IRemoteStub<svc::IAppScheduler, svc::Policy>",
+            "svc",
+            (FileId(0), &[]),
+            false,
+        );
+        assert!(
+            program.derives_from("svc::MultiAppSchedulerHost", "svc::IAppScheduler"),
+            "the first template argument is the interface"
+        );
+
+        add_parameter_bases(
+            &mut program,
+            "svc::Boxed",
+            "svc::Box<svc::IAppScheduler>",
+            "svc",
+            (FileId(0), &[]),
+            false,
+        );
+        assert!(
+            !program.derives_from("svc::Boxed", "svc::IAppScheduler"),
+            "an arbitrary undefined template keeps the post-merge evidence rule"
         );
     }
 

@@ -1022,8 +1022,15 @@ namespace and its enclosing namespaces, while only `::api::IFoo` forces global
 lookup. Bodyless methods are intentionally leaf targets when no implementation
 is indexed. When the `IRemoteStub` definition itself is in the tree, the stub
 also has a real inheritance edge to `IFoo`
-([Template-parameter bases](CXX.md#template-parameter-bases)); the argument
-recovery above covers the common case where it is not.
+([Template-parameter bases](CXX.md#template-parameter-bases)). When it is not,
+lowering adds the first template argument as that edge for the recognized
+binder wrappers (`IRemoteStub`, `IRemoteProxy`, `IProxyBroker`, trailing policy
+arguments ignored, without the arbitrary-template override evidence), so a handler body's
+unqualified interface call resolves to the interface member and virtual
+dispatch reaches the service; `trace-merge` can also recover the call edge
+from the exported base fact, but only the earlier edge preserves the call's
+dispatch and value flow. The IPC fallback above still recovers the interface
+for stubs whose wrapper argument remains unavailable.
 A proxy and a stub whose names pair are bridged only when their interfaces
 can be one. Each side's interfaces are the arguments of its `IRemoteProxy<I>`
 or `IProxyBroker<I>` proxy bases or `IRemoteStub<I>` stub bases, written on

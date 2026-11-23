@@ -1,5 +1,5 @@
 {
-  "note": "Pinned corpora in canonical system-header mode with the embedded models. Recaptured after rebasing onto local master bb64b1e on Windows 11 x64 with MSYS2 MinGW GCC 15.2.0. Header-dependent totals use that toolchain as the reference. Counts include the 2026-11-20 vector specialization audit. The 2026-11-20 binder Host/interface-overload change recaptured the canonical IPC centers: Camera 808 -> 702 and ability_runtime 1762 -> 1641; ability_runtime edges_total 418036 -> 417915 and diagnostics 11944 -> 11945; HDF and HiView IPC counts are unchanged. The 2026-11-23 AAFwk TaskHandlerWrap::SubmitTask/SubmitTaskJust invoke models recaptured ability_runtime edges_total 417915 -> 418405, edges_indirect 2043 -> 2533 and public_edges_total 409148 -> 410574, with the same run reporting diagnostics 11944; the new probe pins AmsMgrScheduler::StartSpecifiedAbility reaching AppMgrServiceInner::StartSpecifiedAbility through its submitted lambda. See docs/EVAL_REPORT.md.",
+  "note": "Pinned corpora in canonical system-header mode with the embedded models. Recaptured after rebasing onto local master bb64b1e on Windows 11 x64 with MSYS2 MinGW GCC 15.2.0. Header-dependent totals use that toolchain as the reference. Counts include the 2026-11-20 vector specialization audit. The 2026-11-20 binder Host/interface-overload change recaptured the canonical IPC centers: Camera 808 -> 702 and ability_runtime 1762 -> 1641; ability_runtime edges_total 418036 -> 417915 and diagnostics 11944 -> 11945; HDF and HiView IPC counts are unchanged. The 2026-11-23 AAFwk TaskHandlerWrap::SubmitTask/SubmitTaskJust invoke models recaptured ability_runtime edges_total 417915 -> 418405, edges_indirect 2043 -> 2533 and public_edges_total 409148 -> 410574, with the same run reporting diagnostics 11944; the new probe pins AmsMgrScheduler::StartSpecifiedAbility reaching AppMgrServiceInner::StartSpecifiedAbility through its submitted lambda. The 2026-11-23 binder-wrapper member-resolution change recaptured ability_runtime functions_total 89063 -> 88690, functions_external 20414 -> 20041, edges_total 418405 -> 420602, edges_direct 255993 -> 257078, edges_external 158238 -> 159350, arg_flow_edges 455892 -> 457968, public_functions_total 85660 -> 85287 and public_edges_total 410574 -> 412771; diagnostics, IPC and indirect centers are unchanged. See docs/EVAL_REPORT.md.",
   "analyze_args": [
     "--canonical-system-headers",
     "--compiler",
@@ -115,19 +115,19 @@
       ],
       "globals": {
         "files": {"cmp": "exact", "value": 6679},
-        "functions_total": {"cmp": "exact", "value": 89063},
+        "functions_total": {"cmp": "exact", "value": 88690},
         "functions_defined": {"cmp": "exact", "value": 68649},
-        "functions_external": {"cmp": "exact", "value": 20414},
-        "edges_total": {"cmp": "exact", "value": 418405},
-        "edges_direct": {"cmp": "exact", "value": 255993},
+        "functions_external": {"cmp": "exact", "value": 20041},
+        "edges_total": {"cmp": "exact", "value": 420602},
+        "edges_direct": {"cmp": "exact", "value": 257078},
         "edges_indirect": {"cmp": "exact", "value": 2533},
-        "edges_external": {"cmp": "exact", "value": 158238},
+        "edges_external": {"cmp": "exact", "value": 159350},
         "edges_ipc": {"cmp": "exact", "value": 1641},
-        "arg_flow_edges": {"cmp": "exact", "value": 455892},
+        "arg_flow_edges": {"cmp": "exact", "value": 457968},
         "diagnostics": {"cmp": "exact", "value": 11944},
         "dlsym_edges": {"cmp": "exact", "value": 107},
-        "public_functions_total": {"cmp": "band", "value": 85660, "tol": 400},
-        "public_edges_total": {"cmp": "band", "value": 410574, "tol": 1300}
+        "public_functions_total": {"cmp": "band", "value": 85287, "tol": 400},
+        "public_edges_total": {"cmp": "band", "value": 412771, "tol": 1300}
       },
       "probes": [
         {"name": "the solver converges within the check's budget (a partial fixpoint silently drops indirect edges, as 800000 pops did for #271)", "sql": "SELECT COUNT(*) FROM diagnostics WHERE stage='analyze' AND message LIKE 'solver stopped early%'", "cmp": "exact", "value": 0},

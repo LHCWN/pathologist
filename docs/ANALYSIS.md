@@ -943,8 +943,13 @@ covers the DataShare framework route. For partial checkouts, choose among
   possible implicit receiver; the combined hierarchy can recover an inherited
   member that was unavailable during lowering. Interface lookup through an
   unavailable `IRemoteStub<I>` definition shares the IPC detector's template
-  argument recovery. Overload, nonvirtual and final rules apply without
-  propagating values across repositories. Provider source views retain class
+  argument recovery. Calls inside a recognized binder wrapper
+  (`IRemoteStub<I>`, `IRemoteProxy<I>`, `IProxyBroker<I>`) are already resolved
+  during analysis: lowering adds the wrapper's first template argument as a
+  base ([Template-parameter bases](CXX.md#template-parameter-bases)), so their
+  dispatch and value flow precede the merge. The other implicit-member
+  recoveries below still run only at merge. Overload, nonvirtual and final
+  rules apply without propagating values across repositories. Provider source views retain class
   and method finality separately. Virtual dispatch uses each provider image's
   visible bodies and final boundaries before unioning its targets; a final
   member or class in another image cannot cut off this view's descendants.
@@ -973,7 +978,10 @@ covers the DataShare framework route. For partial checkouts, choose among
   spellings with a known receiver are normalized in new linking facts; readers
   also recover the method from legacy spellings such as `p->Run`.
   Implicit-member recovery also runs when merging a **single input**: the merged
-  graph can therefore contain inherited-member edges that the source analysis did not produce.
+  graph can therefore contain inherited-member edges that the source analysis did
+  not produce. A recognized binder wrapper's interface-member calls are not among
+  them on current analysis output: lowering resolves those first, and the merge
+  normally finds the edges already present.
   First-time analysis origins are qualified by the input's database content
   identity, rather than using its root path alone. Different snapshots indexed
   at the same path (for example `/workspace/repo` in independent CI jobs) remain
