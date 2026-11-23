@@ -127,4 +127,61 @@ void UsePlugin(Plugin &plugin, Mailbox &mailbox)
     mailbox.AddTask(NotMail);
 }
 } // namespace HiviewDFX
+
+// AAFwk's task handler wraps an ffrt queue. Its `SubmitTask` overloads
+// forward to each other, so the model must reach the callback from the
+// submission site and not rebroadcast its own parameter through the
+// forwarding calls.
+namespace AAFwk {
+void HandlerTask() {}
+void ForwardedTask() {}
+
+struct TaskAttribute {
+    const char *name;
+    int qos;
+};
+
+class TaskHandlerWrap : public std::enable_shared_from_this<TaskHandlerWrap> {
+public:
+    void SubmitTask(const std::function<void()> &task)
+    {
+        SubmitTask(task, TaskAttribute{});
+    }
+    void SubmitTask(const std::function<void()> &task, const TaskAttribute &attr)
+    {
+        (void)attr;
+        pending_ = task;
+    }
+    void SubmitTaskJust(const std::function<void()> &task, const char *name, long delayMillis)
+    {
+        (void)name;
+        (void)delayMillis;
+        SubmitTask(task, TaskAttribute{});
+    }
+
+private:
+    std::function<void()> pending_;
+};
+} // namespace AAFwk
+
+namespace CameraStandard {
+void AafwkSubmit()
+{
+    std::shared_ptr<AAFwk::TaskHandlerWrap> handler;
+    auto task = []() { AAFwk::HandlerTask(); };
+    handler->SubmitTask(task, AAFwk::TaskAttribute{});
+}
+void AafwkSubmitOneArg()
+{
+    std::shared_ptr<AAFwk::TaskHandlerWrap> handler;
+    auto task = []() { AAFwk::HandlerTask(); };
+    handler->SubmitTask(task);
+}
+void AafwkSubmitJust()
+{
+    std::shared_ptr<AAFwk::TaskHandlerWrap> handler;
+    auto task = []() { AAFwk::ForwardedTask(); };
+    handler->SubmitTaskJust(task, "just", 10);
+}
+} // namespace CameraStandard
 } // namespace OHOS

@@ -1,5 +1,59 @@
 # Evaluation Report
 
+## AAFwk task handler callback edges - 2026-11-23
+
+`AmsMgrScheduler::StartSpecifiedAbility` hands a lambda to
+`TaskHandlerWrap::SubmitTask` (`services/appmgr/src/ams_mgr_scheduler.cpp`).
+The lambda body calls `AppMgrServiceInner::StartSpecifiedAbility`, but the
+exported graph only reached it through `SubmitTask` ->
+`SubmitTaskInner` -> the task-wrapper lambda, not from the submitting
+function: `TaskHandlerWrap` had no `invoke` model, so the submitter's async
+call was effectively hidden behind the handler's implementation. The
+`OHOS::AAFwk::TaskHandlerWrap::SubmitTask` and `SubmitTaskJust` built-in
+models now state `invoke param=0 context=none`, giving every submission site
+the same sort of callback edge the `PostTask` family already has
+([Built-in models](MODELS.md#built-in-models)). The handler's own
+`SubmitTaskInner` already submits the task to an ffrt queue whose model
+(`ffrt::submit_h` or `ffrt::queue::submit_h`) states the execution context,
+so the wrapper adds the submitter's edge without a second, possibly
+conflicting context.
+
+Unlike those undeclared APIs, `TaskHandlerWrap` is defined in the tree and
+its overloads forward to each other (`SubmitTask(task, name)` calls
+`SubmitTask(task, attr)`, `SubmitTaskJust` calls `SubmitTask`). Applying the
+model at those inner calls would rebroadcast the parameter's whole points-to
+set — every task submitted anywhere — as edges from the handler body. The
+solver now skips a modelled invocation when the caller hands its own
+invoke-modelled parameter to another modelled API: the outer submission
+site already resolves the concrete callback
+([Forwarded by the API itself](MODELS.md#callback-invocation-invoke)). In the
+pinned `ability_ability_runtime` checkout (`6c18fdc9bdef`, release binary,
+`--jobs 8 --ignore-logging`), this keeps the internal fan-out out:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| `indirect` call edges | 2,043 | 2,533 |
+| `public_edges_total` (lambda-free) | 376,130 | 377,471 |
+| `AmsMgrScheduler::StartSpecifiedAbility` -> `AppMgrServiceInner::StartSpecifiedAbility` | 0 | 1 |
+
+The added 490 indirect edges are the submission sites of the handler's
+callers; the model's own forwarding bodies contribute none. Because the
+wrapper states no context, `execution_contexts` keeps only the ffrt-model
+start sites (`ffrt::submit` / `submit_h` as `pool_task`, `ffrt::queue::submit`
+/ `submit_h` as `serial_task`). A new `ability_runtime` probe pins the
+reported edge, and `edges_indirect` and `public_edges_total` are recaptured
+for the pinned revision. `task_primitives` gains a declared
+`TaskHandlerWrap` plus a test that the submit site reaches the callback and
+that neither `SubmitTask` nor `SubmitTaskJust` rebroadcasts its forwarded
+parameter.
+
+Canonical system-header mode (`--canonical-system-headers --compiler g++`
+with the same MinGW GCC 15.2.0) recaptures the same corpus:
+`edges_total` 417,915 -> 418,405, `edges_indirect` 2,043 -> 2,533,
+`public_edges_total` 409,148 -> 410,574, and the run reports 11,944
+diagnostics. `scripts/eval_expected_canonical.json` is updated with those
+centers and the same edge probe (19/19 checks pass).
+
 ## Binder `*Host` stubs and overloaded interface fallbacks - 2026-11-20
 
 OpenHarmony spells some binder remote halves `*Host` rather than `*Stub`.

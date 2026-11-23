@@ -224,6 +224,19 @@ image as an indirect call's targets are.
   seen are wired in `FnId` order.
 - **Arg-flow rows.** Each forwarded argument is an arg-flow row at the
   starting call site: its position there, and the callback's formal.
+- **Forwarded by the API itself.** A modelled API whose body hands one of
+  its own callback parameters to another modelled API — `TaskHandlerWrap::SubmitTask`
+  overloads calling each other, `SubmitTaskJust` forwarding to `SubmitTask`
+  — adds no edge at the inner call. The outer submission site resolves the
+  concrete callback; the inner one would only rebroadcast the parameter's
+  points-to set (every callback handed to the API anywhere) from the API
+  body. The two APIs may put the callback at different positions. A user
+  wrapper that is itself an `invoke` model and forwards its own parameter is
+  treated the same way, but only when its model is unconditional: a model
+  with `if_arg` / `unless_arg` may not add the outer edge at every call, so
+  its forwarded parameter always keeps the inner one. Only a context-less
+  inner effect is skipped; one that states a context keeps its edge and
+  context, so no execution context is dropped.
 - **Context.** `context` names the [kind](#execution-contexts) of execution
   context the callback runs in (`unknown` when omitted). `context` on an
   effect kind other than `invoke` and `entry` is rejected when the file is
@@ -420,6 +433,7 @@ entries:
 | `ffrt_submit_base`, `ffrt_submit_h_base` | `invoke param=0 context=pool_task` (the function header) |
 | `ffrt_queue_submit`, `ffrt_queue_submit_h` | `invoke param=1 context=serial_task` (the function header, after the queue) |
 | `OHOS::AppExecFwk::EventHandler::PostTask`, `PostImmediateTask`, `PostHighPriorityTask`, `PostIdleTask`, `PostSyncTask`, `PostTimingTask`, `PostTaskAtFront` | `invoke param=0 context=serial_task` (the callback; name, delay, priority after it) |
+| `OHOS::AAFwk::TaskHandlerWrap::SubmitTask`, `OHOS::AAFwk::TaskHandlerWrap::SubmitTaskJust` | `invoke param=0 context=none` (the callback; name, delay, QoS or attribute after it; the handler's in-tree `SubmitTaskInner` submits it to an ffrt queue whose model states the context — [Callable wrappers](#callable-wrappers)) |
 | `OHOS::ThreadPool::AddTask` | `invoke param=0 context=pool_task` |
 | `OHOS::Utils::Timer::Register` | `invoke param=0 context=serial_task` (the callback; interval and once-flag after it) |
 | `HdfWorkInit`, `HdfDelayedWorkInit` | `invoke param=1 args=[2] context=serial_task` (work function and its argument) |
