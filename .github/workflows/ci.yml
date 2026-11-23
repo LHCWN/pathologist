@@ -20,7 +20,9 @@ jobs:
 
       - name: Validate release tag
         if: github.ref_type == 'tag'
-        run: sh scripts/check_release_tag.sh "${{ github.ref_name }}"
+        env:
+          TAG: ${{ github.ref_name }}
+        run: sh scripts/check_release_tag.sh "$TAG"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -224,8 +226,10 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
 
-  release:
-    if: github.event_name == 'push'
+  # Tag releases are published separately by release.yml, which waits for this
+  # workflow's tag run to succeed and reuses its archives.
+  latest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -243,24 +247,14 @@ jobs:
           merge-multiple: true
 
       - name: Delete existing master-latest release
-        if: github.ref == 'refs/heads/master'
         continue-on-error: true
         run: gh release delete master-latest --yes --cleanup-tag
 
       - name: Create master-latest release
-        if: github.ref == 'refs/heads/master'
         run: |
           gh release create master-latest \
             --target "${{ github.sha }}" \
             --title "master-latest" \
             --notes "Latest build from master" \
             --prerelease \
-            artifacts/*
-
-      - name: Create tagged release
-        if: github.ref_type == 'tag'
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
             artifacts/*

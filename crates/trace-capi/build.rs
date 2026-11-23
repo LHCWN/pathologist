@@ -1,5 +1,5 @@
 // Reuse trace-cli's build-identity logic so databases produced through
-// `trace_index` carry the same provenance the CLI stamps (`0.1.0 (sha date)`):
+// `trace_index` carry the same provenance the CLI stamps (`0.2.0 (sha date)`):
 // see crates/trace-cli/build.rs.
 #[path = "../trace-cli/build_support.rs"]
 mod build_support;
