@@ -792,3 +792,86 @@ fn std_async_after_a_policy_starts_its_second_argument() {
         assert!(contexts_of(p, a, hit).is_empty(), "{hit}");
     }
 }
+
+#[test]
+fn a_task_handler_reaches_its_callback_from_the_submission_site() {
+    let (p, a) = task_primitives();
+    for (submit, task) in [
+        ("AafwkSubmit", "OHOS::AAFwk::HandlerTask"),
+        ("AafwkSubmitOneArg", "OHOS::AAFwk::HandlerTask"),
+        ("AafwkSubmitJust", "OHOS::AAFwk::ForwardedTask"),
+    ] {
+        let submitter = cam(submit);
+        let lambda = lambda_in(p, &submitter);
+        assert!(has_edge(
+            p,
+            a,
+            &submitter,
+            &lambda.name,
+            ResolutionKind::Indirect
+        ));
+        assert!(has_edge(p, a, &lambda.name, task, ResolutionKind::Direct));
+        // The handler only wraps the callback; its in-tree `SubmitTaskInner`
+        // (not in this fixture) submits to the ffrt queue that starts it.
+        assert!(
+            contexts_of(p, a, &lambda.name).is_empty(),
+            "{submit}: the wrapper starts no context"
+        );
+    }
+}
+
+#[test]
+fn a_context_stating_inner_model_keeps_its_context_when_forwarded() {
+    // A wrapper whose own model states no context but which forwards its
+    // callback to a context-stating model must not lose that inner context:
+    // skipping the inner effect would leave the callback with none.
+    let (p, _) = analyze_source(&[(
+        "main.cpp",
+        "void Worker() {}\n\
+         void Wrapper(std::function<void()> task) { ffrt::submit(task); }\n\
+         void Caller() { Wrapper(Worker); }\n",
+    )]);
+    let a = analyze_with_models(
+        &p,
+        "[[model]]\nname = \"Wrapper\"\n\
+         effects = [{ kind = \"invoke\", param = 0, context = \"none\" }]\n",
+    );
+    let ctx = context(&p, &a, "Worker");
+    assert_eq!(ctx.kind, ContextKind::PoolTask);
+    assert_eq!(submitted(&p, ctx).1, "ffrt::submit");
+    assert!(has_edge(
+        &p,
+        &a,
+        "Wrapper",
+        "Worker",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn a_task_handler_does_not_rebroadcast_its_own_forwarded_parameter() {
+    // `SubmitTask`'s 1-arg overload calls the 2-arg one and `SubmitTaskJust`
+    // forwards to `SubmitTask`. Those inner calls hand over the parameter
+    // union of every task in the program; without the guard the handler body
+    // would reach each submitted lambda. The outer submission sites already
+    // carry the concrete callback (checked above).
+    let (p, a) = task_primitives();
+    for (api, submit) in [
+        ("SubmitTask", "AafwkSubmitOneArg"),
+        ("SubmitTaskJust", "AafwkSubmitJust"),
+    ] {
+        let api = format!("OHOS::AAFwk::TaskHandlerWrap::{api}");
+        let lambda = lambda_in(p, &cam(submit));
+        assert!(
+            must_not_have_edge(p, a, &api, &lambda.name),
+            "{api} -> {submit}'s lambda"
+        );
+        // The handler body has no indirect callee at all: every rebroadcast
+        // would be one.
+        let indirect: Vec<_> = callees_of(p, a, &api)
+            .into_iter()
+            .filter(|(_, kind)| *kind == ResolutionKind::Indirect)
+            .collect();
+        assert!(indirect.is_empty(), "{api} -> {indirect:?}");
+    }
+}

@@ -2973,6 +2973,34 @@ fn held_functions<'a>(
         .filter_map(|loc| fn_for_loc(pag, *loc))
 }
 
+/// Whether this call site hands one of the caller's own modelled callback
+/// parameters on to another modelled API. `index` is the recorded argument
+/// position of the callee's callback; the variable there must be one the
+/// caller itself states as an unconditional `invoke` parameter, so the outer
+/// submission site already resolves the concrete callback
+/// (`callback_edges`). The caller's callback may sit at a different explicit
+/// position than the callee's.
+fn forwards_own_callback(
+    program: &Program,
+    cs: &trace_ir::CallSite,
+    index: u32,
+    all_invocations: &FxHashMap<FnId, Invocations<'_>>,
+) -> bool {
+    let Some(caller_models) = all_invocations.get(&cs.caller) else {
+        return false;
+    };
+    let caller = program.symbols.function(cs.caller);
+    let this = usize::from(program.symbols.has_this_param(cs.caller));
+    args_at(&cs.var_args, index).any(|var| {
+        caller_models.iter().any(|model| {
+            // A conditional caller model may not produce the outer edge at
+            // every call, so its forwarded parameter must not suppress the
+            // inner one.
+            model.when.is_none() && caller.params.get(this + model.param as usize) == Some(&var)
+        })
+    })
+}
+
 /// The receivers a callback may skip ahead of forwarded arguments: none or
 /// one ([`invoke_alignments`]).
 const RECEIVER_SKIPS: usize = 2;
@@ -3245,8 +3273,8 @@ fn callback_edges<'m>(
         let Some(cs) = program.symbols.call_site_by_id(edge.call_site) else {
             continue;
         };
-        for invoked in params {
-            if !invocation_applies(program, cs, invoked) {
+        for effect in params {
+            if !invocation_applies(program, cs, effect) {
                 continue;
             }
             let Invoked {
@@ -3254,10 +3282,23 @@ fn callback_edges<'m>(
                 context,
                 model,
                 ..
-            } = *invoked;
+            } = *effect;
             let Some(index) = invoke_site_index(cs, param) else {
                 continue;
             };
+            // A modelled API forwarding its own callback parameter to
+            // another modelled API (`SubmitTask(task, name)` calling
+            // `SubmitTask(task, attr)`) would rebroadcast the parameter's
+            // whole points-to set — every callback handed to the API
+            // anywhere — as an edge from the API body. The outer submission
+            // site already resolves the concrete callback; skipping the
+            // forward keeps the graph from carrying that union once per
+            // forwarding overload. Only a context-less inner effect is
+            // skipped: one that starts a context keeps its edge and context,
+            // so no execution context is lost.
+            if context.is_none() && forwards_own_callback(program, cs, index, invoked) {
+                continue;
+            }
             let start = ContextStart {
                 call_site: cs.id,
                 api: edge.callee,
@@ -3267,7 +3308,7 @@ fn callback_edges<'m>(
             let named = args_at(cs.fn_args(), index);
             let pointed = args_at(&cs.var_args, index).flat_map(|var| held_functions(pag, st, var));
             for callee in named.chain(pointed) {
-                for (target, _) in invoke_targets(program, cs, callee, invoked) {
+                for (target, _) in invoke_targets(program, cs, callee, effect) {
                     if let Some(context) = context {
                         invocations.push((start, target, context, model));
                     }

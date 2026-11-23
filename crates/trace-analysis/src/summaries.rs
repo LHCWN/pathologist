@@ -352,6 +352,19 @@ impl FnModelSet {
                 starts(0, InvokeArgs::Listed(Vec::new()), SerialTask),
             );
         }
+        // AAFwk's task handler: every `SubmitTask`/`SubmitTaskJust` overload
+        // takes the callback first, then a name, delay, QoS or attribute. The
+        // handler forwards the task to its ffrt queue (`SubmitTaskInner` calls
+        // `ffrt::submit_h` or `ffrt::queue::submit_h`, whose models state the
+        // context), so this wrapper only keeps the callback reachable from the
+        // submission site as the `PostTask` family does, without adding a
+        // second context beside the queue's own.
+        for method in ["SubmitTask", "SubmitTaskJust"] {
+            reg(
+                &format!("OHOS::AAFwk::TaskHandlerWrap::{method}"),
+                wraps(0, InvokeArgs::Listed(Vec::new())),
+            );
+        }
         // The callable first, or after a launch policy.
         reg(
             "std::async",
