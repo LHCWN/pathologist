@@ -355,6 +355,7 @@ move constructor and delete its implicit copy constructor. The viability
 check reuses the result for layouts reached through multiple subobjects.
 A const class subobject requires a viable copy. A reference field can make
 that copy unavailable when the field is an rvalue reference.
+A class subobject declared `volatile` also prevents proving a viable move.
 The call graph records selected user-provided constructors. Reference
 declarations bind directly to the initializer, and same-type prvalues
 construct the destination directly under C++17 copy elision. Same-class assignments record

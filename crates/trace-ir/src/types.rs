@@ -678,6 +678,8 @@ pub struct CvQualification {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FieldQualification {
     pub cv: CvQualification,
+    /// A `volatile` qualifier written on the field declaration's base type.
+    pub is_volatile: bool,
     pub is_mutable: bool,
     pub is_reference: bool,
 }

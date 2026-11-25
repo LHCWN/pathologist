@@ -6198,11 +6198,16 @@ fn lower_struct_specifier(
                                             .split_whitespace()
                                             .any(|w| w == "mutable")
                                 });
+                                let is_volatile = child.children(&mut child.walk()).any(|c| {
+                                    c.cached_kind() == "type_qualifier"
+                                        && node_text(source, &c) == "volatile"
+                                });
                                 program.types.note_field_qualification(
                                     &reg_name,
                                     &fname,
                                     trace_ir::FieldQualification {
                                         cv,
+                                        is_volatile,
                                         is_mutable,
                                         is_reference: is_ref,
                                     },
@@ -15437,11 +15442,14 @@ fn subobjects_have_simple_construction(
             }
             match peel_arrays(program.types.get(field.type_id).desc.as_ref()).0 {
                 TypeDesc::Struct { name, .. } => {
-                    let is_const = program
+                    let qualification = program
                         .types
                         .field_qualification(class, &field.name)
-                        .is_some_and(|qual| qual.cv.object_const);
-                    simple_class(name, copy || is_const)
+                        .unwrap_or_default();
+                    // An implicit copy or move cannot bind a volatile class
+                    // subobject. A user-provided constructor may accept it.
+                    !qualification.is_volatile
+                        && simple_class(name, copy || qualification.cv.object_const)
                 }
                 TypeDesc::Union { .. } | TypeDesc::Unknown => false,
                 _ => true,

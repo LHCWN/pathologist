@@ -1113,3 +1113,49 @@ void run() { void* p = malloc(8UL); }
     let loc = &pag.locations[pointees.iter().next().unwrap().0 as usize];
     assert_eq!(loc.kind, trace_analysis::LocKind::Heap);
 }
+
+#[test]
+fn namespaced_adl_allocator_overload_controls_return_flow() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+extern "C" void* malloc(unsigned long);
+namespace app {
+struct Tag {};
+Tag* malloc(Tag*) { return nullptr; }
+}
+void adl(app::Tag* tag) { void* p = malloc(tag); }
+void* forward(app::Tag* tag) { return malloc(tag); }
+void forwarded(app::Tag* tag) { void* p = forward(tag); }
+void libc() { void* p = malloc(8UL); }
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for caller in ["adl", "forward"] {
+        let targets: Vec<_> = result
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(&program, edge.caller) == caller)
+            .map(|edge| fn_name(&program, edge.callee))
+            .collect();
+        assert_eq!(targets, ["app::malloc"], "{caller}");
+    }
+    for (caller, allocates) in [("adl", false), ("forwarded", false), ("libc", true)] {
+        let dst = local_variable(&program, caller, "p");
+        let has_heap = result
+            .points_to
+            .get(&pag.var_node[&dst])
+            .is_some_and(|pts| {
+                pts.iter()
+                    .any(|loc| pag.locations[loc.0 as usize].kind == trace_analysis::LocKind::Heap)
+            });
+        assert_eq!(has_heap, allocates, "{caller}");
+    }
+}

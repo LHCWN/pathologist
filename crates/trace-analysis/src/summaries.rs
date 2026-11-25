@@ -697,8 +697,7 @@ impl<'m> ModelLookup<'m> {
     ) -> Cow<'_, [FnId]> {
         // Canonical lowering can attach an ordinary lookup namespace to an
         // unqualified call that actually selected a global overload by ADL.
-        let bare = name.rsplit("::").next().unwrap_or(name);
-        let name = if self.is_builtin_allocator(bare) {
+        let name = if self.has_allocator_leaf(name) {
             if let Some(selected) = caller.and_then(|caller| {
                 self.allocation_targets
                     .get_or_init(|| self.collect_allocation_targets())
@@ -746,6 +745,10 @@ impl<'m> ModelLookup<'m> {
             })
     }
 
+    fn has_allocator_leaf(&self, name: &str) -> bool {
+        self.is_builtin_allocator(name.rsplit("::").next().unwrap_or(name))
+    }
+
     fn collect_allocation_targets(&self) -> AllocationTargets {
         let mut targets = AllocationTargets::default();
         for site in &self.program.symbols.call_sites {
@@ -762,7 +765,9 @@ impl<'m> ModelLookup<'m> {
                 .rsplit_once("::")
                 .filter(|(_, suffix)| suffix.parse::<u32>().is_ok())
                 .map_or(spelling, |(name, _)| name);
-            if !self.is_builtin_allocator(name) {
+            // ADL can select a namespace's own overload even when the
+            // return fact names the global allocator from ordinary lookup.
+            if !self.has_allocator_leaf(name) {
                 continue;
             }
             let occurrence = (self.program.symbols.variable(dst).temp
