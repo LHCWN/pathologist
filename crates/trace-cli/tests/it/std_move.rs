@@ -1676,3 +1676,34 @@ void move(Movable& owner) { Movable dst = std::move(owner); }
     assert_reference_target(&p, &a, "copy_array", "ArrayOwner::ArrayOwner", false);
     assert!(!has_any_edge(&p, &a, "move", "Movable::Movable"));
 }
+
+#[test]
+fn copy_assignment_can_suppress_a_subobject_move() {
+    let (p, a) = analyze(
+        r#"
+int value;
+struct Member {
+    int&& ref;
+    Member& operator=(const Member&) = delete;
+};
+struct Owner {
+    Member member;
+    Owner(const Owner&) : member{static_cast<int&&>(value)} {}
+    Owner(Owner&&) = default;
+};
+struct Copyable {
+    int n;
+    Copyable& operator=(const Copyable&) = delete;
+};
+struct Movable {
+    Copyable member;
+    Movable(const Movable&) : member{} {}
+    Movable(Movable&&) = default;
+};
+void copy(Owner& owner) { Owner dst = std::move(owner); }
+void move(Movable& owner) { Movable dst = std::move(owner); }
+"#,
+    );
+    assert_reference_target(&p, &a, "copy", "Owner::Owner", false);
+    assert!(!has_any_edge(&p, &a, "move", "Movable::Movable"));
+}

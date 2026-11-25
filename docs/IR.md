@@ -125,7 +125,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `Store { dst, src }` | store through pointer | `*p = y`, `field = val` |
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
 | `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
-| `CallReturn { dst, callee_name, caller, occurrence }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer). Allocation calls in a body record the source occurrence for binding to the selected call site's targets. | `p = GetOps()`; `void *g = GetOps();` |
+| `CallReturn { dst, callee_name, caller, binding }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer). Allocation calls can retain the body call's source occurrence or the file-scope initializer's selected declarations. | `p = GetOps()`; `void *g = GetOps();` |
 | `CallReturnResolved { dst, callee }` | return from an exact selected function | selected free arrow-star overload or post-merge file-scope getter return |
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
@@ -145,6 +145,12 @@ Integer zero/`NULL` spellings and omitted defaults are not materialized by this
 explicit C++ `nullptr` rule.
 
 ### Return-value flow
+
+A direct allocation return can preserve overload selection. In a function
+body the occurrence identifies the call site's selected targets. At file scope
+lowering retains the selected C++ declarations and PAG construction matches
+their signatures in the destination's file and link target. Export uses the
+same targets when attributing return flow to source occurrences.
 
 When only a callee name is available, file-scope direct reference-getter
 addresses use `CallReferenceReturn { dst, callee_name }`. PAG construction

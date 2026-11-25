@@ -838,13 +838,11 @@ fn export_flow_provenance(
                 dst,
                 callee_name,
                 caller,
-                ..
+                binding,
             } => (
                 *dst,
-                program
-                    .symbols
-                    .call_return_candidates(*caller, *dst, callee_name)
-                    .to_vec(),
+                pag.return_candidates(program, callee_name, *caller, *dst, binding.as_deref())
+                    .into_owned(),
             ),
             trace_ir::FlowConstraint::CallReferenceReturn { dst, callee_name } => (
                 *dst,
@@ -960,7 +958,15 @@ fn export_flow_provenance(
                                 returned.insert(*n);
                             }
                             pending.extend(
-                                program.symbols.return_flow_candidates(callee, callee_name),
+                                pag.return_candidates(
+                                    program,
+                                    callee_name,
+                                    Some(callee),
+                                    *result,
+                                    None,
+                                )
+                                .iter()
+                                .copied(),
                             );
                         }
                     }

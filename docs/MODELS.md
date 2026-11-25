@@ -62,10 +62,11 @@ heap), and rule 4 still applies to them.
 The built-in libc memory, string, and epoll argument effects and the
 `malloc`, `calloc`, and `realloc` return effects check language linkage for
 known C++ declarations. Allocation summaries use the selected call targets
-when a call site records them, including a C allocator found by ADL when
-ordinary lookup found a declaration in another namespace. Each call's
-own targets determine whether it has a real return flow or uses the summary,
-even when several calls assign to the same variable. Undeclared
+from the call site or from the declarations retained for a file-scope
+initializer. This includes a C allocator found by ADL when ordinary lookup
+found a declaration in another namespace. Each call's own targets determine
+whether it has a real return flow or uses the summary, even when several calls
+assign to the same variable. Undeclared
 callees and explicitly configured models can still match by name.
 
 Not matched: a member a subclass inherits from a base the unit never declares,

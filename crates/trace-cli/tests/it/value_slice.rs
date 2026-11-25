@@ -2029,3 +2029,36 @@ fn a_declarator_with_brackets_or_an_attribute_declares_its_identifier() {
         );
     }
 }
+
+#[test]
+fn allocator_return_origins_follow_the_selected_overload() {
+    let (_dir, _db, conn) = scratch_db(&[(
+        "alloc.cpp",
+        "extern \"C\" void* malloc(unsigned long);\n\
+         struct Tag {};\n\
+         Tag tag;\n\
+         Tag* malloc(Tag*, int) { return &tag; }\n\
+         void use() {\n\
+             void* p;\n\
+             p = malloc(8UL);\n\
+             p = malloc(&tag, 0);\n\
+         }\n",
+    )]);
+    let sites: Vec<i64> = conn
+        .prepare(
+            "SELECT o.line FROM flow_origins o \
+             JOIN flow_nodes src ON src.id = o.src_node \
+             JOIN flow_nodes dst ON dst.id = o.dst_node \
+             JOIN variables src_var ON src_var.id = src.var_id \
+             JOIN variables dst_var ON dst_var.id = dst.var_id \
+             WHERE o.kind = 'addr_of' AND o.operation = 'return value' \
+               AND src_var.name = 'tag' AND dst_var.name = 'p' \
+             ORDER BY o.line",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(sites, [8]);
+}

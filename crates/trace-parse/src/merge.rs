@@ -1691,18 +1691,28 @@ fn merges_body(program: &Program, mode: MergeMode, function: &Function) -> bool 
             || (function.linkage == trace_ir::Linkage::Internal && function.is_cpp))
 }
 
-fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
-    match flow {
+fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> + '_ {
+    use trace_ir::CallReturnBinding;
+    let (one, declarations) = match flow {
         FlowConstraint::AddrOfFn { callee, .. }
         | FlowConstraint::ArrayFnMember { callee, .. }
         | FlowConstraint::CallReturnResolved { callee, .. }
-        | FlowConstraint::CallReferenceReturnDeclared { callee, .. } => Some(*callee),
-        // A call follows the function it is written in: dropped with it in
-        // `valid_flow`, replayed with it in `MergeMode::SymbolsOnly`.
-        FlowConstraint::CallReturn { caller, .. } => *caller,
-        _ => None,
-    }
-    .into_iter()
+        | FlowConstraint::CallReferenceReturnDeclared { callee, .. } => (Some(*callee), &[][..]),
+        // A call follows the function it is written in.
+        FlowConstraint::CallReturn {
+            caller, binding, ..
+        } => (
+            *caller,
+            match binding.as_deref() {
+                Some(CallReturnBinding::InitializerDeclarations(declarations)) => {
+                    declarations.as_slice()
+                }
+                _ => &[],
+            },
+        ),
+        _ => (None, &[][..]),
+    };
+    one.into_iter().chain(declarations.iter().copied())
 }
 
 fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> {
@@ -2014,20 +2024,32 @@ fn remap_flow(
             dst,
             callee_name,
             caller,
-            occurrence,
-        } => FlowConstraint::CallReturn {
-            dst: rv(*dst),
-            callee_name: callee_name.clone(),
-            caller: caller.map(rf),
-            occurrence: occurrence.as_deref().map(|&occurrence| {
-                let mut occurrence = occurrence;
-                occurrence.span.file = map_file(occurrence.span.file);
-                if let Some(span) = &mut occurrence.expansion_span {
-                    span.file = map_file(span.file);
-                }
-                Box::new(occurrence)
-            }),
-        },
+            binding,
+        } => {
+            use trace_ir::CallReturnBinding;
+            FlowConstraint::CallReturn {
+                dst: rv(*dst),
+                callee_name: callee_name.clone(),
+                caller: caller.map(rf),
+                binding: binding.as_deref().map(|binding| {
+                    Box::new(match binding {
+                        CallReturnBinding::Occurrence(occurrence) => {
+                            let mut occurrence = *occurrence;
+                            occurrence.span.file = map_file(occurrence.span.file);
+                            if let Some(span) = &mut occurrence.expansion_span {
+                                span.file = map_file(span.file);
+                            }
+                            CallReturnBinding::Occurrence(occurrence)
+                        }
+                        CallReturnBinding::InitializerDeclarations(declarations) => {
+                            CallReturnBinding::InitializerDeclarations(
+                                declarations.iter().copied().map(rf).collect(),
+                            )
+                        }
+                    })
+                }),
+            }
+        }
         FlowConstraint::CallReturnResolved { dst, callee } => FlowConstraint::CallReturnResolved {
             dst: rv(*dst),
             callee: rf(*callee),

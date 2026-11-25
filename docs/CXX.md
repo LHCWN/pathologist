@@ -679,7 +679,9 @@ C++-aware only where it must be — everything else reuses the C machinery.
   unions imported through nested cached headers use the same construction rule.
   Volatile class members, including arrays and fields declared through type
   aliases, can delete a defaulted move constructor and leave a user-provided
-  copy constructor as the selected overload.
+  copy constructor as the selected overload. A class subobject's user-declared
+  copy assignment suppresses its implicit move constructor, so it needs a
+  viable copy constructor to be initialized by the enclosing defaulted move.
   A member that is an array of a class, nested arrays
   included, constructs its elements: an empty list (`m_arr{}`) records the
   element's default constructor, and a non-empty list initializes the

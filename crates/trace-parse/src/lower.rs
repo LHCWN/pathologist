@@ -32,9 +32,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use trace_ir::{
-    is_anonymous_tag, CallOccurrence, CallSite, CallSiteDetails, ContainerModels, Diagnostic,
-    DiagnosticSeverity, FieldId, FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow,
-    ScalarKind, Span, StorageClass, TempKind, TypeDesc, VarId, Variable,
+    is_anonymous_tag, CallOccurrence, CallReturnBinding, CallSite, CallSiteDetails,
+    ContainerModels, Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId, Function,
+    Linkage, Program, ReturnFlow, ScalarKind, Span, StorageClass, TempKind, TypeDesc, VarId,
+    Variable,
 };
 use trace_ir::{is_template_literal, split_pointer_suffix, strip_trailing_cv};
 use trace_preproc::{Language, PreprocessOptions};
@@ -15412,23 +15413,33 @@ fn subobjects_have_simple_construction(
     memo[mode].insert(class.to_owned(), false);
     let mut simple_class = |subobject: &str, copy| {
         let subobject = receiver_lookup_name(subobject);
-        !program.types.has_declared_constructor(&subobject)
-            && !program
+        if program.types.has_declared_constructor(&subobject)
+            || program
                 .symbols
                 .has_function_named(&trace_ir::MethodKind::Dtor.name_on(&subobject))
-            && !program
-                .symbols
-                .functions_named(&format!("{subobject}::operator="))
-                .iter()
-                .any(|&id| {
-                    let f = program.symbols.function(id);
-                    !f.is_member_template
-                        && f.parameter_references
-                            .first()
-                            .is_some_and(|form| form.is_some_and(|reference| reference.rvalue))
-                        && takes_own_class(program, id, &subobject)
-                })
-            && subobjects_have_simple_construction(program, &subobject, copy, memo)
+        {
+            return false;
+        }
+        let mut copy = copy;
+        for id in program
+            .symbols
+            .functions_named(&format!("{subobject}::operator="))
+        {
+            let f = program.symbols.function(id);
+            if f.is_member_template || !takes_own_class(program, id, &subobject) {
+                continue;
+            }
+            if f.parameter_references
+                .first()
+                .is_some_and(|form| form.is_some_and(|reference| reference.rvalue))
+            {
+                // Move assignment suppresses the move and deletes the copy.
+                return false;
+            }
+            // User-declared copy assignment suppresses the implicit move.
+            copy = true;
+        }
+        subobjects_have_simple_construction(program, &subobject, copy, memo)
     };
     let simple = program
         .base_names(class)
@@ -17938,15 +17949,13 @@ fn collect_call_at_node_inner(
                 false,
             )
         } else {
-            let by_arity = filter_targets_by_argc(program, candidates, argc, &arg_desc, argc == 0);
-            let by_arity =
-                narrow_reference_arguments(program, by_arity, &arg_desc, &args.argument_references);
-            narrow_overloads(
+            rank_free_call_overloads(
                 program,
-                by_arity,
+                candidates,
                 &arg_desc,
                 &null_constants,
-                OverloadChoice::Edges,
+                &args.argument_references,
+                argc,
             )
         };
         if ranked.len() > 1
@@ -19245,6 +19254,25 @@ fn narrow_reference_arguments(
             })
         })
         .collect()
+}
+
+fn rank_free_call_overloads(
+    program: &Program,
+    candidates: Vec<FnId>,
+    args: &[TypeDesc],
+    null_constants: &[bool],
+    references: &[(usize, trace_ir::ReferenceParameter)],
+    argc: usize,
+) -> Vec<FnId> {
+    let by_arity = filter_targets_by_argc(program, candidates, argc, args, argc == 0);
+    let by_reference = narrow_reference_arguments(program, by_arity, args, references);
+    narrow_overloads(
+        program,
+        by_reference,
+        args,
+        null_constants,
+        OverloadChoice::Edges,
+    )
 }
 
 fn narrow_overloads(
@@ -25835,7 +25863,9 @@ fn extract_flow_from_expr_inner(
                         resolve_call_for_return(program, ctx, source, call)
                     {
                         let ret_temp = alloc_ret_temp(program, ctx, node);
-                        lower_call_return_with_resolved(program, ctx, call, ret_temp, resolved);
+                        lower_call_return_with_resolved(
+                            program, ctx, source, call, ret_temp, resolved,
+                        );
                         let Some(dst) = ptr(program, ctx) else {
                             return;
                         };
@@ -26628,19 +26658,56 @@ fn std_move_forward<'t>(
 fn emit_call_return(
     program: &mut Program,
     ctx: &LowerContext,
+    source: &str,
     call_node: Node,
     dst: VarId,
     callee_name: String,
 ) {
-    let occurrence = (ctx.current_fn.is_some() && is_allocator_name(&callee_name))
-        .then(|| Box::new(call_occurrence(program, ctx, call_node)));
+    let binding = if is_allocator_name(&callee_name) {
+        if ctx.current_fn.is_some() {
+            Some(CallReturnBinding::Occurrence(call_occurrence(
+                program, ctx, call_node,
+            )))
+        } else if ctx.is_cpp {
+            initializer_allocation_binding(program, ctx, source, call_node)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     program.flow.push(FlowConstraint::CallReturn {
         dst,
         callee_name,
         caller: ctx.current_fn,
-        occurrence,
+        binding: binding.map(Box::new),
     });
     ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
+}
+
+fn initializer_allocation_binding(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    call: Node,
+) -> Option<CallReturnBinding> {
+    let func = call.cached_field("function")?;
+    let name = resolve_direct_call_name_from_func(source, func)?;
+    let nodes = call_arg_nodes(call);
+    let args: Vec<_> = nodes
+        .iter()
+        .map(|&arg| known_arg_type(program, ctx, source, arg))
+        .collect();
+    let candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
+    let selected = rank_free_call_overloads(
+        program,
+        candidates,
+        &args,
+        &null_constant_args(source, &nodes),
+        &move_argument_references(program, ctx, source, call),
+        nodes.len(),
+    );
+    (!selected.is_empty()).then_some(CallReturnBinding::InitializerDeclarations(selected))
 }
 
 fn is_allocator_name(name: &str) -> bool {
@@ -26885,7 +26952,14 @@ fn emit_store_to_location(
         } else if peeled_value.cached_kind() == "call_expression" {
             if let Some(resolved) = resolve_call_for_return(program, ctx, source, peeled_value) {
                 let ret_temp = alloc_ret_temp(program, ctx, span_node);
-                lower_call_return_with_resolved(program, ctx, peeled_value, ret_temp, resolved);
+                lower_call_return_with_resolved(
+                    program,
+                    ctx,
+                    source,
+                    peeled_value,
+                    ret_temp,
+                    resolved,
+                );
                 program
                     .flow
                     .push(FlowConstraint::Store { dst, src: ret_temp });
@@ -27304,7 +27378,7 @@ impl FieldPath<'_> {
             PathRoot::Call(call, root) => {
                 let result = alloc_ret_temp(program, ctx, call);
                 program.symbols.variable_mut(result).type_id = root.wrapper;
-                emit_call_return(program, ctx, call, result, root.callee);
+                emit_call_return(program, ctx, source, call, result, root.callee);
                 result
             }
             PathRoot::Value(value) => value.publish(program, ctx, source)?,
@@ -29575,7 +29649,7 @@ fn return_flow_from_expr(
                     let type_id = program.types.intern(result.clone());
                     let span = node_span(program, ctx, node);
                     let temp = add_temp(program, ctx.current_fn, TempKind::Unwrap, type_id, span);
-                    lower_call_return_with_resolved(program, ctx, node, temp, resolved);
+                    lower_call_return_with_resolved(program, ctx, source, node, temp, resolved);
                     Some(ReturnFlow::Copy { src: temp })
                 }
                 ResolvedCallReturn::PromotedReceiver(src) => Some(ReturnFlow::Copy { src }),
@@ -29603,7 +29677,7 @@ fn return_flow_from_expr(
                     } else if is_symbol_lookup_callee(&callee_name) {
                         // dlsym needs its inner call site's value destination.
                         let temp = alloc_ret_temp(program, ctx, node);
-                        emit_call_return(program, ctx, node, temp, callee_name);
+                        emit_call_return(program, ctx, source, node, temp, callee_name);
                         Some(ReturnFlow::Copy { src: temp })
                     } else {
                         let span = node_span(program, ctx, node);
@@ -29800,6 +29874,7 @@ fn resolve_call_for_return(
 fn lower_call_return_with_resolved(
     program: &mut Program,
     ctx: &mut LowerContext,
+    source: &str,
     call_node: Node,
     dst: VarId,
     resolved: ResolvedCallReturn,
@@ -29839,7 +29914,7 @@ fn lower_call_return_with_resolved(
             ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
         }
         ResolvedCallReturn::Direct(callee_name) => {
-            emit_call_return(program, ctx, call_node, dst, callee_name);
+            emit_call_return(program, ctx, source, call_node, dst, callee_name);
         }
         ResolvedCallReturn::Indirect(callee_var) => {
             program
@@ -29864,7 +29939,7 @@ fn lower_call_return(
 ) {
     if let Some(resolved) = resolve_call_for_return(program, ctx, source, call_node) {
         let dst = dst.var(program, ctx);
-        lower_call_return_with_resolved(program, ctx, call_node, dst, resolved);
+        lower_call_return_with_resolved(program, ctx, source, call_node, dst, resolved);
     }
 }
 
@@ -29879,7 +29954,7 @@ fn lower_nested_call_arg(
     }
     let resolved = resolve_call_for_return(program, ctx, source, call_node)?;
     let temp = alloc_ret_temp(program, ctx, call_node);
-    lower_call_return_with_resolved(program, ctx, call_node, temp, resolved);
+    lower_call_return_with_resolved(program, ctx, source, call_node, temp, resolved);
     Some(temp)
 }
 

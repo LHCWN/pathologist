@@ -11,7 +11,8 @@ use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 use trace_ir::{
-    CallOccurrence, ContainerModel, ContainerModels, FnId, Function, Program, TempKind, VarId,
+    CallOccurrence, CallReturnBinding, ContainerModel, ContainerModels, FnId, Function, Program,
+    TempKind, VarId,
 };
 
 /// One parameter relation of a function model.
@@ -647,7 +648,60 @@ impl FnModel {
     }
 }
 
-type AllocationTargets = FxHashMap<(FnId, VarId, Option<CallOccurrence>), Vec<FnId>>;
+#[derive(Debug, Default)]
+pub(crate) struct AllocationTargets {
+    sites: FxHashMap<(FnId, VarId, Option<CallOccurrence>), Vec<FnId>>,
+    model_names: FxHashSet<String>,
+}
+
+impl AllocationTargets {
+    pub(crate) fn candidates(
+        &self,
+        program: &Program,
+        name: &str,
+        caller: Option<FnId>,
+        dst: VarId,
+        binding: Option<&CallReturnBinding>,
+    ) -> Cow<'_, [FnId]> {
+        let occurrence = match binding {
+            Some(CallReturnBinding::InitializerDeclarations(declarations)) => {
+                let mut candidates = Vec::new();
+                for &declaration in declarations {
+                    for callee in program.symbols.initializer_declaration_candidates(
+                        dst,
+                        declaration,
+                        &program.types,
+                    ) {
+                        if !candidates.contains(&callee) {
+                            candidates.push(callee);
+                        }
+                    }
+                }
+                return Cow::Owned(candidates);
+            }
+            Some(CallReturnBinding::Occurrence(occurrence)) => Some(*occurrence),
+            None => None,
+        };
+        // Ordinary lookup can name a different namespace than the target
+        // selected by ADL. Its leaf identifies the allocation candidate index.
+        let name = if self.has_allocator_leaf(name) {
+            if let Some(selected) =
+                caller.and_then(|caller| self.sites.get(&(caller, dst, occurrence)))
+            {
+                return Cow::Borrowed(selected);
+            }
+            name.trim_start_matches("::")
+        } else {
+            name
+        };
+        Cow::Owned(program.symbols.call_return_candidates(caller, dst, name))
+    }
+
+    fn has_allocator_leaf(&self, name: &str) -> bool {
+        self.model_names
+            .contains(name.rsplit("::").next().unwrap_or(name))
+    }
+}
 
 /// The one matcher every model lookup of an analysis goes through
 /// (`docs/MODELS.md`, "Model matching"): the model named for the function
@@ -662,7 +716,7 @@ pub struct ModelLookup<'m> {
     /// nearest class first, then by model name.
     member_models: RefCell<FxHashMap<String, Vec<&'m FnModel>>>,
     /// Lowering's selected targets for allocations with a recorded call site.
-    allocation_targets: OnceCell<AllocationTargets>,
+    allocation_targets: OnceCell<Arc<AllocationTargets>>,
 }
 
 impl<'m> ModelLookup<'m> {
@@ -688,32 +742,9 @@ impl<'m> ModelLookup<'m> {
             .then_some(model)
     }
 
-    pub(crate) fn return_candidates(
-        &self,
-        name: &str,
-        caller: Option<FnId>,
-        dst: VarId,
-        occurrence: Option<CallOccurrence>,
-    ) -> Cow<'_, [FnId]> {
-        // Canonical lowering can attach an ordinary lookup namespace to an
-        // unqualified call that actually selected a global overload by ADL.
-        let name = if self.has_allocator_leaf(name) {
-            if let Some(selected) = caller.and_then(|caller| {
-                self.allocation_targets
-                    .get_or_init(|| self.collect_allocation_targets())
-                    .get(&(caller, dst, occurrence))
-            }) {
-                return Cow::Borrowed(selected);
-            }
-            name.trim_start_matches("::")
-        } else {
-            name
-        };
-        Cow::Owned(
-            self.program
-                .symbols
-                .call_return_candidates(caller, dst, name),
-        )
+    pub(crate) fn allocation_targets(&self) -> &Arc<AllocationTargets> {
+        self.allocation_targets
+            .get_or_init(|| Arc::new(self.collect_allocation_targets()))
     }
 
     pub(crate) fn return_model(
@@ -764,7 +795,19 @@ impl<'m> ModelLookup<'m> {
     }
 
     fn collect_allocation_targets(&self) -> AllocationTargets {
-        let mut targets = AllocationTargets::default();
+        let mut targets = AllocationTargets {
+            model_names: self
+                .models
+                .c_api_models
+                .iter()
+                .filter(|name| self.is_builtin_allocator(name))
+                .cloned()
+                .collect(),
+            ..AllocationTargets::default()
+        };
+        if targets.model_names.is_empty() {
+            return targets;
+        }
         for site in &self.program.symbols.call_sites {
             let Some(dst) = site
                 .return_dst
@@ -781,13 +824,14 @@ impl<'m> ModelLookup<'m> {
                 .map_or(spelling, |(name, _)| name);
             // ADL can select a namespace's own overload even when the
             // return fact names the global allocator from ordinary lookup.
-            if !self.has_allocator_leaf(name) {
+            if !targets.has_allocator_leaf(name) {
                 continue;
             }
             let occurrence = (self.program.symbols.variable(dst).temp
                 != Some(TempKind::ReturnedCall))
             .then(|| site.occurrence());
             targets
+                .sites
                 .entry((site.caller, dst, occurrence))
                 .or_default()
                 .extend(self.program.callees_of(site));

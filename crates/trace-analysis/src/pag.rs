@@ -1,12 +1,13 @@
 use crate::constraints::{AbstractLocation, Constraint, ConstraintKind, LocKind};
 use crate::ipc::detect_ipc_pairs_with_models;
-use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
+use crate::summaries::{AllocationTargets, Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::borrow::Cow;
+use std::sync::Arc;
 use trace_ir::{
-    CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow,
-    StorageClass, TargetId, TypeDesc, TypeId, VarId,
+    CallReturnBinding, CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId,
+    Program, ReturnFlow, StorageClass, TargetId, TypeDesc, TypeId, VarId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -128,6 +129,7 @@ pub struct Pag {
     pub indices: SolverIndices,
     /// Call results produced by `return_field`, for transitive return expansion.
     return_field_values: FxHashSet<VarId>,
+    allocation_targets: Arc<AllocationTargets>,
 }
 
 impl Pag {
@@ -146,6 +148,7 @@ impl Pag {
     ) -> Self {
         let mut pag = Self {
             ipc_enabled: enable_ipc,
+            allocation_targets: Arc::clone(models.allocation_targets()),
             ..Self::default()
         };
         pag.build_variables(program);
@@ -159,6 +162,20 @@ impl Pag {
             pag.ipc_bridges = detect_ipc_pairs_with_models(program, models);
         }
         pag
+    }
+
+    /// Resolve direct return facts using the same call selections as PAG
+    /// construction, so export can attribute the wiring to its occurrence.
+    pub fn return_candidates(
+        &self,
+        program: &Program,
+        name: &str,
+        caller: Option<FnId>,
+        dst: VarId,
+        binding: Option<&CallReturnBinding>,
+    ) -> Cow<'_, [FnId]> {
+        self.allocation_targets
+            .candidates(program, name, caller, dst, binding)
     }
 
     fn alloc_node(&mut self, kind: PagNodeKind) -> PagNodeId {
@@ -897,15 +914,20 @@ impl Pag {
                     dst,
                     callee_name,
                     caller,
-                    occurrence,
+                    binding,
                 } => {
                     let dst_n = self.var_node_id(*dst);
                     let mut visited = FxHashSet::default();
-                    let candidates = models.return_candidates(
+                    let candidates = models.allocation_targets().candidates(
+                        program,
                         callee_name,
                         *caller,
                         *dst,
-                        occurrence.as_deref().copied(),
+                        binding.as_deref(),
+                    );
+                    let declared = matches!(
+                        binding.as_deref(),
+                        Some(CallReturnBinding::InitializerDeclarations(_)),
                     );
                     let mut any_real = false;
                     for callee in candidates.iter() {
@@ -918,11 +940,11 @@ impl Pag {
                     // allocators). Synthesized externals never enter the
                     // name-resolution maps. Fall back to a return model
                     // using the selected targets and the call spelling.
-                    if !any_real {
+                    if !any_real && (!declared || !candidates.is_empty()) {
                         if let Some((model, params)) = models.return_model(
                             callee_name,
                             &candidates,
-                            matches!(candidates, Cow::Borrowed(_)),
+                            declared || matches!(candidates, Cow::Borrowed(_)),
                         ) {
                             self.apply_return_model(program, dst_n, model, params);
                             // A file-scope initializer has no call record.
@@ -1229,8 +1251,13 @@ impl Pag {
                             callee_name,
                             result,
                         } => {
-                            let inner_candidates =
-                                models.return_candidates(&callee_name, Some(callee), result, None);
+                            let inner_candidates = models.allocation_targets().candidates(
+                                program,
+                                &callee_name,
+                                Some(callee),
+                                result,
+                                None,
+                            );
                             let mut inner_applied = false;
                             for inner in inner_candidates.iter().copied() {
                                 if self.expand_returns_in_mode(

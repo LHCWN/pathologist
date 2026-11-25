@@ -1201,3 +1201,69 @@ void forwarded(Size size) { void* p = forward(size); }
         assert_eq!(loc.kind, trace_analysis::LocKind::Heap, "{caller}");
     }
 }
+
+#[test]
+fn file_scope_allocator_returns_follow_adl_selection() {
+    let dir = scratch(&[
+        (
+            "main.cpp",
+            r#"
+extern "C" void* malloc(unsigned long);
+namespace app {
+struct Tag {};
+Tag tag;
+Tag* malloc(Tag*);
+}
+namespace address {
+struct Tag {};
+Tag address_tag;
+Tag* malloc(Tag*) { return &address_tag; }
+}
+struct Size { operator unsigned long() const { return 8; } };
+void* no_allocation = malloc(&app::tag);
+void* adl_address = malloc(&address::address_tag);
+void* libc_allocation = malloc(8UL);
+namespace inner {
+void* malloc(int, int);
+Size size;
+void* adl_allocation = malloc(size);
+}
+"#,
+        ),
+        (
+            "overload.cpp",
+            "namespace app { struct Tag {}; Tag* malloc(Tag*) { return nullptr; } }",
+        ),
+    ]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let pointees = |name| {
+        let dst = only_variable(&program, name);
+        result
+            .points_to
+            .get(&pag.var_node[&dst])
+            .into_iter()
+            .flatten()
+    };
+    assert_eq!(pointees("no_allocation").count(), 0);
+    let tag = only_variable(&program, "address_tag");
+    assert_eq!(
+        pointees("adl_address").copied().collect::<Vec<_>>(),
+        [pag.var_location[&tag]],
+    );
+    for name in ["libc_allocation", "adl_allocation"] {
+        let locations: Vec<_> = pointees(name).collect();
+        assert_eq!(locations.len(), 1, "{name}");
+        assert_eq!(
+            pag.locations[locations[0].0 as usize].kind,
+            trace_analysis::LocKind::Heap,
+            "{name}",
+        );
+    }
+}

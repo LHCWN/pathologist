@@ -31,6 +31,13 @@ pub enum ContainerOwner {
     Field { class: TypeId, name: Arc<str> },
 }
 
+/// Overload selection retained for a direct allocation return.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallReturnBinding {
+    Occurrence(crate::CallOccurrence),
+    InitializerDeclarations(Vec<FnId>),
+}
+
 /// Statement-level flow facts extracted during IR lowering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FlowConstraint {
@@ -69,8 +76,7 @@ pub enum FlowConstraint {
         dst: VarId,
         callee_name: String,
         caller: Option<FnId>,
-        /// Identifies an allocator call with a recorded overload selection.
-        occurrence: Option<Box<crate::CallOccurrence>>,
+        binding: Option<Box<CallReturnBinding>>,
     },
     /// Return from an exact, already-resolved function (not name-only lookup).
     /// Used for selected free operators and after merge when a file-scope
