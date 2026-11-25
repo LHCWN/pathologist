@@ -14715,6 +14715,7 @@ fn aggregate_defaults_are_evaluated(
             desc,
             ctx.current_fn.is_some(),
             &mut Vec::new(),
+            &mut HashMap::default(),
         )
 }
 
@@ -14733,7 +14734,13 @@ fn empty_construction_runs_defaults(
         && !lifecycle_members(program, ctx, &cls, &trace_ir::MethodKind::Ctor)
             .iter()
             .any(|(owner, _)| *owner == *cls)
-        && aggregate_has_default_initializer(program, desc, true, &mut Vec::new())
+        && aggregate_has_default_initializer(
+            program,
+            desc,
+            true,
+            &mut Vec::new(),
+            &mut HashMap::default(),
+        )
 }
 
 fn class_is_indexed(program: &Program, class: &str) -> bool {
@@ -14860,6 +14867,7 @@ fn aggregate_has_default_initializer(
     desc: &TypeDesc,
     in_body: bool,
     seen: &mut Vec<String>,
+    memo: &mut HashMap<(trace_ir::TypeId, usize), bool>,
 ) -> bool {
     let desc = peel_arrays(desc).0;
     let name = match desc {
@@ -14872,6 +14880,12 @@ fn aggregate_has_default_initializer(
     let Some(tid) = program.types.class_type_id(name) else {
         return false;
     };
+    // The same layout can appear at different depths. Keep the remaining
+    // depth budget in the key while sharing work for repeated subobjects.
+    let key = (tid, seen.len());
+    if let Some(&found) = memo.get(&key) {
+        return found;
+    }
     seen.push(name.clone());
     let found = program.types.get(tid).layout.fields.values().any(|field| {
         default_needs_lowering(program, name, field, in_body)
@@ -14880,6 +14894,7 @@ fn aggregate_has_default_initializer(
                 program.types.get(field.type_id).desc.as_ref(),
                 in_body,
                 seen,
+                memo,
             )
     }) || program.bases_of(name).iter().any(|base| {
         aggregate_has_default_initializer(
@@ -14890,9 +14905,11 @@ fn aggregate_has_default_initializer(
             },
             in_body,
             seen,
+            memo,
         )
     });
     seen.pop();
+    memo.insert(key, found);
     found
 }
 
@@ -15327,7 +15344,7 @@ fn lower_copy_initialization(
     };
     let mut selected = select(targets.clone());
     if selected.iter().copied().any(defaulted_move)
-        && !subobjects_have_simple_move(program, &cls, &mut HashSet::default())
+        && !subobjects_have_simple_move(program, &cls, &mut HashMap::default())
     {
         // An implicitly deleted defaulted move is ignored by overload
         // resolution. Keep the fallback when subobject viability is uncertain.
@@ -15373,19 +15390,39 @@ fn lower_copy_initialization(
 fn subobjects_have_simple_move(
     program: &Program,
     class: &str,
-    pending: &mut HashSet<String>,
+    memo: &mut HashMap<String, bool>,
 ) -> bool {
+    if let Some(&simple) = memo.get(class) {
+        return simple;
+    }
     let Some(ty) = program.types.class_type_id(class) else {
         return false;
     };
-    if !program.types.is_struct_defined(class) || !pending.insert(class.to_owned()) {
+    if !program.types.is_struct_defined(class) {
         return false;
     }
+    // A cycle in a partial index cannot establish a viable move. Completed
+    // layouts reuse their answer even when reached through multiple fields.
+    memo.insert(class.to_owned(), false);
     let mut simple_class = |subobject: &str| {
         let subobject = receiver_lookup_name(subobject);
         !program.types.has_declared_constructor(&subobject)
-            && declared_members_upward(program, &subobject, &trace_ir::MethodKind::Dtor).is_empty()
-            && subobjects_have_simple_move(program, &subobject, pending)
+            && !program
+                .symbols
+                .has_function_named(&trace_ir::MethodKind::Dtor.name_on(&subobject))
+            && !program
+                .symbols
+                .functions_named(&format!("{subobject}::operator="))
+                .iter()
+                .any(|&id| {
+                    let f = program.symbols.function(id);
+                    !f.is_member_template
+                        && f.parameter_references
+                            .first()
+                            .is_some_and(|form| form.is_some_and(|reference| reference.rvalue))
+                        && takes_own_class(program, id, &subobject)
+                })
+            && subobjects_have_simple_move(program, &subobject, memo)
     };
     let simple = program.base_names(class).all(&mut simple_class)
         && program.types.get(ty).layout.fields.values().all(|field| {
@@ -15398,7 +15435,7 @@ fn subobjects_have_simple_move(
                 _ => true,
             }
         });
-    pending.remove(class);
+    *memo.get_mut(class).unwrap() = simple;
     simple
 }
 

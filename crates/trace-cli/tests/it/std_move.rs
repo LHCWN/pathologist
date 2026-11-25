@@ -1546,3 +1546,45 @@ void explicit_delete(Deleted& deleted) { Deleted dst = std::move(deleted); }
     assert!(!has_any_edge(&p, &a, "simple_move", "Movable::Movable"));
     assert!(!has_any_edge(&p, &a, "explicit_delete", "Deleted::Deleted"));
 }
+
+#[test]
+fn move_assignment_can_delete_a_subobjects_implicit_constructors() {
+    let (p, a) = analyze(
+        r#"
+struct Member { Member& operator=(Member&&) = default; };
+struct Owner {
+    Member member;
+    Owner(const Owner&) {}
+    Owner(Owner&&) = default;
+};
+void copy(Owner& owner) { Owner dst = std::move(owner); }
+"#,
+    );
+    assert_reference_target(&p, &a, "copy", "Owner::Owner", false);
+}
+
+#[test]
+fn defaulted_move_checks_each_shared_subobject_layout_once() {
+    let mut source = String::from("struct N0 { char data; };\n");
+    for depth in 1..=28 {
+        let child = depth - 1;
+        source.push_str(&format!("struct N{depth} {{ N{child} left, right; }};\n"));
+    }
+    source.push_str(
+        "struct Owner {
+            N28 member;
+            Owner(const Owner&) {}
+            Owner(Owner&&) = default;
+        };
+        void run(Owner& owner) { Owner dst = std::move(owner); }",
+    );
+    let started = std::time::Instant::now();
+    let (p, a) = analyze(&source);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "repeated subobject layout checks took {:?}",
+        started.elapsed()
+    );
+    assert_edge(&p, &a, "run", "std::move");
+    assert!(!has_any_edge(&p, &a, "run", "Owner::Owner"));
+}

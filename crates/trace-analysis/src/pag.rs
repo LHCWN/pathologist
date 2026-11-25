@@ -915,12 +915,10 @@ impl Pag {
                     // name-resolution maps, so the model is consulted by
                     // call name directly.
                     if !any_real {
-                        if let Some(model) = models.model(callee_name, EffectGroup::Return) {
-                            let params = candidates
-                                .iter()
-                                .find(|c| !program.symbols.function(**c).params.is_empty())
-                                .map(|c| program.symbols.function(*c).params.clone());
-                            self.apply_return_model(program, dst_n, model, params.as_deref());
+                        if let Some((model, params)) =
+                            models.return_model(callee_name, *caller, *dst, &candidates)
+                        {
+                            self.apply_return_model(program, dst_n, model, params);
                             // A file-scope initializer has no call record.
                             if caller.is_none() {
                                 self.apply_return_fields(program, *dst, model, &candidates, None);
@@ -1089,11 +1087,13 @@ impl Pag {
             }
             if !any_real {
                 for cs in sites {
-                    if let Some(model) = models.model(&cs.callee_name, EffectGroup::Return) {
-                        let params = cs
-                            .callee_fn_id
-                            .map(|fid| program.symbols.function(fid).params.clone());
-                        self.apply_return_model(program, dst_n, model, params.as_deref());
+                    if let Some((model, params)) = models.return_model(
+                        &cs.callee_name,
+                        Some(caller),
+                        dst_var,
+                        cs.callee_fn_id.as_slice(),
+                    ) {
+                        self.apply_return_model(program, dst_n, model, params);
                         break;
                     }
                 }
@@ -1240,18 +1240,14 @@ impl Pag {
                             // realloc has no tree body): fall back to the
                             // modeled return effects.
                             if !inner_applied && !address {
-                                if let Some(model) = models.model(&callee_name, EffectGroup::Return)
-                                {
-                                    let params = inner_candidates
-                                        .iter()
-                                        .find(|c| !program.symbols.function(**c).params.is_empty())
-                                        .map(|c| program.symbols.function(*c).params.clone());
-                                    inner_applied = self.apply_return_model(
-                                        program,
-                                        dst,
-                                        model,
-                                        params.as_deref(),
-                                    );
+                                if let Some((model, params)) = models.return_model(
+                                    &callee_name,
+                                    Some(callee),
+                                    result,
+                                    &inner_candidates,
+                                ) {
+                                    inner_applied =
+                                        self.apply_return_model(program, dst, model, params);
                                 }
                             }
                             if !address && self.return_field_values.contains(&result) {

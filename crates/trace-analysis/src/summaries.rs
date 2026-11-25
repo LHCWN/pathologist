@@ -7,9 +7,9 @@
 //! models") for semantics and the configuration format.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
-use trace_ir::{ContainerModel, ContainerModels, Program};
+use trace_ir::{ContainerModel, ContainerModels, FnId, Function, Program, VarId};
 
 /// One parameter relation of a function model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,20 +404,9 @@ impl FnModelSet {
         ] {
             reg(name, vec![Effect::Entry { context }]);
         }
-        for n in [
-            "malloc",
-            "calloc",
-            "zalloc",
-            "kmalloc",
-            "OsalMemAlloc",
-            "OsalMemCalloc",
-        ] {
+        for n in ["zalloc", "kmalloc", "OsalMemAlloc", "OsalMemCalloc"] {
             reg(n, vec![Effect::ReturnHeap]);
         }
-        reg(
-            "realloc",
-            vec![Effect::ReturnAlias { param: 0 }, Effect::ReturnHeap],
-        );
         for n in ["dlsym", "dlvsym", "GetProcAddress"] {
             reg(n, vec![Effect::Dlsym { name_param: 1 }]);
         }
@@ -425,6 +414,13 @@ impl FnModelSet {
             set.register(FnModel::new(name, effects));
             set.c_api_models.insert(name.to_owned());
         };
+        for name in ["malloc", "calloc"] {
+            reg(name, vec![Effect::ReturnHeap]);
+        }
+        reg(
+            "realloc",
+            vec![Effect::ReturnAlias { param: 0 }, Effect::ReturnHeap],
+        );
         for n in ["memcpy", "memmove", "strcpy", "strncpy"] {
             reg(n, vec![Effect::MemCopy { dst: 0, src: 1 }]);
         }
@@ -506,6 +502,7 @@ impl FnModelSet {
             models: self,
             program,
             member_models: RefCell::default(),
+            allocation_targets: OnceCell::new(),
         }
     }
 
@@ -659,6 +656,8 @@ pub struct ModelLookup<'m> {
     /// Function name → the member models the class rule admits for it,
     /// nearest class first, then by model name.
     member_models: RefCell<FxHashMap<String, Vec<&'m FnModel>>>,
+    /// Lowering's selected targets for allocations with a recorded call site.
+    allocation_targets: OnceCell<FxHashMap<(FnId, VarId, &'m str), Vec<FnId>>>,
 }
 
 impl<'m> ModelLookup<'m> {
@@ -678,15 +677,85 @@ impl<'m> ModelLookup<'m> {
             .map(|(model, ())| model)
     }
 
-    pub(crate) fn argument_model(&self, callee: &trace_ir::Function) -> Option<&'m FnModel> {
+    pub(crate) fn argument_model(&self, callee: &Function) -> Option<&'m FnModel> {
         let model = self.model(&callee.name, EffectGroup::Args)?;
+        (!self.models.c_api_models.contains(&model.name) || Self::can_name_c_api(callee))
+            .then_some(model)
+    }
+
+    pub(crate) fn return_model(
+        &self,
+        name: &str,
+        caller: Option<FnId>,
+        dst: VarId,
+        candidates: &[FnId],
+    ) -> Option<(&'m FnModel, Option<&'m [VarId]>)> {
+        let model = self.model(name, EffectGroup::Return)?;
+        let guarded = self.models.c_api_models.contains(&model.name);
+        let selected = guarded
+            .then(|| {
+                self.allocation_targets
+                    .get_or_init(|| self.collect_allocation_targets())
+                    .get(&(caller?, dst, model.name.as_str()))
+            })
+            .flatten();
+        let qualified_candidates;
+        let candidates = if let Some(selected) = selected {
+            selected.as_slice()
+        } else if guarded && candidates.is_empty() && name.starts_with("::") {
+            qualified_candidates = self.program.symbols.call_return_candidates(
+                caller,
+                dst,
+                name.trim_start_matches("::"),
+            );
+            &qualified_candidates
+        } else {
+            candidates
+        };
+        let mut eligible = candidates
+            .iter()
+            .map(|&id| self.program.symbols.function(id))
+            .filter(|callee| !guarded || Self::can_name_c_api(callee))
+            .peekable();
+        if !candidates.is_empty() && eligible.peek().is_none() {
+            return None;
+        }
+        let params = eligible
+            .find(|callee| !callee.params.is_empty())
+            .map(|callee| callee.params.as_slice());
+        Some((model, params))
+    }
+
+    fn collect_allocation_targets(&self) -> FxHashMap<(FnId, VarId, &'m str), Vec<FnId>> {
+        let mut targets = FxHashMap::<_, Vec<_>>::default();
+        for site in &self.program.symbols.call_sites {
+            let Some(dst) = site.return_dst.filter(|_| !site.unevaluated) else {
+                continue;
+            };
+            let name = site.callee_fn_id.map_or(site.callee_name.as_ref(), |id| {
+                self.program.symbols.function(id).name.as_str()
+            });
+            let Some(model) = self
+                .models
+                .named(name, EffectGroup::Return)
+                .filter(|model| {
+                    self.models.c_api_models.contains(&model.name) && model.has(EffectGroup::Return)
+                })
+            else {
+                continue;
+            };
+            targets
+                .entry((site.caller, dst, model.name.as_str()))
+                .or_default()
+                .extend(self.program.callees_of(site));
+        }
+        targets
+    }
+
+    fn can_name_c_api(callee: &Function) -> bool {
         // Calls without a declaration may still name a C API outside the
         // index. A declared C++ overload has its own linker symbol.
-        (!(callee.is_cpp
-            && !callee.c_linkage
-            && callee.explicit_arity.is_some()
-            && self.models.c_api_models.contains(&model.name)))
-        .then_some(model)
+        !callee.is_cpp || callee.c_linkage || callee.explicit_arity.is_none()
     }
 
     /// The `entry` model the function named `name` is the member of or an

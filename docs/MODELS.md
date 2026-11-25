@@ -59,9 +59,10 @@ take the `memset` model, while a class's or namespace's own
 `SecureBuffer::memset`, `Pool::memcpy`, `secure::memset` or bodyless
 `Arena::malloc` take none of the libc models (no terminator, no copy, no fresh
 heap), and rule 4 still applies to them.
-The built-in libc memory, string, and epoll argument effects also check
-language linkage for known C++ declarations. ADL can find a global C++
-overload with the same name and still keep its ordinary call edge. Undeclared
+The built-in libc memory, string, and epoll argument effects and the
+`malloc`, `calloc`, and `realloc` return effects check language linkage for
+known C++ declarations. Allocation summaries use the selected call targets
+when a call site records them, including targets found by ADL. Undeclared
 callees and explicitly configured models can still match by name.
 
 Not matched: a member a subclass inherits from a base the unit never declares,

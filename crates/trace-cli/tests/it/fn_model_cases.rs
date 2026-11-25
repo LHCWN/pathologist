@@ -973,3 +973,77 @@ void copy() { memcpy(destination, source); }
         .get(&pag.var_node[&destination.id])
         .is_none_or(|pts| pts.is_empty()));
 }
+
+#[test]
+fn libc_allocation_models_follow_the_selected_call_target() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {};
+Tag* malloc(Tag*) { return nullptr; }
+namespace std { extern "C" void* malloc(unsigned long); }
+namespace app {
+void malloc(int, int);
+Tag tag;
+void unqualified() { Tag* p = malloc(&tag); }
+void qualified() { Tag* p = ::malloc(&tag); }
+void genuine() { void* p = std::malloc(sizeof(Tag)); }
+}
+namespace ordinary {
+void unqualified() { Tag* p = malloc(&app::tag); }
+Tag* forwarded() { return malloc(&app::tag); }
+void through_return() { Tag* p = forwarded(); }
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for caller in [
+        "app::unqualified",
+        "app::qualified",
+        "ordinary::unqualified",
+        "ordinary::forwarded",
+        "app::genuine",
+    ] {
+        let targets: Vec<_> = result
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(&program, edge.caller) == caller)
+            .map(|edge| program.symbols.function(edge.callee))
+            .collect();
+        assert_eq!(targets.len(), 1, "{caller}");
+        assert_eq!(
+            targets[0].name,
+            if caller == "app::genuine" {
+                "std::malloc"
+            } else {
+                "malloc"
+            },
+            "{caller}"
+        );
+        assert_eq!(targets[0].c_linkage, caller == "app::genuine", "{caller}");
+    }
+    for (caller, allocates) in [
+        ("app::unqualified", false),
+        ("app::qualified", false),
+        ("ordinary::unqualified", false),
+        ("ordinary::through_return", false),
+        ("app::genuine", true),
+    ] {
+        let var = local_variable(&program, caller, "p");
+        let heap = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .is_some_and(|pts| {
+                pts.iter()
+                    .any(|l| pag.locations[l.0 as usize].kind == trace_analysis::LocKind::Heap)
+            });
+        assert_eq!(heap, allocates, "{caller}");
+    }
+}
