@@ -720,8 +720,22 @@ impl<'m> ModelLookup<'m> {
         &self,
         name: &str,
         candidates: &[FnId],
+        selected: bool,
     ) -> Option<(&'m FnModel, Option<&'m [VarId]>)> {
-        let model = self.model(name, EffectGroup::Return)?;
+        let model = self.model(name, EffectGroup::Return).or_else(|| {
+            // Ordinary lookup can name a different namespace from the
+            // allocator that won ADL. Only ranked targets can recover a
+            // built-in model whose name did not match the return fact.
+            if !selected || !self.has_allocator_leaf(name) {
+                return None;
+            }
+            candidates.iter().find_map(|&id| {
+                let callee = self.program.symbols.function(id);
+                (Self::can_name_c_api(callee) && self.is_builtin_allocator(&callee.name))
+                    .then(|| self.model(&callee.name, EffectGroup::Return))
+                    .flatten()
+            })
+        })?;
         let guarded = self.models.c_api_models.contains(&model.name);
         let mut eligible = candidates
             .iter()

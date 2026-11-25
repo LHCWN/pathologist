@@ -2477,6 +2477,7 @@ mod tests {
         let element_cv = trace_ir::CvQualification {
             object_const: false,
             pointee_const: Some(true),
+            ..Default::default()
         };
         header.register_template_element(specialization, element.clone(), element_cv);
         header.complete_nested_tags();

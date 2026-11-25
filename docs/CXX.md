@@ -677,6 +677,9 @@ C++-aware only where it must be — everything else reuses the C machinery.
   (`T first, second`, `T &ref, value`); parentheses around a known class member's
   name (`T (value)`) do not turn it into a method. Qualified base names and
   unions imported through nested cached headers use the same construction rule.
+  Volatile class members, including arrays and fields declared through type
+  aliases, can delete a defaulted move constructor and leave a user-provided
+  copy constructor as the selected overload.
   A member that is an array of a class, nested arrays
   included, constructs its elements: an empty list (`m_arr{}`) records the
   element's default constructor, and a non-empty list initializes the

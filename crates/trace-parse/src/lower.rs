@@ -6198,16 +6198,11 @@ fn lower_struct_specifier(
                                             .split_whitespace()
                                             .any(|w| w == "mutable")
                                 });
-                                let is_volatile = child.children(&mut child.walk()).any(|c| {
-                                    c.cached_kind() == "type_qualifier"
-                                        && node_text(source, &c) == "volatile"
-                                });
                                 program.types.note_field_qualification(
                                     &reg_name,
                                     &fname,
                                     trace_ir::FieldQualification {
                                         cv,
-                                        is_volatile,
                                         is_mutable,
                                         is_reference: is_ref,
                                     },
@@ -13765,9 +13760,13 @@ fn pointer_declarators(decl: Node) -> impl Iterator<Item = Node> {
 /// the name, so it is read from the syntax tree: a named declarator's text
 /// ends with the name, not with `const`.
 fn declarator_pointer_is_const(source: &str, decl: Node) -> bool {
+    declarator_pointer_has_qualifier(source, decl, "const")
+}
+
+fn declarator_pointer_has_qualifier(source: &str, decl: Node, qualifier: &str) -> bool {
     pointer_declarators(decl).last().is_some_and(|pointer| {
         pointer.children(&mut pointer.walk()).any(|child| {
-            child.cached_kind() == "type_qualifier" && node_text(source, &child) == "const"
+            child.cached_kind() == "type_qualifier" && node_text(source, &child) == qualifier
         })
     })
 }
@@ -15448,7 +15447,7 @@ fn subobjects_have_simple_construction(
                         .unwrap_or_default();
                     // An implicit copy or move cannot bind a volatile class
                     // subobject. A user-provided constructor may accept it.
-                    !qualification.is_volatile
+                    !qualification.cv.object_volatile
                         && simple_class(name, copy || qualification.cv.object_const)
                 }
                 TypeDesc::Union { .. } | TypeDesc::Unknown => false,
@@ -23164,6 +23163,7 @@ fn lower_lambda_expression(
                 && receiver_is_const(program, ctx, source, right, false) == Some(true))
                 || (!is_mutable && !is_ref && !is_ptr),
             pointee_const: receiver_is_const(program, ctx, source, right, true),
+            ..Default::default()
         };
         ctx.var_qualifications.insert(var_id, cv);
         if cv.object_const {
@@ -30547,12 +30547,16 @@ fn declaration_is_constant(source: &str, node: Node) -> bool {
 }
 
 fn declaration_has_const(source: &str, node: Node) -> bool {
+    declaration_has_qualifier(source, node, "const")
+}
+
+fn declaration_has_qualifier(source: &str, node: Node, qualifier: &str) -> bool {
     node.children(&mut node.walk()).any(|child| {
-        node_text(source, &child) == "const"
+        node_text(source, &child) == qualifier
             || (child.cached_kind() == "placeholder_type_specifier"
                 && child
                     .children(&mut child.walk())
-                    .any(|c| node_text(source, &c) == "const"))
+                    .any(|c| node_text(source, &c) == qualifier))
     })
 }
 
@@ -30599,6 +30603,7 @@ fn call_receiver_return_cv(
         return Some(trace_ir::CvQualification {
             object_const: false,
             pointee_const: Some(is_held_const),
+            ..Default::default()
         });
     }
     let func = call.cached_field("function")?;
@@ -30918,6 +30923,10 @@ fn receiver_is_const(
 /// not inside a template argument list, parameter list or array bound:
 /// `const Box<int>` and `Box<int> const` are const, `Box<const int>` is not.
 fn spelled_has_const(spelled: &str) -> bool {
+    spelled_has_qualifier(spelled, "const")
+}
+
+fn spelled_has_qualifier(spelled: &str, qualifier: &str) -> bool {
     let mut depth = 0usize;
     let mut word = String::new();
     let mut found = false;
@@ -30928,7 +30937,7 @@ fn spelled_has_const(spelled: &str) -> bool {
             }
             continue;
         }
-        found |= word == "const";
+        found |= word == qualifier;
         word.clear();
         match ch {
             '<' | '(' | '[' => depth += 1,
@@ -31000,9 +31009,10 @@ fn spelled_type_cv(
     let stripped = strip_cv(spelled);
     if stripped != spelled {
         if let Some((mut cv, is_ref)) = resolve_alias_cv(program, ctx, stripped) {
-            let outer_const = spelled_has_const(spelled) && !spelled_has_const(stripped);
-            if outer_const && !is_ref {
-                cv.object_const = true;
+            if !is_ref {
+                cv.object_const |= spelled_has_const(spelled) && !spelled_has_const(stripped);
+                cv.object_volatile |= spelled_has_qualifier(spelled, "volatile")
+                    && !spelled_has_qualifier(stripped, "volatile");
             }
             return cv;
         }
@@ -31024,6 +31034,7 @@ fn spelled_type_cv(
                 .unwrap_or_default();
             return trace_ir::CvQualification {
                 object_const: top_const,
+                object_volatile: spelled_has_qualifier(spelled, "volatile"),
                 pointee_const: Some(inner_cv.object_const),
             };
         }
@@ -31035,17 +31046,16 @@ fn spelled_type_cv(
     match peel_outer_declarator(spelled) {
         Some((pointee, true)) => trace_ir::CvQualification {
             object_const: has_trailing_const(spelled),
+            object_volatile: spelled_has_qualifier(
+                &spelled[peel_trailing_cv(spelled).0.len()..],
+                "volatile",
+            ),
             pointee_const: Some(spelled_type_cv(program, ctx, pointee).object_const),
         },
-        Some((referent, false)) => {
-            let inner_cv = spelled_type_cv(program, ctx, referent);
-            trace_ir::CvQualification {
-                object_const: inner_cv.object_const,
-                pointee_const: inner_cv.pointee_const,
-            }
-        }
+        Some((referent, false)) => spelled_type_cv(program, ctx, referent),
         None => trace_ir::CvQualification {
             object_const: spelled_has_const(spelled),
+            object_volatile: spelled_has_qualifier(spelled, "volatile"),
             pointee_const: None,
         },
     }
@@ -31070,11 +31080,13 @@ fn declaration_cv_qualification(
     let is_placeholder = type_node.is_some_and(|ty| is_placeholder_type(ctx, ty));
     if is_placeholder {
         let has_decl_const = declaration_has_const(source, node);
+        let has_decl_volatile = declaration_has_qualifier(source, node, "volatile");
         if let Some(init) = init_expr {
             if is_ref {
                 return trace_ir::CvQualification {
                     object_const: has_decl_const
                         || receiver_is_const(program, ctx, source, init, false) == Some(true),
+                    object_volatile: has_decl_volatile,
                     pointee_const: receiver_is_const(program, ctx, source, init, true),
                 };
             }
@@ -31089,6 +31101,8 @@ fn declaration_cv_qualification(
                     } else {
                         false
                     },
+                    object_volatile: decl
+                        .is_some_and(|d| declarator_pointer_has_qualifier(source, d, "volatile")),
                     pointee_const: Some(pointee_const),
                 };
             }
@@ -31102,6 +31116,7 @@ fn declaration_cv_qualification(
                     && receiver_is_const(program, ctx, source, init, false) == Some(true));
             return trace_ir::CvQualification {
                 object_const: obj_const,
+                object_volatile: has_decl_volatile,
                 pointee_const,
             };
         }
@@ -31114,11 +31129,14 @@ fn declaration_cv_qualification(
                 } else {
                     false
                 },
+                object_volatile: decl
+                    .is_some_and(|d| declarator_pointer_has_qualifier(source, d, "volatile")),
                 pointee_const: Some(has_decl_const),
             };
         }
         return trace_ir::CvQualification {
             object_const: has_decl_const || is_constexpr,
+            object_volatile: has_decl_volatile,
             pointee_const: None,
         };
     }
@@ -31129,9 +31147,8 @@ fn declaration_cv_qualification(
     } else {
         trace_ir::CvQualification::default()
     };
-    if declaration_has_const(source, node) {
-        base_cv.object_const = true;
-    }
+    base_cv.object_const |= declaration_has_const(source, node);
+    base_cv.object_volatile |= declaration_has_qualifier(source, node, "volatile");
 
     if let Some(decl) = decl {
         let ptr_depth = declarator_pointer_depth(decl);
@@ -31145,11 +31162,13 @@ fn declaration_cv_qualification(
                 } else {
                     false
                 },
+                object_volatile: declarator_pointer_has_qualifier(source, decl, "volatile"),
                 pointee_const: Some(pointee_const),
             };
         } else if has_ref {
             return trace_ir::CvQualification {
                 object_const: base_cv.object_const,
+                object_volatile: base_cv.object_volatile,
                 pointee_const: base_cv
                     .pointee_const
                     .or_else(|| declarator_is_array(decl).then_some(base_cv.object_const)),

@@ -1643,3 +1643,36 @@ void move(Movable& owner) { Movable dst = std::move(owner); }
     assert_reference_target(&p, &a, "copy_array", "ArrayOwner::ArrayOwner", false);
     assert!(!has_any_edge(&p, &a, "move", "Movable::Movable"));
 }
+
+#[test]
+fn volatile_class_aliases_can_delete_a_defaulted_move() {
+    let (p, a) = analyze(
+        r#"
+struct Member { int n; };
+using V = volatile Member;
+typedef V Alias;
+using Pointer = V*;
+struct Owner {
+    V member;
+    Owner(const Owner&) : member{} {}
+    Owner(Owner&&) = default;
+};
+struct ArrayOwner {
+    Alias members[2];
+    ArrayOwner(const ArrayOwner&) : members{} {}
+    ArrayOwner(ArrayOwner&&) = default;
+};
+struct Movable {
+    Pointer pointer;
+    Movable(const Movable&) : pointer{} {}
+    Movable(Movable&&) = default;
+};
+void copy(Owner& owner) { Owner dst = std::move(owner); }
+void copy_array(ArrayOwner& owner) { ArrayOwner dst = std::move(owner); }
+void move(Movable& owner) { Movable dst = std::move(owner); }
+"#,
+    );
+    assert_reference_target(&p, &a, "copy", "Owner::Owner", false);
+    assert_reference_target(&p, &a, "copy_array", "ArrayOwner::ArrayOwner", false);
+    assert!(!has_any_edge(&p, &a, "move", "Movable::Movable"));
+}

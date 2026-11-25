@@ -1124,6 +1124,7 @@ namespace app {
 struct Tag {};
 Tag* malloc(Tag*) { return nullptr; }
 }
+
 void adl(app::Tag* tag) { void* p = malloc(tag); }
 void* forward(app::Tag* tag) { return malloc(tag); }
 void forwarded(app::Tag* tag) { void* p = forward(tag); }
@@ -1157,5 +1158,46 @@ void libc() { void* p = malloc(8UL); }
                     .any(|loc| pag.locations[loc.0 as usize].kind == trace_analysis::LocKind::Heap)
             });
         assert_eq!(has_heap, allocates, "{caller}");
+    }
+}
+
+#[test]
+fn adl_selected_c_allocator_supplies_return_flow() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+extern "C" void* malloc(unsigned long);
+struct Size { operator unsigned long() const { return 8; } };
+namespace app {
+void* malloc(int, int);
+void direct(Size size) { void* p = malloc(size); }
+void* forward(Size size) { return malloc(size); }
+void forwarded(Size size) { void* p = forward(size); }
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for caller in ["app::direct", "app::forward"] {
+        let targets: Vec<_> = result
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(&program, edge.caller) == caller)
+            .map(|edge| fn_name(&program, edge.callee))
+            .collect();
+        assert_eq!(targets, ["malloc"], "{caller}");
+    }
+    for caller in ["app::direct", "app::forwarded"] {
+        let dst = local_variable(&program, caller, "p");
+        let pointees = &result.points_to[&pag.var_node[&dst]];
+        assert_eq!(pointees.len(), 1, "{caller}: {pointees:?}");
+        let loc = &pag.locations[pointees.iter().next().unwrap().0 as usize];
+        assert_eq!(loc.kind, trace_analysis::LocKind::Heap, "{caller}");
     }
 }

@@ -665,12 +665,12 @@ impl std::fmt::Debug for ByAddress {
     }
 }
 
-/// Const qualification of a declared entity, alias, or return type: whether
-/// the top-level object/referent is `const`, and for a pointer or smart-pointer
-/// wrapper whether its immediate pointee is `const`.
+/// Qualification of a declared entity, alias, or return type. Tracks const
+/// and volatile on the object or referent, and const on the immediate pointee.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CvQualification {
     pub object_const: bool,
+    pub object_volatile: bool,
     pub pointee_const: Option<bool>,
 }
 
@@ -678,8 +678,6 @@ pub struct CvQualification {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FieldQualification {
     pub cv: CvQualification,
-    /// A `volatile` qualifier written on the field declaration's base type.
-    pub is_volatile: bool,
     pub is_mutable: bool,
     pub is_reference: bool,
 }

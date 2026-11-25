@@ -3,6 +3,7 @@ use crate::ipc::detect_ipc_pairs_with_models;
 use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use std::borrow::Cow;
 use trace_ir::{
     CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow,
     StorageClass, TargetId, TypeDesc, TypeId, VarId,
@@ -915,11 +916,14 @@ impl Pag {
                     // Modeled return effects fire only when no real return
                     // flow exists (bodyless callees: libc realloc, vendor
                     // allocators). Synthesized externals never enter the
-                    // name-resolution maps, so the model is consulted by
-                    // call name directly.
+                    // name-resolution maps. Fall back to a return model
+                    // using the selected targets and the call spelling.
                     if !any_real {
-                        if let Some((model, params)) = models.return_model(callee_name, &candidates)
-                        {
+                        if let Some((model, params)) = models.return_model(
+                            callee_name,
+                            &candidates,
+                            matches!(candidates, Cow::Borrowed(_)),
+                        ) {
                             self.apply_return_model(program, dst_n, model, params);
                             // A file-scope initializer has no call record.
                             if caller.is_none() {
@@ -1090,7 +1094,7 @@ impl Pag {
             if !any_real {
                 for cs in sites {
                     if let Some((model, params)) =
-                        models.return_model(&cs.callee_name, &program.callees_of(cs))
+                        models.return_model(&cs.callee_name, &program.callees_of(cs), true)
                     {
                         self.apply_return_model(program, dst_n, model, params);
                         break;
@@ -1239,9 +1243,11 @@ impl Pag {
                             // realloc has no tree body): fall back to the
                             // modeled return effects.
                             if !inner_applied && !address {
-                                if let Some((model, params)) =
-                                    models.return_model(&callee_name, &inner_candidates)
-                                {
+                                if let Some((model, params)) = models.return_model(
+                                    &callee_name,
+                                    &inner_candidates,
+                                    matches!(inner_candidates, Cow::Borrowed(_)),
+                                ) {
                                     inner_applied =
                                         self.apply_return_model(program, dst, model, params);
                                 }
