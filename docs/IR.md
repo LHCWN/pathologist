@@ -339,17 +339,20 @@ collapsed reference category for declarations such as `Ref&&` with
 pointee constness in overload metadata even when lowered as pointer values
 for flow analysis. For member calls ranking checks receiver viability before
 preferring an argument binding. Base qualifiers resolve in their lexical scope, with a leading
-`::` starting lookup at global scope. Result type and constness
-inference use the same selection. Default arguments come from declarations
+`::` starting lookup at global scope. Result type and constness inference
+share the receiver and reference viability checks. Default arguments come from declarations
 matching the selected member overload. Reference viability also checks direct
 bindings to base subobjects. Virtual dispatch expands the overload selected
 from the static receiver's declarations to its override family.
 A same-class glvalue such as a named object, member access, reference-returning
 call, or conditional glvalue converted to a common base selects a copy or move
-constructor when it initializes an object. The candidates are user-provided constructors
-eligible for implicit conversion. Reference declarations bind directly to
-the initializer, and same-type prvalues construct the destination directly
-under C++17 copy elision. Same-class assignments record
+constructor when it initializes an object. Constructors eligible for implicit
+conversion participate in selection, including defaulted and deleted overloads.
+When a winning defaulted move may be implicitly deleted because of its
+subobjects, lowering also considers the overloads that could win without it.
+The call graph records selected user-provided constructors. Reference
+declarations bind directly to the initializer, and same-type prvalues
+construct the destination directly under C++17 copy elision. Same-class assignments record
 declared copy or move `operator=` sites where a visible user-provided overload
 can accept a same-class argument and wins overload selection. Defaulted
 assignments participate in selection and have no synthetic call site. This

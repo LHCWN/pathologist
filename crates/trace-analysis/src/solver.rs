@@ -1062,7 +1062,7 @@ fn solve(
                 &mut st,
                 &mut scratch,
                 cs,
-                &f.name,
+                f,
                 models,
                 &mut terminator_events,
             );
@@ -1662,7 +1662,7 @@ fn solve(
                             &mut st,
                             &mut scratch,
                             cs,
-                            &program.symbols.function(callee).name,
+                            program.symbols.function(callee),
                             models,
                             &mut terminator_events,
                         );
@@ -1825,11 +1825,11 @@ fn apply_fn_model(
     st: &mut SolverState,
     scratch: &mut Scratch,
     cs: &trace_ir::CallSite,
-    callee_name: &str,
+    callee: &trace_ir::Function,
     models: &ModelLookup,
     terminator_events: &mut Vec<(CallSiteId, u32)>,
 ) {
-    let Some(model) = models.model(callee_name, EffectGroup::Args) else {
+    let Some(model) = models.argument_model(callee) else {
         return;
     };
     // Unresolved member addresses may still name the base variable;
@@ -4296,6 +4296,7 @@ mod tests {
                 pack_positions: Vec::new(),
                 is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
                 is_free_function_template: false,
                 is_member_template: false,

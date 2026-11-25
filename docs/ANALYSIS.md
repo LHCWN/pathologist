@@ -971,8 +971,10 @@ covers the DataShare framework route. For partial checkouts, choose among
   status still permits recovery through the combined hierarchy. An explicit
   call already bound to a defined nonvirtual body (or an exact/final binding)
   keeps that binding; another repository's same-name body does not widen it.
-  Parameter mismatch excludes a candidate only when both selected and candidate
-  arities are known. Parameter shapes retain guessed-tag names and their
+  Storage-type mismatch excludes a candidate only when both selected and candidate
+  arities are known. Known reference bindings in the exported signatures also
+  exclude incompatible overloads during member reconstruction. Parameter
+  shapes retain guessed-tag names and their
   source uncertainty; a class declared in another provider cannot turn a
   caller's unresolved typedef into a certain class. The shared signature
   matcher admits scalar-typedef alternatives for such guesses. Legacy exports

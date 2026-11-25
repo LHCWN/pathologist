@@ -206,6 +206,8 @@ pub struct Function {
     /// is not user-provided, so the class is still an aggregate (C++17) and
     /// braces initialize its fields rather than call it.
     pub defaulted_in_class: bool,
+    /// An explicitly deleted function (`= delete`).
+    pub is_deleted: bool,
     /// A constructor with a known true or unconditional explicit specifier.
     pub is_explicit_constructor: bool,
     /// Declared in its class body: a member, whatever its parameter list
@@ -669,6 +671,11 @@ fn absorb_redeclaration(
             .parameter_references
             .clone_from(&func.parameter_references);
     } else {
+        if existing.parameter_references.len() < func.parameter_references.len() {
+            existing
+                .parameter_references
+                .resize(func.parameter_references.len(), None);
+        }
         for (known, new) in existing
             .parameter_references
             .iter_mut()
@@ -693,6 +700,7 @@ fn absorb_redeclaration(
     }
     // User-provided once any declaration of it is.
     existing.defaulted_in_class &= func.defaulted_in_class;
+    existing.is_deleted |= func.is_deleted;
     existing.is_explicit_constructor |= func.is_explicit_constructor;
     existing.is_static_member |= func.is_static_member;
     existing.is_const_member |= func.is_const_member;
@@ -2494,10 +2502,21 @@ impl SymbolTable {
     }
 
     fn reference_forms_alike(a: &Function, b: &Function) -> bool {
-        a.parameter_references
-            .iter()
-            .zip(&b.parameter_references)
-            .all(|(a, b)| a.zip(*b).is_none_or(|(a, b)| a.compatible_with(b)))
+        let form = |f: &Function, i| f.parameter_references.get(i).copied().flatten();
+        (0..a
+            .parameter_references
+            .len()
+            .max(b.parameter_references.len()))
+            .all(|i| {
+                match (form(a, i), form(b, i)) {
+                    (Some(x), Some(y)) => x.compatible_with(y),
+                    // A written pointer reference may use value storage. Check
+                    // the binding only on the side without a written form.
+                    (Some(_), None) => b.reference_params.get(i) != Some(&false),
+                    (None, Some(_)) => a.reference_params.get(i) != Some(&false),
+                    (None, None) => true,
+                }
+            })
     }
 
     /// Type of a parameter variable, for overload signature comparison.
@@ -4980,6 +4999,7 @@ mod tests {
             pack_positions: Vec::new(),
             is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
             is_member_template: false,
@@ -5370,6 +5390,35 @@ mod tests {
                 .add_function_with_param_types(on_control, Some(&[control]), Some(&p.types));
         assert_ne!(control_id, data_id, "distinct tags are distinct overloads");
         assert_eq!(p.symbols.externals_by_name["send"].len(), 2);
+    }
+
+    #[test]
+    fn a_redeclaration_supplies_missing_trailing_reference_forms() {
+        let mut symbols = SymbolTable::default();
+        let file = FileId(1);
+        let lvalue = crate::ReferenceParameter {
+            rvalue: false,
+            is_const: Some(false),
+            pointee_const: None,
+        };
+        let rvalue = crate::ReferenceParameter {
+            rvalue: true,
+            ..lvalue
+        };
+        let mut first = fake_function(symbols.alloc_fn_id(), "f", vec![], false, false, file, 1);
+        first.is_cpp = true;
+        first.explicit_arity = Some(2);
+        first.reference_params = vec![true, true];
+        first.parameter_references = vec![Some(lvalue)];
+        let mut second = first.clone();
+        second.id = symbols.alloc_fn_id();
+        second.parameter_references.push(Some(rvalue));
+        let id = symbols.add_function(first);
+        assert_eq!(symbols.add_function(second), id);
+        assert_eq!(
+            symbols.function(id).parameter_references,
+            [Some(lvalue), Some(rvalue)]
+        );
     }
 
     #[test]

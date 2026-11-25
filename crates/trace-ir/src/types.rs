@@ -488,6 +488,9 @@ pub fn split_signature_references(signature: &str) -> (&str, &str) {
 
 /// Missing facts, including all reference information in older databases,
 /// leave an overload compatible for name or storage-signature fallback.
+/// Compare only shared slots here. Exact storage matching checks arity as
+/// part of the signature; name fallback can consider differently shaped
+/// declarations when the two databases disagree about their storage types.
 pub fn signature_references_compatible(a: &str, b: &str) -> bool {
     if a.is_empty() || b.is_empty() {
         return true;

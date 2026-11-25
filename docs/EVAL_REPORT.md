@@ -192,6 +192,30 @@ reported 39,860 raw edges and 34,946 argument-flow rows. Camera reported
 nine aggregate checks outside the Windows MinGW reference ranges as before
 the rebase.
 
+### Review of PR #300 at `401cec5`
+
+The pinned macOS arm64 runs used eight jobs and compared the review fixes
+with a build from `401cec5`. The default profile moved HiView from 39,511 to
+39,507 raw edges and from 33,799 to 33,787 argument-flow rows. Camera moved
+from 117,184 to 117,176 raw edges and from 60,964 to 60,941 argument-flow
+rows. The HiView pointer-offset probe now checks for three distinct call
+sites with one binding each. The two sites for `CalcBufferSha` previously
+each shared the pointer and reference overload's formals. Each now binds
+its selected overload, and the content reader still binds `Append::data`.
+
+In Ability Runtime, public functions moved from 76,976 to 76,973 and public
+edges from 379,698 to 379,805. The extra edges comprise 22 direct and 85
+external alternatives. These include unresolved
+`AbilityManagerService::StartAbility` targets and direct bindings to
+`Token::GetAbilityRecordByToken`. Indirect and IPC totals match HEAD.
+
+Debug canonical runs passed every named HiView and Camera probe. HiView
+reported 39,856 raw edges and 34,934 argument-flow rows. Camera reported
+117,380 raw edges and 61,706 argument-flow rows. HEAD and the fixes had the
+same 18 aggregate mismatches with the Windows MinGW expectation centers.
+The Clang differential matched HEAD case for case, with 4,480 exact matches,
+87 untyped cases and two wrong overloads.
+
 ## AAFwk task handler callback edges - 2026-11-23
 
 `AmsMgrScheduler::StartSpecifiedAbility` hands a lambda to

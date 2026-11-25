@@ -822,6 +822,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
 - **Call-result receivers**: `S::GetInstance().Open()` and pointer-returning
   chains reuse declared return-type inference. Ambiguous return types stay
   unknown; receiver probes do not mutate the index.
+  A cast to a class value, reference, or pointer supplies its written class
+  and value category for member lookup.
 - **Move/forward receivers.** Lowering recognizes one-argument calls to
   `std::move` and `std::forward` through qualification, namespace aliases,
   using-declarations, and using-directives. Qualified names and imports resolve
@@ -837,12 +839,16 @@ C++-aware only where it must be — everything else reuses the C machinery.
   be resolved, as in `std::forward<Base>(derived).M()`. Otherwise it uses
   the operand's static type, including any cast inside the operand.
   Forwarding through an lvalue reference, including an alias or a resolved
-  `decltype`, yields an lvalue. A resolved `decltype` supplies the referent
+  `decltype`, yields an lvalue. A local `auto&&` collapses according to its
+  initializer's category, so `decltype(r)` names an lvalue reference when
+  `r` was initialized from an lvalue. A resolved `decltype` supplies the referent
   type and qualification, including applicable explicit qualifiers.
   `std::move` and forwarding through a known
   value or rvalue reference type yield rvalues. Dependent and unresolved
   forward types retain both possible categories. Known receiver categories
-  narrow ref-qualified members for call edges and return flow. Unknown
+  narrow ref-qualified members for call edges and return flow. Known
+  arguments can rank edges when another argument is unknown, while static
+  result inference still requires agreement among the viable overloads. Unknown
   forwarding receiver categories and constness keep the winners of each
   viable receiver, including calls that pass ordinary arguments. These facts
   follow a comma expression's right operand, either arm of a conditional,

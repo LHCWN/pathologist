@@ -259,6 +259,17 @@ pub(super) fn reconstruct(
         let (Some(a), Some(b)) = (functions.get(&caller), functions.get(&callee)) else {
             continue;
         };
+        if member
+            .selected
+            .and_then(|id| functions.get(&i64::from(id.0)))
+            .is_some_and(|selected| {
+                let (_, selected_refs) = trace_ir::split_signature_references(&selected.signature);
+                let (_, candidate_refs) = trace_ir::split_signature_references(&b.signature);
+                !trace_ir::signature_references_compatible(selected_refs, candidate_refs)
+            })
+        {
+            continue;
+        }
         if let Some(target) = a.target_id {
             let reachable = closures.entry(target).or_insert_with(|| {
                 let mut reachable = FxHashSet::default();

@@ -4911,3 +4911,63 @@ void qualified_pointer(const T*&&) {}
         ]
     );
 }
+
+#[test]
+fn member_reference_signatures_use_explicit_parameter_slots() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for (name, source) in [
+        (
+            "caller",
+            r#"
+struct T {};
+struct C { virtual void f(T*&, T*) = 0; };
+void run(C& c, T*& a, T* b) { c.f(a, b); }
+"#,
+        ),
+        (
+            "provider",
+            r#"
+struct T {};
+struct C {
+    virtual void f(T*&, T*) {}
+    virtual void f(T*&, T*&) {}
+};
+"#,
+        ),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("code.cpp"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let caller = Connection::open(&inputs[0]).unwrap();
+    let signature: String = caller
+        .query_row(
+            "SELECT signature FROM functions WHERE name = 'C::f'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(signature, "C::f(T*, T*) [refs=&:m,value]");
+
+    let out = tmp.path().join("out.db");
+    merge_into(&inputs, &out);
+    let conn = Connection::open(out).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT callee.signature FROM call_edges e
+             JOIN functions caller ON caller.id = e.caller_fn_id
+             JOIN functions callee ON callee.id = e.callee_fn_id
+             WHERE caller.name = 'run' AND callee.name = 'C::f' AND callee.is_defined = 1",
+        )
+        .unwrap();
+    let targets: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(targets, [signature]);
+}

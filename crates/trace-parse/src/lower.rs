@@ -2730,6 +2730,7 @@ fn finalize_extern_callees(program: &mut Program) {
             pack_positions: Vec::new(),
             is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
             is_member_template: false,
@@ -2856,6 +2857,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             pack_positions: Vec::new(),
             is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
             is_member_template: false,
@@ -5172,6 +5174,9 @@ fn type_reference_kind(
         }
     }
     let name = normalize_qualified(ty_text);
+    if spelling_is_dependent(ctx, source, ty, &name, Spelling::Source) {
+        return None;
+    }
     resolve_alias_reference_kind(program, ctx, &name)
 }
 
@@ -5234,18 +5239,39 @@ fn declaration_is_reference(
 ) -> bool {
     // Pointer-reference parameters retain the IR's collapsed pointer value;
     // their written binding does not add a referent-address storage layer.
-    !parameter_keeps_pointer_value(node)
-        && declaration_reference_kind(program, ctx, source, node).is_some()
+    declaration_reference_kind(program, ctx, source, node).is_some()
+        && !parameter_keeps_pointer_value(program, ctx, source, node)
 }
 
-fn parameter_keeps_pointer_value(node: Node) -> bool {
-    is_parameter_node(node.cached_kind())
-        && node.cached_field("declarator").is_some_and(|decl| {
-            matches!(
-                ungroup_declarator(decl).cached_kind(),
-                "pointer_declarator" | "abstract_pointer_declarator"
-            )
+fn parameter_keeps_pointer_value(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> bool {
+    if !is_parameter_node(node.cached_kind()) {
+        return false;
+    }
+    if node.cached_field("declarator").is_some_and(|decl| {
+        matches!(
+            ungroup_declarator(decl).cached_kind(),
+            "pointer_declarator" | "abstract_pointer_declarator"
+        )
+    }) {
+        return true;
+    }
+    node.cached_field("type").is_some_and(|ty| {
+        let name = node_text(source, &ty);
+        if spelling_is_dependent(ctx, source, ty, name, Spelling::Source) {
+            return false;
+        }
+        resolve_alias_cv(program, ctx, name).is_some_and(|(_, is_reference)| {
+            !is_reference
+                && type_referent_desc(program, ctx, source, ty).is_some_and(|desc| {
+                    matches!(desc, TypeDesc::Ptr(_)) && desc.callable_signature().is_none()
+                })
         })
+    })
 }
 
 fn type_is_reference_alias(program: &Program, ctx: &LowerContext, source: &str, ty: Node) -> bool {
@@ -8096,6 +8122,7 @@ fn register_member_prototype(
             is_explicit_constructor: short == last_segment_of(cls_qual)
                 && explicitly_declared_constructor(program, ctx, source, node),
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: true,
             is_free_function_template: false,
             is_member_template: is_member_function_template(source, node),
@@ -8477,6 +8504,9 @@ fn lower_function_signature(
                         "default_method_clause" | "delete_method_clause"
                     )
                 }),
+            is_deleted: node
+                .children(&mut node.walk())
+                .any(|c| c.cached_kind() == "delete_method_clause"),
             declared_in_class: ctx.class_ctx.is_some(),
             is_free_function_template,
             is_member_template: ctx.is_cpp
@@ -8815,8 +8845,9 @@ impl ParamListShape {
         };
         if declares {
             let reference = declaration_reference_kind(program, ctx, source, param);
-            self.references
-                .push(reference.is_some() && !parameter_keeps_pointer_value(param));
+            self.references.push(
+                reference.is_some() && !parameter_keeps_pointer_value(program, ctx, source, param),
+            );
             if ctx.is_cpp {
                 if let Some(form) = reference.and_then(|rvalue| {
                     parameter_reference_form(program, ctx, source, param, rvalue)
@@ -9202,9 +9233,6 @@ fn lower_parameter(
     if declaration_callable_returns_reference(program, ctx, source, node) {
         ctx.reference_callables.insert(var_id);
     }
-    if let Some(declarator) = declarator {
-        mark_reference_binding(ctx, declarator, var_id);
-    }
     if reference {
         ctx.reference_vars.insert(var_id);
         ctx.reference_bindings.insert(var_id);
@@ -9262,7 +9290,9 @@ fn auto_initializer_type(
     value: Node,
 ) -> Option<TypeDesc> {
     let value = peel_expression(value);
-    let desc = if value.cached_kind() == "call_expression" {
+    let desc = if let Some(cast) = std_move_forward(program, ctx, source, value) {
+        cast.result_desc(program, ctx, source)?
+    } else if value.cached_kind() == "call_expression" {
         match call_result_shape(program, ctx, source, value)? {
             CallResult::Decided(desc) => desc?,
             CallResult::Qualified(desc, _) => desc,
@@ -9873,7 +9903,8 @@ fn call_result_among(
         }
     }
     let spells_template_args = callee_spells_template_args(func);
-    let candidates = result_overloads(
+    let candidates = select_call_overloads(
+        OverloadChoice::Result,
         program,
         candidates,
         args,
@@ -10016,10 +10047,10 @@ fn call_has_forwarded_receiver(
     is_forwarded_receiver(program, ctx, source, callee)
 }
 
-/// The overloads deciding both a call's static result type and whether
-/// its value represents a reference's address.
+/// Select a call's targets for edge emission or static result inference.
 #[allow(clippy::too_many_arguments)]
-fn result_overloads(
+fn select_call_overloads(
+    choice: OverloadChoice,
     program: &Program,
     candidates: Vec<FnId>,
     args: &[TypeDesc],
@@ -10059,7 +10090,8 @@ fn result_overloads(
                                 ))
                     })
                     .collect();
-                selected.extend(result_overloads(
+                selected.extend(select_call_overloads(
+                    choice,
                     program,
                     viable,
                     args,
@@ -10131,15 +10163,7 @@ fn result_overloads(
         candidates
     };
     let candidates = narrow_reference_arguments(program, candidates, args, argument_references);
-    // The candidates left must all take the arguments and agree on one
-    // return type.
-    let narrowed = narrow_overloads(
-        program,
-        candidates,
-        args,
-        null_constants,
-        OverloadChoice::Result,
-    );
+    let narrowed = narrow_overloads(program, candidates, args, null_constants, choice);
     if narrowed.len() <= 1 {
         return narrowed;
     }
@@ -10304,7 +10328,8 @@ fn select_receiver_overloads(
     }
     let targets = static_overload_candidates(program, member.0, member.1, targets);
     args.receiver_ranked = true;
-    result_overloads(
+    select_call_overloads(
+        OverloadChoice::Edges,
         program,
         targets,
         &args.arg_desc,
@@ -12480,7 +12505,8 @@ fn call_return_categories(
     let spells_template_args = call
         .cached_field("function")
         .is_some_and(callee_spells_template_args);
-    let selected = result_overloads(
+    let selected = select_call_overloads(
+        OverloadChoice::Result,
         program,
         candidates,
         &args,
@@ -14997,13 +15023,18 @@ fn lower_one_declarator(
             record_adl_template_type(program, ctx, source, declaration, var_id, type_id);
             let is_ref = ctx.reference_bindings.contains(&var_id);
             if is_ref && ctx.current_fn.is_some() {
-                if let Some(rvalue) = declared_reference_kind(
-                    program,
-                    ctx,
-                    source,
-                    Some(decl),
-                    declaration.cached_field("type"),
-                ) {
+                let ty = declaration.cached_field("type");
+                let category = declared_reference_kind(program, ctx, source, Some(decl), ty);
+                let category = if category == Some(true)
+                    && ty.is_some_and(|ty| is_placeholder_type(ctx, ty))
+                    && !declaration_has_const(source, declaration)
+                {
+                    init_expr
+                        .and_then(|init| receiver_value_category(program, ctx, source, init, false))
+                } else {
+                    category
+                };
+                if let Some(rvalue) = category {
                     ctx.local_reference_categories.insert(var_id, rvalue);
                 }
             }
@@ -15271,6 +15302,49 @@ fn lower_copy_initialization(
             },
         ));
     }
+    let select = |targets| {
+        select_call_overloads(
+            OverloadChoice::Edges,
+            program,
+            targets,
+            &args.arg_desc,
+            &args.null_constants,
+            &args.argument_references,
+            None,
+            None,
+            false,
+            false,
+        )
+    };
+    let defaulted_move = |id| {
+        let f = program.symbols.function(id);
+        f.defaulted_in_class
+            && !f.is_deleted
+            && f.parameter_references
+                .first()
+                .is_some_and(|form| form.is_some_and(|reference| reference.rvalue))
+            && takes_own_class(program, id, &cls)
+    };
+    let mut selected = select(targets.clone());
+    if selected.iter().copied().any(defaulted_move)
+        && !subobjects_have_simple_move(program, &cls, &mut HashSet::default())
+    {
+        // An implicitly deleted defaulted move is ignored by overload
+        // resolution. Keep the fallback when subobject viability is uncertain.
+        targets.retain(|&id| !defaulted_move(id));
+        for id in select(targets) {
+            if !selected.contains(&id) {
+                selected.push(id);
+            }
+        }
+    }
+    // Defaulted and deleted constructors can win selection, but have no
+    // user-provided body to reach through this synthetic site.
+    selected.retain(|&id| user_provided(program, id) && !program.symbols.function(id).is_deleted);
+    if selected.is_empty() {
+        return;
+    }
+    args.receiver_ranked = true;
     let span = node_call_span(program, ctx, declaration);
     let expansion = node_expansion_span(program, ctx, declaration);
     let first = program.symbols.call_sites.len();
@@ -15284,7 +15358,7 @@ fn lower_copy_initialization(
         args,
         span,
         expansion,
-        targets,
+        selected,
         None,
     );
     record_call_expressions(
@@ -15292,6 +15366,40 @@ fn lower_copy_initialization(
         first,
         &operation_expression(ctx, source, declaration),
     );
+}
+
+/// Prove movability for simple subobjects. Special members, incomplete
+/// layouts, and union variants can require C++ checks the index cannot make.
+fn subobjects_have_simple_move(
+    program: &Program,
+    class: &str,
+    pending: &mut HashSet<String>,
+) -> bool {
+    let Some(ty) = program.types.class_type_id(class) else {
+        return false;
+    };
+    if !program.types.is_struct_defined(class) || !pending.insert(class.to_owned()) {
+        return false;
+    }
+    let mut simple_class = |subobject: &str| {
+        let subobject = receiver_lookup_name(subobject);
+        !program.types.has_declared_constructor(&subobject)
+            && declared_members_upward(program, &subobject, &trace_ir::MethodKind::Dtor).is_empty()
+            && subobjects_have_simple_move(program, &subobject, pending)
+    };
+    let simple = program.base_names(class).all(&mut simple_class)
+        && program.types.get(ty).layout.fields.values().all(|field| {
+            if program.types.field_is_reference(class, &field.name) {
+                return true;
+            }
+            match peel_arrays(program.types.get(field.type_id).desc.as_ref()).0 {
+                TypeDesc::Struct { name, .. } => simple_class(name),
+                TypeDesc::Union { .. } | TypeDesc::Unknown => false,
+                _ => true,
+            }
+        });
+    pending.remove(class);
+    simple
 }
 
 fn note_reference_argument(
@@ -16231,6 +16339,7 @@ fn lower_function_decl(
         pack_positions: shape.pack_positions,
         is_explicit_constructor: false,
         defaulted_in_class: false,
+        is_deleted: false,
         declared_in_class: false,
         is_free_function_template: ctx.is_cpp
             && object_declaration(decl).is_some_and(has_function_template_parameters),
@@ -17232,7 +17341,8 @@ fn collect_call_at_node_inner(
         if !binds_this {
             if let Some((cls, kind)) = callee_var.and_then(|v| callable_operator(program, v)) {
                 let args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
-                let targets = result_overloads(
+                let targets = select_call_overloads(
+                    OverloadChoice::Edges,
                     program,
                     member_targets_upward(program, &cls, &kind),
                     &args.arg_desc,
@@ -17533,7 +17643,8 @@ fn collect_call_at_node_inner(
                     } else {
                         let targets = static_overload_candidates(program, &cls, &kind, targets);
                         call_args.receiver_ranked = true;
-                        result_overloads(
+                        select_call_overloads(
+                            OverloadChoice::Edges,
                             program,
                             targets,
                             &call_args.arg_desc,
@@ -17749,7 +17860,8 @@ fn collect_call_at_node_inner(
             .then(|| qualified_this_context(program, ctx, &callee_name))
             .flatten();
         let ranked = if let Some(class) = implicit_receiver {
-            result_overloads(
+            select_call_overloads(
+                OverloadChoice::Edges,
                 program,
                 candidates,
                 &arg_desc,
@@ -20352,41 +20464,26 @@ fn parameter_reference_form(
     }
     let ty = param.cached_field("type")?;
     let name = normalize_qualified(node_text(source, &ty));
-    let is_const = if let Some((cv, true)) = resolve_alias_cv(program, ctx, &name) {
-        Some(cv.object_const)
-    } else if let Some(decl) = param
-        .cached_field("declarator")
-        .filter(|&decl| declarator_pointer_depth(decl) > 0)
-    {
-        Some(declarator_pointer_is_const(source, decl))
+    let decl = param.cached_field("declarator");
+    let written_pointers = decl.map_or(0, declarator_pointer_depth);
+    let dependent = spelling_is_dependent(ctx, source, ty, &name, Spelling::Source);
+    let alias = (!dependent)
+        .then(|| resolve_alias_cv(program, ctx, &name))
+        .flatten();
+    let alias_pointers = alias
+        .and_then(|_| type_referent_desc(program, ctx, source, ty))
+        .map_or(0, |desc| pointer_depth(&desc));
+    let (base_cv, reference_alias) = alias.unwrap_or_default();
+    let object_const =
+        base_cv.object_const || (!reference_alias && declaration_has_const(source, param));
+    let is_const = if written_pointers > 0 {
+        decl.map(|decl| declarator_pointer_is_const(source, decl))
     } else {
-        let alias = find_in_scope(program, ctx, &name, |name, _| {
-            program.types.resolve_alias(name).map(|_| ())
-        })
-        .is_some();
-        let pointer = param.cached_field("declarator").is_some_and(|declarator| {
-            ungroup_declarator(declarator)
-                .named_children(&mut declarator.walk())
-                .any(|child| {
-                    matches!(
-                        ungroup_declarator(child).cached_kind(),
-                        "pointer_declarator" | "abstract_pointer_declarator"
-                    )
-                })
-        });
-        (!alias && !pointer).then(|| declaration_is_constant(source, param))
+        Some(object_const)
     };
-    let pointee_const = match param
-        .cached_field("declarator")
-        .map(declarator_pointer_depth)
-    {
-        Some(1) => Some(
-            declaration_has_const(source, param)
-                || spelled_type_cv(program, ctx, node_text(source, &ty)).object_const,
-        ),
-        Some(0) | None => {
-            resolve_alias_cv(program, ctx, &name).and_then(|(cv, _)| cv.pointee_const)
-        }
+    let pointee_const = match (written_pointers, alias_pointers) {
+        (1, 0) if !dependent || object_const => Some(object_const),
+        (0, 0 | 1) => base_cv.pointee_const,
         _ => None,
     };
     Some(trace_ir::ReferenceParameter {
@@ -22788,6 +22885,7 @@ fn lower_lambda_expression(
         pack_positions: Vec::new(),
         is_explicit_constructor: false,
         defaulted_in_class: false,
+        is_deleted: false,
         declared_in_class: false,
         is_free_function_template: false,
         is_member_template: false,
@@ -24475,7 +24573,8 @@ fn enum_operator_result(
     if candidates.is_empty() {
         return None;
     }
-    let selected = result_overloads(
+    let selected = select_call_overloads(
+        OverloadChoice::Result,
         program,
         candidates,
         args,
@@ -26281,7 +26380,6 @@ fn move_argument_references(
 /// known to be incompatible. Unresolved types can still compete.
 fn incompatible_move_argument(
     program: &Program,
-    ctx: &LowerContext,
     argument: &TypeDesc,
     candidate: FnId,
     matches_pointer_cv: impl FnOnce(Option<bool>) -> bool,
@@ -26326,12 +26424,7 @@ fn incompatible_move_argument(
                 })
                 && (argument.pointee().is_none()
                     || (pointer_depth(argument) == 1
-                        && function.params.first().is_some_and(|&var| {
-                            let cv = var_cv(program, ctx, var);
-                            // An abstract pointer declarator may retain the
-                            // written pointee const as its object qualifier.
-                            matches_pointer_cv(cv.pointee_const.or(Some(cv.object_const)))
-                        })))
+                        && matches_pointer_cv(reference.pointee_const)))
         })
 }
 
@@ -26421,7 +26514,6 @@ fn std_move_forward<'t>(
                         && !operand_desc.as_ref().is_some_and(|desc| {
                             incompatible_move_argument(
                                 program,
-                                ctx,
                                 desc,
                                 id,
                                 |parameter| {
@@ -28557,7 +28649,8 @@ fn address_flow_inner(
                         .map(|func| cpp_callee_candidates(program, ctx, source, func, &name, &args))
                         .unwrap_or_default(),
                 };
-                let selected = result_overloads(
+                let selected = select_call_overloads(
+                    OverloadChoice::Result,
                     program,
                     candidates,
                     &args,
@@ -30485,7 +30578,8 @@ fn call_receiver_return_cv(
     let forwarded_receiver = references.is_empty()
         && (receiver_is_const.is_none() || receiver_is_rvalue.is_none())
         && call_has_forwarded_receiver(program, ctx, source, call);
-    let selected = result_overloads(
+    let selected = select_call_overloads(
+        OverloadChoice::Result,
         program,
         candidates,
         &args,
@@ -31657,7 +31751,8 @@ fn arrow_star_overload(
             .iter()
             .any(|&fid| program.symbols.function(fid).ref_qualifier.is_some())
             .then(|| expr_is_rvalue(program, ctx, source, object));
-        result_overloads(
+        select_call_overloads(
+            OverloadChoice::Result,
             program,
             members,
             &[known_arg_type(program, ctx, source, member)],
@@ -37365,6 +37460,36 @@ mod from_this_traversal_tests {
 #[cfg(test)]
 mod member_function_tests {
     use super::*;
+
+    #[test]
+    fn move_argument_checks_written_pointer_cv_for_member_parameters() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("main.cpp"),
+            "struct Q {};
+             struct C {
+                 virtual void prototype(Q*&&) = 0;
+                 void definition(const Q*&) {}
+             };",
+        )
+        .unwrap();
+        let program = build_program(root.path(), &PreprocessOptions::new()).unwrap();
+        let prototype = program.symbols.resolve_function("C::prototype").unwrap();
+        let definition = program.symbols.resolve_function("C::definition").unwrap();
+        assert!(program.symbols.function(prototype).params.is_empty());
+        assert!(program.symbols.has_this_param(definition));
+        for (id, pointee_const, rvalue) in [(prototype, false, false), (definition, true, true)] {
+            let formal = program.symbols.function(id);
+            let argument = parameter_referent(&program, formal, 0).unwrap();
+            assert!(incompatible_move_argument(
+                &program,
+                argument,
+                id,
+                |cv| cv == Some(pointee_const),
+                || Some(rvalue),
+            ));
+        }
+    }
 
     #[test]
     fn a_member_template_declaring_no_function_is_no_member_function() {

@@ -9,7 +9,7 @@ pub(crate) use target_merge::{merge_linked_units, record_link_targets};
 use trace_ir::CallSiteDetails;
 use trace_ir::{
     same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
-    ReturnFlow, TempKind, TemplateBase, TypeDesc, TypeId, VarId, Variable,
+    ReturnFlow, SymbolTable, TempKind, TemplateBase, TypeDesc, TypeId, VarId, Variable,
 };
 
 /// Per-file indexing result merged into a single [`Program`].
@@ -1919,6 +1919,7 @@ fn respelled_declarations(
                         && f.ref_qualifier == declaration.ref_qualifier
                         && f.is_member_template == declaration.is_member_template
                         && arity(f) == arity(declaration)
+                        && SymbolTable::references_alike(f, declaration)
                 })
                 .collect();
             let only = |same: &dyn Fn(TypeId, TypeId) -> bool| {
@@ -2758,6 +2759,7 @@ mod tests {
                 pack_positions: Vec::new(),
                 is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
                 is_free_function_template: false,
                 is_member_template: false,
@@ -2848,6 +2850,7 @@ mod tests {
             pack_positions: Vec::new(),
             is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
             is_member_template: false,
@@ -2985,6 +2988,7 @@ mod tests {
             pack_positions: Vec::new(),
             is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
             is_member_template: false,
@@ -3102,6 +3106,7 @@ mod tests {
                 pack_positions: Vec::new(),
                 is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
                 is_free_function_template: false,
                 is_member_template: false,
@@ -3182,6 +3187,7 @@ mod tests {
             pack_positions: Vec::new(),
             is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
             is_member_template: false,
@@ -3429,6 +3435,7 @@ mod tests {
             pack_positions: Vec::new(),
             is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
             is_member_template: false,
@@ -3686,6 +3693,7 @@ mod tests {
                 pack_positions: Vec::new(),
                 is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
                 is_free_function_template: false,
                 is_member_template: false,

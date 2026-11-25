@@ -275,6 +275,8 @@ impl FnModel {
 #[derive(Debug, Default, Clone)]
 pub struct FnModelSet {
     by_name: FxHashMap<String, FnModel>,
+    /// Built-in models for C APIs that can share a name with C++ overloads.
+    c_api_models: FxHashSet<String>,
     /// Class → the model registered for its constructor (`C` → `C::C`).
     constructors: FxHashMap<String, String>,
     /// Member name → the qualified models of that name (`PostTask` →
@@ -402,10 +404,27 @@ impl FnModelSet {
         ] {
             reg(name, vec![Effect::Entry { context }]);
         }
-        reg("epoll_ctl", vec![Effect::EpollRegister { param: 3 }]);
-        for name in ["epoll_wait", "epoll_pwait", "epoll_pwait2"] {
-            reg(name, vec![Effect::EpollWait { param: 1 }]);
+        for n in [
+            "malloc",
+            "calloc",
+            "zalloc",
+            "kmalloc",
+            "OsalMemAlloc",
+            "OsalMemCalloc",
+        ] {
+            reg(n, vec![Effect::ReturnHeap]);
         }
+        reg(
+            "realloc",
+            vec![Effect::ReturnAlias { param: 0 }, Effect::ReturnHeap],
+        );
+        for n in ["dlsym", "dlvsym", "GetProcAddress"] {
+            reg(n, vec![Effect::Dlsym { name_param: 1 }]);
+        }
+        let mut reg = |name: &str, effects| {
+            set.register(FnModel::new(name, effects));
+            set.c_api_models.insert(name.to_owned());
+        };
         for n in ["memcpy", "memmove", "strcpy", "strncpy"] {
             reg(n, vec![Effect::MemCopy { dst: 0, src: 1 }]);
         }
@@ -423,22 +442,13 @@ impl FnModelSet {
         for n in ["memset", "memset_s"] {
             reg(n, vec![Effect::Clears { param: 0 }]);
         }
-        for n in [
-            "malloc",
-            "calloc",
-            "zalloc",
-            "kmalloc",
-            "OsalMemAlloc",
-            "OsalMemCalloc",
+        for (name, effect) in [
+            ("epoll_ctl", Effect::EpollRegister { param: 3 }),
+            ("epoll_wait", Effect::EpollWait { param: 1 }),
+            ("epoll_pwait", Effect::EpollWait { param: 1 }),
+            ("epoll_pwait2", Effect::EpollWait { param: 1 }),
         ] {
-            reg(n, vec![Effect::ReturnHeap]);
-        }
-        reg(
-            "realloc",
-            vec![Effect::ReturnAlias { param: 0 }, Effect::ReturnHeap],
-        );
-        for n in ["dlsym", "dlvsym", "GetProcAddress"] {
-            reg(n, vec![Effect::Dlsym { name_param: 1 }]);
+            reg(name, vec![effect]);
         }
         set
     }
@@ -500,6 +510,7 @@ impl FnModelSet {
     }
 
     pub fn register(&mut self, model: FnModel) {
+        self.c_api_models.remove(&model.name);
         if let Some((class, last)) = model.name.rsplit_once("::") {
             if class.rsplit("::").next() == Some(last) {
                 self.constructors
@@ -665,6 +676,17 @@ impl<'m> ModelLookup<'m> {
     pub fn model(&self, name: &str, group: EffectGroup) -> Option<&'m FnModel> {
         self.find(name, group, |model| model.has(group).then_some(()))
             .map(|(model, ())| model)
+    }
+
+    pub(crate) fn argument_model(&self, callee: &trace_ir::Function) -> Option<&'m FnModel> {
+        let model = self.model(&callee.name, EffectGroup::Args)?;
+        // Calls without a declaration may still name a C API outside the
+        // index. A declared C++ overload has its own linker symbol.
+        (!(callee.is_cpp
+            && !callee.c_linkage
+            && callee.explicit_arity.is_some()
+            && self.models.c_api_models.contains(&model.name)))
+        .then_some(model)
     }
 
     /// The `entry` model the function named `name` is the member of or an

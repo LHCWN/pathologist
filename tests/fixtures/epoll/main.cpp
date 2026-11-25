@@ -46,12 +46,22 @@ void only_wait(int epfd) {
 }
 // Qualified lookalikes must not take the libc model.
 namespace other {
+struct Tag {};
 int epoll_wait(int, epoll_event *, int, int);
+int epoll_pwait(int, epoll_event *, int, int, const void *);
 void wait_events(int epfd) {
     epoll_event events[8];
     other::epoll_wait(epfd, events, 8, -1);
     LevelHandler *handler = (LevelHandler *)events[0].data.ptr;
     handler->handler(handler->data, events[0].events);
+}
+}
+
+int epoll_pwait(other::Tag, epoll_event *);
+namespace other {
+void wait_overload(Tag tag) {
+    epoll_event events[8];
+    epoll_pwait(tag, events);
 }
 }
 

@@ -59,6 +59,10 @@ take the `memset` model, while a class's or namespace's own
 `SecureBuffer::memset`, `Pool::memcpy`, `secure::memset` or bodyless
 `Arena::malloc` take none of the libc models (no terminator, no copy, no fresh
 heap), and rule 4 still applies to them.
+The built-in libc memory, string, and epoll argument effects also check
+language linkage for known C++ declarations. ADL can find a global C++
+overload with the same name and still keep its ordinary call edge. Undeclared
+callees and explicitly configured models can still match by name.
 
 Not matched: a member a subclass inherits from a base the unit never declares,
 called bare in the subclass's body (`PostTask(f)` inside a subclass of
@@ -109,8 +113,10 @@ does `return_field` for a static member.
 ### Epoll event data
 
 `epoll_ctl` registers argument 3; `epoll_wait`, `epoll_pwait` and
-`epoll_pwait2` receive into argument 1. The solver connects each registered
-event pointer to each receiving buffer with the same whole-object aliasing
+`epoll_pwait2` receive into argument 1. These effects follow the built-in C API
+linkage rules in [Model matching](#model-matching).
+The solver connects each registered event pointer to each receiving buffer
+with the same whole-object aliasing
 approximation as `mem_copy`. Registration retains the actual pointer, including
 `&local_event`; a decayed local event array denotes its own storage. Receiving
 `&buffer` arguments name the buffer's value node. Wiring immediately propagates

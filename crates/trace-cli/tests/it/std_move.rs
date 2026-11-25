@@ -1276,3 +1276,273 @@ void imported() { using std::move; take(move(1)); }
         assert_reference_target(&p, &a, caller, "take", true);
     }
 }
+
+#[test]
+fn pointer_values_and_references_have_distinct_declarations() {
+    let (p, _) = analyze(
+        r#"
+struct T {};
+void one(T*);
+void one(T*&&);
+void two(T*&, T*);
+void two(T*&, T*&&);
+void one(T*&&) {}
+void two(T*&, T*&&) {}
+"#,
+    );
+    for (name, slot) in [("one", 0), ("two", 1)] {
+        let functions: Vec<_> = p
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .collect();
+        assert_eq!(functions.len(), 2, "{functions:?}");
+        let defined = functions.iter().find(|f| f.is_defined).unwrap();
+        assert!(defined.parameter_references[slot].unwrap().rvalue);
+        let declared = functions.iter().find(|f| !f.is_defined).unwrap();
+        assert!(declared.parameter_references.get(slot).is_none());
+    }
+}
+
+#[test]
+fn member_edges_rank_known_arguments_alongside_unknown_arguments() {
+    let (p, a) = analyze(
+        r#"
+struct T {};
+struct C {
+    void f(T&&, int, int) & {}
+    void f(T&&, int, double) & {}
+    void implicit(T& t) { f(std::move(t), opaque(), 5); }
+    void qualified(T& t) { C::f(std::move(t), opaque(), 5); }
+};
+void explicit_receiver(C& c, T& t) { c.f(std::move(t), opaque(), 5); }
+"#,
+    );
+    for caller in ["explicit_receiver", "C::implicit", "C::qualified"] {
+        let lines: Vec<_> = a
+            .call_edges
+            .iter()
+            .filter_map(|edge| {
+                let f = p.symbols.function_by_id(edge.callee)?;
+                (p.symbols.function(edge.caller).name == caller && f.name == "C::f")
+                    .then_some(f.span.line)
+            })
+            .collect();
+        assert_eq!(lines, [4], "{caller}");
+    }
+}
+
+#[test]
+fn copy_initialization_does_not_emit_bodyless_constructor_calls() {
+    let (p, a) = analyze(
+        r#"
+struct T {
+    T(const T&) {}
+    T(T&&) = default;
+};
+struct U {
+    U(const U&) = default;
+    U(U&&) {}
+};
+void defaulted_move(T& x) { T y = std::move(x); }
+void written_copy(T& x) { T y = x; }
+void defaulted_copy(U& x) { U y = x; }
+void written_move(U& x) { U y = std::move(x); }
+"#,
+    );
+    for (caller, ctor) in [("defaulted_move", "T::T"), ("defaulted_copy", "U::U")] {
+        assert!(!has_any_edge(&p, &a, caller, ctor));
+        assert!(!p
+            .symbols
+            .call_sites
+            .iter()
+            .any(|s| { p.symbols.function(s.caller).name == caller && s.callee_name == ctor }));
+    }
+    assert_reference_target(&p, &a, "written_copy", "T::T", false);
+    assert_reference_target(&p, &a, "written_move", "U::U", true);
+}
+
+#[test]
+fn reference_parameters_preserve_alias_qualification() {
+    let (p, a) = analyze(
+        r#"
+using I = int;
+using CI = const int;
+using Ptr = int*;
+using CPtr = int* const;
+void take(I&) {}
+void take(const I&) {}
+void same(I&);
+void same(CI&) {}
+void pointer(Ptr&) {}
+void pointer(CPtr&) {}
+void nested(Ptr*&) {}
+void run(I& x, const I& cx, Ptr p, CPtr cp) {
+    take(std::forward<I&>(x));
+    take(std::forward<const I&>(cx));
+    pointer(std::forward<Ptr&>(p));
+    pointer(std::forward<CPtr&>(cp));
+}
+"#,
+    );
+    for name in ["take", "same", "pointer"] {
+        let mut qualifiers: Vec<_> = p
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .map(|f| f.parameter_references[0].unwrap().is_const)
+            .collect();
+        qualifiers.sort();
+        assert_eq!(qualifiers, [Some(false), Some(true)], "{name}");
+    }
+    for (line, expected) in [(14, false), (15, true), (16, false), (17, true)] {
+        let form: Vec<_> = a
+            .call_edges
+            .iter()
+            .filter_map(|edge| {
+                let site = p.symbols.call_site_by_id(edge.call_site)?;
+                let f = p.symbols.function_by_id(edge.callee)?;
+                (site.span.line == line && matches!(f.name.as_str(), "take" | "pointer"))
+                    .then(|| f.parameter_references[0].unwrap().is_const)
+            })
+            .collect();
+        assert_eq!(form, [Some(expected)], "line {line}");
+    }
+    let nested = p
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "nested")
+        .unwrap();
+    assert_eq!(nested.parameter_references[0].unwrap().pointee_const, None);
+}
+
+#[test]
+fn forwarding_with_decltype_of_auto_rvalue_reference_uses_collapsed_binding() {
+    let (p, a) = analyze(
+        r#"
+struct T {
+    T(const T&) {}
+    T(T&&) {}
+    void f() & {}
+    void f() && {}
+};
+void sink(T&) {}
+void sink(T&&) {}
+void from_lvalue(T& t) {
+    auto&& r = t;
+    std::forward<decltype(r)>(r).f();
+    sink(std::forward<decltype(r)>(r));
+    T copy = std::forward<decltype(r)>(r);
+}
+void from_rvalue(T& t) {
+    auto&& r = std::move(t);
+    std::forward<decltype(r)>(r).f();
+    sink(std::forward<decltype(r)>(r));
+    T moved = std::forward<decltype(r)>(r);
+}
+"#,
+    );
+    for (caller, rvalue) in [("from_lvalue", false), ("from_rvalue", true)] {
+        assert_reference_target(&p, &a, caller, "sink", rvalue);
+        assert_reference_target(&p, &a, caller, "T::T", rvalue);
+        let categories: Vec<_> = a
+            .call_edges
+            .iter()
+            .filter_map(|edge| {
+                let f = p.symbols.function_by_id(edge.callee)?;
+                (p.symbols.function(edge.caller).name == caller && f.name == "T::f")
+                    .then_some(f.ref_qualifier)
+            })
+            .collect();
+        assert_eq!(categories, [Some(rvalue)], "{caller}");
+    }
+}
+
+#[test]
+fn respelled_internal_declarations_only_match_their_own_reference_overload() {
+    let (p, a) = analyze(
+        r#"
+struct T {};
+static void take(const T&);
+static void take(T&&) {}
+void run(const T& t) { take(std::forward<const T&>(t)); }
+"#,
+    );
+    let overloads: Vec<_> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "take")
+        .collect();
+    assert_eq!(overloads.len(), 2, "{overloads:?}");
+    assert_reference_target(&p, &a, "run", "take", false);
+}
+
+#[test]
+fn template_reference_parameters_shadow_outer_type_aliases() {
+    let (p, _) = analyze(
+        r#"
+using P = const int;
+using R = int&;
+template<class P> void same(P&);
+template<class Q> void same(Q&) {}
+template<class R> void move_only(R&&);
+template<class Q> void move_only(Q&&) {}
+"#,
+    );
+    for (name, rvalue) in [("same", false), ("move_only", true)] {
+        let overloads: Vec<_> = p
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .collect();
+        assert_eq!(overloads.len(), 1, "{overloads:?}");
+        assert!(overloads[0].is_defined);
+        assert_eq!(overloads[0].parameter_references[0].unwrap().rvalue, rvalue);
+    }
+}
+
+#[test]
+fn implicitly_deleted_defaulted_move_preserves_copy_edge() {
+    let (p, a) = analyze(
+        r#"
+struct Member {
+    Member(const Member&) {}
+    Member(Member&&) = delete;
+};
+struct Owner {
+    Member items[2];
+    Owner(const Owner& other) : items{other.items[0], other.items[1]} {}
+    Owner(Owner&&) = default;
+};
+struct Derived : Member {
+    Derived(const Derived& other) : Member(other) {}
+    Derived(Derived&&) = default;
+};
+struct Simple { int value; };
+struct Movable {
+    Simple member;
+    Movable(const Movable&) {}
+    Movable(Movable&&) = default;
+};
+struct Deleted {
+    Member member;
+    Deleted(const Deleted& other) : member(other.member) {}
+    Deleted(Deleted&&) = delete;
+};
+void copy_member(Owner& owner) { Owner dst = std::move(owner); }
+void copy_base(Derived& derived) { Derived dst = std::move(derived); }
+void simple_move(Movable& movable) { Movable dst = std::move(movable); }
+// Keep the explicitly deleted overload in selection for this ill-formed call.
+void explicit_delete(Deleted& deleted) { Deleted dst = std::move(deleted); }
+"#,
+    );
+    assert_reference_target(&p, &a, "copy_member", "Owner::Owner", false);
+    assert_reference_target(&p, &a, "copy_base", "Derived::Derived", false);
+    assert!(!has_any_edge(&p, &a, "simple_move", "Movable::Movable"));
+    assert!(!has_any_edge(&p, &a, "explicit_delete", "Deleted::Deleted"));
+}

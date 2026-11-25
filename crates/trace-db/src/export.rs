@@ -2103,6 +2103,7 @@ mod tests {
                 pack_positions: Vec::new(),
                 is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
                 is_free_function_template: false,
                 is_member_template: false,

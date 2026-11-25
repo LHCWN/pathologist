@@ -724,6 +724,15 @@ fn epoll_registration_reaches_wait_dispatch() {
         },
     );
     assert!(with.solve.converged);
+    let overload_targets: Vec<_> = with
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "other::wait_overload")
+        .map(|edge| program.symbols.function(edge.callee))
+        .collect();
+    assert_eq!(overload_targets.len(), 1);
+    assert_eq!(overload_targets[0].name, "epoll_pwait");
+    assert!(overload_targets[0].is_cpp && !overload_targets[0].c_linkage);
     let registration = program
         .symbols
         .call_sites
@@ -916,4 +925,51 @@ fn alias_models_accept_precise_members_but_reject_container_fallbacks() {
             );
         }
     }
+}
+
+#[test]
+fn adl_overloads_do_not_take_builtin_libc_models() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+using size_t = decltype(sizeof(0));
+struct Tag {};
+void memcpy(Tag*, Tag*) {}
+extern "C" void *memcpy(void *, const void *, size_t);
+namespace app {
+void memcpy(int);
+Tag tag;
+Tag* destination;
+Tag* source = &tag;
+void copy() { memcpy(destination, source); }
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let targets: Vec<_> = result
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "app::copy")
+        .map(|edge| program.symbols.function(edge.callee))
+        .collect();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].name, "memcpy");
+    assert!(targets[0].is_cpp && !targets[0].c_linkage);
+    let destination = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "destination")
+        .unwrap();
+    assert!(result
+        .points_to
+        .get(&pag.var_node[&destination.id])
+        .is_none_or(|pts| pts.is_empty()));
 }
