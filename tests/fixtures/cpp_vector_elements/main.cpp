@@ -287,6 +287,107 @@ void isolated(unsigned i) {
     callbacks[i]();
 }
 
+void range_for_typed() {
+    std::vector<Callback> callbacks;
+    callbacks.push_back(alpha);
+    for (Callback cb : callbacks) { cb(); }
+}
+
+void range_for_placeholder() {
+    std::vector<Callback> callbacks;
+    callbacks.push_back(beta);
+    for (auto cb : callbacks) { cb(); }
+}
+
+void range_for_unknown_index() {
+    std::vector<Callback> callbacks;
+    callbacks.push_back(alpha);
+    callbacks.emplace_back(&beta);
+    for (Callback cb : callbacks) { cb(); }
+}
+
+void range_for_isolated() {
+    std::vector<Callback> callbacks = {alpha};
+    std::vector<Callback> other = {unrelated};
+    for (Callback cb : callbacks) { cb(); }
+}
+
+void range_for_after_clear() {
+    std::vector<Callback> callbacks;
+    callbacks.push_back(alpha);
+    callbacks.clear();
+    for (Callback cb : callbacks) { cb(); }
+}
+
+void range_for_shadowed() {
+    std::vector<Callback> callbacks = {alpha};
+    for (Callback callbacks : callbacks) { callbacks(); }
+}
+
+#define RANGE_CONTAINER callbacks
+void ignored_range_macro() {
+    std::vector<Callback> callbacks = {alpha};
+    for (Callback cb : RANGE_CONTAINER) { cb(); }
+}
+
+struct RangeHolder {
+    std::vector<Callback> slots;
+};
+
+void range_for_field() {
+    RangeHolder holder;
+    holder.slots.push_back(beta);
+    for (Callback cb : holder.slots) { cb(); }
+}
+
+#define RANGE_MEMBER slots
+struct IgnoredRangeHolder {
+    std::vector<Callback> slots;
+};
+
+void ignored_range_field_macro() {
+    IgnoredRangeHolder holder;
+    holder.slots.push_back(alpha);
+    for (Callback cb : holder.RANGE_MEMBER) { cb(); }
+}
+
+#define SELECT_NESTED nested
+struct NestedRangeHolder {
+    struct Inner { std::vector<Callback> entries; };
+    Inner nested;
+};
+
+void ignored_nested_range_macro() {
+    NestedRangeHolder holder;
+    holder.nested.entries.push_back(alpha);
+    for (Callback cb : holder.SELECT_NESTED.entries) { cb(); }
+}
+
+namespace range_const {
+struct Target {
+    void run() {}
+    void run() const {}
+};
+
+void dispatch() {
+    std::vector<const Target*> targets;
+    for (auto target : targets) { target->run(); }
+}
+} // namespace range_const
+
+namespace overload_range {
+struct Sink {
+    void use(void (*cb)()) { cb(); }
+    void use(long*) { unrelated(); }
+};
+
+void dispatch() {
+    Sink sink;
+    std::vector<Callback> callbacks = {alpha};
+    for (auto cb : callbacks) { sink.use(cb); }
+}
+} // namespace overload_range
+
 void unevaluated(unsigned i) {
     std::vector<Callback> callbacks = {alpha};
     (void)noexcept(callbacks.push_back(unrelated));
@@ -296,6 +397,14 @@ void unevaluated(unsigned i) {
 
 struct Handler { void run() {} };
 struct OtherHandler { void run() {} };
+
+void range_for_pointer() {
+    Handler item;
+    OtherHandler other_item;
+    std::vector<Handler*> handlers;
+    handlers.push_back(&item);
+    for (Handler* h : handlers) { h->run(); }
+}
 
 void element_type_in_declaration_scope(unsigned i) {
     using Element = Callback;

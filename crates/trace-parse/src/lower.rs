@@ -14704,10 +14704,28 @@ fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: 
     }
     let placeholder = is_placeholder_type(ctx, type_node);
     let type_id = parse_type_node(program, ctx, source, type_node);
-    let element = node
-        .cached_field("right")
+    let range = node.cached_field("right").map(peel_expression);
+    // The range is evaluated before the loop variable exists. Resolve its
+    // element source now so `for (Callback callbacks : callbacks)` still
+    // names the outer container rather than the variable being declared.
+    let range_source = range.and_then(|range| range_source(program, ctx, source, range));
+    // Prefer the resolved element descriptor for `auto`, which carries a
+    // function-pointer alias the spelling walk leaves unknown; fall back to
+    // the spelling lookup for unmodeled ranges and arrays.
+    let element = range
         .filter(|_| placeholder)
-        .and_then(|range| range_element_desc(program, ctx, source, range));
+        .and_then(|range| match &range_source {
+            Some(RangeSource::Container(elements)) => Some(elements.element().clone()),
+            _ => range_element_desc(program, ctx, source, range),
+        });
+    // The element descriptors drop cv, which the container model records
+    // separately. Carry the pointee constness onto the deduced variable so a
+    // `for (auto h : std::vector<const T*>)` call selects `T`'s const member.
+    let range_cv = match &range_source {
+        Some(RangeSource::Container(elements)) => Some(elements.cv(program)),
+        _ => None,
+    };
+    let binds_reference = decl.cached_kind() == "reference_declarator";
     let ty = deduced_local_type(program, type_id, decl, element);
     let var = lower_one_declarator(
         program,
@@ -14723,11 +14741,25 @@ fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: 
     );
     forget_placeholder_alias(ctx, type_node, var);
     if let Some(var) = var {
-        flow_range_element(program, ctx, source, node, var);
+        if let (Some(range), Some(range_source)) = (range, range_source) {
+            flow_range_element(program, ctx, source, range, range_source, var);
+        }
+        if placeholder {
+            if let Some(cv) = range_cv {
+                let qualifications = ctx.var_qualifications.entry(var).or_default();
+                // A by-value `auto` drops top-level const; a reference keeps
+                // it. Pointee constness applies to both.
+                qualifications.object_const |= binds_reference && cv.object_const;
+                qualifications.pointee_const =
+                    match (qualifications.pointee_const, cv.pointee_const) {
+                        (Some(existing), Some(incoming)) => Some(existing || incoming),
+                        (existing, incoming) => existing.or(incoming),
+                    };
+            }
+        }
         // A reference bound to the elements of a const range (`auto &e : a`
         // over `const T a[2]`) refers to const objects; a by-value variable
         // copies them into mutable ones.
-        let binds_reference = decl.cached_kind() == "reference_declarator";
         if placeholder
             && binds_reference
             && node.cached_field("right").is_some_and(|range| {
@@ -14739,19 +14771,54 @@ fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: 
     }
 }
 
-/// The element a range-for variable starts as, for a range naming an array
-/// variable: read from the array summary, as `x = arr[i]` reads it.
-/// Containers have no element model.
-fn flow_range_element(
+/// Where a range-for loop reads its elements from, resolved before the loop
+/// variable enters scope.
+enum RangeSource {
+    Array(VarId),
+    Container(container_elements::Elements),
+}
+
+/// Whether a range expression is spelled through an ignored macro. A field
+/// range (`holder.RANGE_MEMBER`, `outer.SELECT_NESTED.entries`) starts at the
+/// object, so every field token on the receiver chain has its own provenance
+/// checked, as member-call lowering does.
+fn range_is_from_ignored_macro(ctx: &LowerContext, range: Node) -> bool {
+    let mut node = range;
+    loop {
+        if node_is_from_ignored_macro(ctx, node) {
+            return true;
+        }
+        if node.cached_kind() != "field_expression" {
+            return false;
+        }
+        if node
+            .cached_field("field")
+            .is_some_and(|field| node_is_from_ignored_macro(ctx, field))
+        {
+            return true;
+        }
+        let Some(argument) = node.cached_field("argument") else {
+            return false;
+        };
+        node = peel_expression(argument);
+    }
+}
+
+/// Resolve an array summary or an iterable modeled container's element
+/// summary for `range`. The caller must run this before declaring the loop
+/// variable so a shadowing name still names the outer range.
+fn range_source(
     program: &mut Program,
     ctx: &mut LowerContext,
     source: &str,
-    node: Node,
-    var: VarId,
-) {
-    let Some(range) = node.cached_field("right").map(peel_expression) else {
-        return;
-    };
+    range: Node,
+) -> Option<RangeSource> {
+    // The `for` statement may start outside a macro while the range itself is
+    // spelled inside one (`for (T x : RANGE)`); an ignored range macro
+    // suppresses the read the same way an ignored subscript bracket does.
+    if range_is_from_ignored_macro(ctx, range) {
+        return None;
+    }
     if receiver_desc(program, ctx, source, range)
         .is_some_and(|desc| matches!(desc.innermost().0, TypeDesc::Array { .. }))
     {
@@ -14762,13 +14829,31 @@ fn flow_range_element(
         } else {
             None
         };
-        let Some(array) = array else {
-            return;
-        };
-        program.flow.push(FlowConstraint::Copy {
+        return array.map(RangeSource::Array);
+    }
+    container_elements::range_elements(program, ctx, source, range).map(RangeSource::Container)
+}
+
+/// The element a range-for variable starts as: read from the array summary
+/// for an array range, as `x = arr[i]` reads it, or from a modeled
+/// container's element summary for an iterable container range. Anything
+/// else, including map iteration which yields a pair, gets no value flow.
+fn flow_range_element(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    range: Node,
+    range_source: RangeSource,
+    var: VarId,
+) {
+    match range_source {
+        RangeSource::Array(array) => program.flow.push(FlowConstraint::Copy {
             dst: var,
             src: array,
-        });
+        }),
+        RangeSource::Container(elements) => {
+            container_elements::flow_range_element(program, ctx, source, range, elements, var);
+        }
     }
 }
 
@@ -16372,6 +16457,11 @@ fn collect_call_at_node_inner(
                 &cls,
             );
             let targets = member_targets_upward(program, &cls, &kind);
+            let targets = retain_const_viable_members(
+                program,
+                targets,
+                receiver_is_const(program, ctx, source, op.receiver, op.is_arrow),
+            );
             if !targets.is_empty() {
                 emit_member_targets(
                     program,
@@ -16650,6 +16740,15 @@ fn collect_call_at_node_inner(
                             )))
                         };
                         let targets = member_targets_upward(program, &cls, &kind);
+                        let targets = if kind.is_destructor() {
+                            targets
+                        } else {
+                            retain_const_viable_members(
+                                program,
+                                targets,
+                                receiver_is_const(program, ctx, source, recv, op_is_arrow),
+                            )
+                        };
                         if !targets.is_empty() {
                             let call_args = collect_call_args(
                                 program,
@@ -21913,6 +22012,27 @@ fn lower_lambda_expression(
     ctx.locals = saved_locals;
     ctx.class_ctx = saved_class;
     Some(fn_id)
+}
+
+/// Drop member overloads a const receiver cannot call. Static members stay
+/// callable; standard-library const members are handled by their own
+/// declarations. A non-const or unknown receiver keeps every candidate
+/// (may-analysis).
+fn retain_const_viable_members(
+    program: &Program,
+    targets: Vec<FnId>,
+    object_is_const: Option<bool>,
+) -> Vec<FnId> {
+    if object_is_const != Some(true) {
+        return targets;
+    }
+    targets
+        .into_iter()
+        .filter(|&id| {
+            let f = program.symbols.function(id);
+            f.is_static_member || f.is_const_member
+        })
+        .collect()
 }
 
 /// Walk UP the inheritance chain from `cls` until some class declares the

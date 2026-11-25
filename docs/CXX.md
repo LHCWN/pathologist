@@ -220,7 +220,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   (`params` minus implicit `this`, or the arity a parameterless prototype
   declared, within its default arguments; an entry recording neither stays,
   and an empty filtered set falls back to all candidates so varargs still
-  resolve). A
+  resolve). A **const receiver** (a const object, or a pointer or smart
+  pointer to const for `->`) keeps only `const` and `static` member
+  candidates; a non-const or unknown receiver keeps every candidate
+  (may-analysis). A
   `final` class, or a method declared `final`,
   cuts off further subclasses (devirtualization). C++ `struct` inheritance
   and **virtual bases** (`class D : virtual B`) are recorded the same way as
@@ -1246,13 +1249,21 @@ section is the authoritative statement of the rules; lowering
   so they hide an outer name whatever their type. Copy-initialized, one of
   class type gets the destructor site only. A range naming an array
   variable gives the loop variable its elements, read from the array
-  summary as `x = arr[i]` reads them.
+  summary as `x = arr[i]` reads them. A range naming a modeled sequence or
+  set container (`std::vector`, `std::list`, `std::set`, ...) gives it the
+  container's loaded element summary in the same way (the loop variable
+  receives the element value; a reference loop variable is not an alias);
+  map iteration yields a pair and stays a follow-up (see "Container
+  elements").
   Calls through a loop or catch variable resolve by its type:
   - the declared one (`catch (const std::logic_error &e)`,
     `for (Handler *h : hs)`);
-  - for a placeholder (`for (const auto &p : ps)`), the element type of a
-    range typed as a member call's receiver is (a variable, a field, `*p`)
-    when it is an array, or a standard sequence container (`std::vector`,
+  - for a placeholder (`for (const auto &p : ps)`), a modeled container's
+    resolved element descriptor types the variable, so a function-pointer
+    or pointer element keeps its type through overload resolution and
+    member calls; otherwise the spelling-derived element type is used when
+    the range (a variable, a field, or `*p`) is an array, or a standard
+    sequence container (`std::vector`,
     `std::list`, `std::set`, ..., or the bare name under
     `using namespace std;`) whose first template argument names a class,
     cv-qualifiers dropped; under the `auto` rule above, the declarator's
@@ -1349,9 +1360,36 @@ selected insertions to iterators from `find` and `begin`. A local iterator or
 an immediate lookup can read the same cell through `*it`, preserving the
 set's read-only element access.
 
+A `range-for` loop over a named modeled sequence or set container reads the
+same element cell as a subscript: each iteration's variable carries every
+value inserted into that container, so a callback or pointer stored through
+`push_back`, emplacement, assignment, or an initializer list remains
+reachable from the loop body. Named containers stay isolated by variable;
+field-owned containers share their cell by declaring member and element type,
+as below. Array ranges keep the array rule. Map iteration yields a pair, and
+ranges over a reference or pointer to the container remain follow-ups.
+A reference loop variable (`auto &x`) is also filled with the element value
+rather than bound to the element cell, so a write through it does not flow
+back to the container; write-back through reference loop variables is a
+follow-up. Element value flow also requires a container model: placeholder
+typing recognizes additional standard spellings such as `std::multiset`,
+`std::unordered_multiset`, `std::array`, `std::span`, and
+`std::initializer_list`, but without a model their loop variables get no
+element summary. Range element flow itself is limited to the standard
+iterable container models (`std::vector`, `std::deque`, `std::list`,
+`std::forward_list`, `std::array`, `std::span`, `std::set`, `std::unordered_set`,
+and their multiset spellings); a custom `[[container]]` model's `element`
+index does not opt it into iteration. A placeholder variable also carries
+the element's recorded qualification, so `for (auto h : std::vector<const T*>)`
+types `h` as `T const*` and `h->run()` selects `T::run() const`. An ignored
+macro that spells any field on the range's receiver chain
+(`for (T x : outer.SELECT_NESTED.entries)`) suppresses the read.
+
 Follow-ups include container copies, iterator arithmetic and reference
-parameters, range-for value flow, access via pointers or references to the
-container itself, nested containers, and structured bindings. Planned stores
+parameters, write-back through reference loop variables, map iteration (which
+yields a pair), access via pointers or references to the container itself,
+nested containers, structured bindings, and element models for the set-like,
+array, span and initializer-list spellings. Planned stores
 include fill construction, initializer-list assignment and `assign`, and
 `try_emplace`. Pair projections currently cover named standard pairs and direct
 `std::make_pair` calls. Other pair-producing expressions and lists of typed

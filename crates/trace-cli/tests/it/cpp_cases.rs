@@ -55,6 +55,13 @@ fn vector_elements_keep_targets_and_storage_boundaries() {
         ("inserted_member", &["beta"][..]),
         ("initialized_member", &["beta"][..]),
         ("isolated", &["alpha"][..]),
+        ("range_for_typed", &["alpha"][..]),
+        ("range_for_placeholder", &["beta"][..]),
+        ("range_for_unknown_index", &["alpha", "beta"][..]),
+        ("range_for_isolated", &["alpha"][..]),
+        ("range_for_after_clear", &["alpha"][..]),
+        ("range_for_shadowed", &["alpha"][..]),
+        ("range_for_field", &["beta"][..]),
         ("unevaluated", &["alpha"][..]),
         ("invoke", &["beta"][..]),
         ("read_global", &["beta"][..]),
@@ -89,6 +96,18 @@ fn vector_elements_keep_targets_and_storage_boundaries() {
         program,
         &analysis,
         "pointer_element",
+        "OtherHandler::run"
+    ));
+    assert!(has_any_edge(
+        program,
+        &analysis,
+        "range_for_pointer",
+        "Handler::run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "range_for_pointer",
         "OtherHandler::run"
     ));
     assert!(pag
@@ -207,6 +226,52 @@ fn vector_elements_keep_targets_and_storage_boundaries() {
         .map(|(column, _)| column as u32 + 1)
         .collect();
     assert_eq!(macro_sites, brackets);
+}
+
+#[test]
+fn range_for_placeholder_uses_the_modeled_element_type() {
+    let root = fixture("cpp_vector_elements");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(&program);
+    let uses: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "overload_range::dispatch")
+        .filter(|edge| fn_name(&program, edge.callee).ends_with("::use"))
+        .map(|edge| edge.callee)
+        .collect();
+    assert_eq!(uses.len(), 1, "dispatch should select one use overload");
+    let params = fn_param_descs(&program, uses[0]);
+    assert!(
+        params.iter().any(|desc| desc.contains("FnPtr")),
+        "the selected overload takes the callback, not long*: {params:?}"
+    );
+    assert!(has_any_edge(
+        &program,
+        &analysis,
+        "overload_range::Sink::use",
+        "alpha"
+    ));
+}
+
+#[test]
+fn range_for_placeholder_keeps_pointee_constness() {
+    let root = fixture("cpp_vector_elements");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(&program);
+    let runs: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "range_const::dispatch")
+        .filter(|edge| fn_name(&program, edge.callee).ends_with("::run"))
+        .map(|edge| edge.callee)
+        .collect();
+    assert_eq!(
+        runs.len(),
+        1,
+        "dispatch should select the const run overload"
+    );
+    assert!(program.symbols.function(runs[0]).is_const_member);
 }
 
 #[test]
@@ -339,7 +404,12 @@ fn vector_subscripts_resolve_on_the_instantiated_owner() {
 #[test]
 fn ignored_subscript_brackets_suppress_container_reads_and_writes() {
     let root = fixture("cpp_vector_elements");
-    let opts = default_opts(&root).with_ignored_macros(["IGNORED_VECTOR_SLOT".to_owned()]);
+    let opts = default_opts(&root).with_ignored_macros([
+        "IGNORED_VECTOR_SLOT".to_owned(),
+        "RANGE_CONTAINER".to_owned(),
+        "RANGE_MEMBER".to_owned(),
+        "SELECT_NESTED".to_owned(),
+    ]);
     let program = build_program(&root, &opts).unwrap();
     let (_, analysis) = analyze(&program);
     let mut targets = analysis
@@ -356,6 +426,29 @@ fn ignored_subscript_brackets_suppress_container_reads_and_writes() {
         .collect::<Vec<_>>();
     targets.sort_unstable();
     assert_eq!(targets, ["alpha", "std::vector::operator[]"]);
+    // The range expression comes from an ignored macro even though the `for`
+    // statement itself starts outside it.
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "ignored_range_macro",
+        "alpha"
+    ));
+    // The range starts at `holder`, so the ignored field token itself must
+    // suppress the read too.
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "ignored_range_field_macro",
+        "alpha"
+    ));
+    // A macro naming an intermediate field in the receiver chain counts too.
+    assert!(must_not_have_edge(
+        &program,
+        &analysis,
+        "ignored_nested_range_macro",
+        "alpha"
+    ));
 }
 
 #[test]

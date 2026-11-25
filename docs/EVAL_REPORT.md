@@ -1,5 +1,48 @@
 # Evaluation Report
 
+## Container range-for reads and canonical budget - 2026-11-24
+
+A `range-for` over a named modeled sequence or set container now reads the same
+typed, monotone element summary as a subscript, so inserted callbacks and
+pointers remain reachable from the loop body. Named containers stay isolated by
+variable; field-owned containers keep the declaring-member sharing. Map
+iteration, nested containers and structured bindings remain follow-ups, and
+arrays keep the array rule. Tests cover typed and placeholder loop variables,
+unknown-index may-sets, post-`clear` monotonicity, variable and field isolation,
+and pointer-element member calls.
+
+The canonical solver profile no longer pins 850 000 pops. That override
+truncated any corpus whose convergence exceeded it. Canonical runs now use the
+analyzer's derived `800 000 + 6 x PAG constraints` budget, while the default
+profile keeps its 800 000 pin and byte-identical export.
+
+Pinned corpora, canonical profile, release binary, `--jobs 8`:
+
+| Corpus | Measurement | Before | After |
+|---|---|---:|---:|
+| HDF | modeled element cells | 3 | 4 |
+| HiView | modeled element cells | 33 | 35 |
+| Camera | modeled element cells | 7 | 8 |
+| Ability Runtime | modeled element cells | 38 | 39 |
+| Ability Runtime | `edges_total` | 420 602 | 420 591 |
+| Ability Runtime | `edges_direct` | 257 078 | 257 064 |
+| Ability Runtime | `edges_indirect` | 2 533 | 2 536 |
+| Ability Runtime | `arg_flow_edges` | 457 968 | 457 970 |
+
+The Ability Runtime gains are
+`ConnectServerManager::SendInstanceMessageCallback` and
+`ConnectServerManager::AddInstanceCallback`, whose `for (callback : callbacks_)`
+invocations now reach the callbacks their test bodies register. The extra
+element cells are the containers those loops read. A const receiver now keeps
+only const or static member candidates, so the non-const
+`ExtractInsightIntentGenericInfo::get()` no longer joins the 14 const-receiver
+calls; that is the 14-row `edges_direct` decrease. Every other global, site and
+probe is unchanged: the canonical check passes 81/81 and the default profile
+190/190, and HiView canonical compares identical across `--jobs 1` and
+`--jobs 8`. Ability Runtime converges at 977 093 pops within its 4 901 732-pop
+derived budget; the old 850 000 pin stopped short of the fixpoint. See
+[Work budget](POINTERS.md#work-budget).
+
 ## Binder-wrapper interface members during lowering - 2026-11-23
 
 `AppSchedulerHost::HandleScheduleAbilityStage`

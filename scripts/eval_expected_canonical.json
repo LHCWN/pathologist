@@ -1,11 +1,11 @@
 {
-  "note": "Pinned corpora in canonical system-header mode with the embedded models. Recaptured after rebasing onto local master bb64b1e on Windows 11 x64 with MSYS2 MinGW GCC 15.2.0. Header-dependent totals use that toolchain as the reference. Counts include the 2026-11-20 vector specialization audit. The 2026-11-20 binder Host/interface-overload change recaptured the canonical IPC centers: Camera 808 -> 702 and ability_runtime 1762 -> 1641; ability_runtime edges_total 418036 -> 417915 and diagnostics 11944 -> 11945; HDF and HiView IPC counts are unchanged. The 2026-11-23 AAFwk TaskHandlerWrap::SubmitTask/SubmitTaskJust invoke models recaptured ability_runtime edges_total 417915 -> 418405, edges_indirect 2043 -> 2533 and public_edges_total 409148 -> 410574, with the same run reporting diagnostics 11944; the new probe pins AmsMgrScheduler::StartSpecifiedAbility reaching AppMgrServiceInner::StartSpecifiedAbility through its submitted lambda. The 2026-11-23 binder-wrapper member-resolution change recaptured ability_runtime functions_total 89063 -> 88690, functions_external 20414 -> 20041, edges_total 418405 -> 420602, edges_direct 255993 -> 257078, edges_external 158238 -> 159350, arg_flow_edges 455892 -> 457968, public_functions_total 85660 -> 85287 and public_edges_total 410574 -> 412771; diagnostics, IPC and indirect centers are unchanged. See docs/EVAL_REPORT.md.",
+  "note": "Pinned corpora in canonical system-header mode with the embedded models. Recaptured after rebasing onto local master bb64b1e on Windows 11 x64 with MSYS2 MinGW GCC 15.2.0. Header-dependent totals use that toolchain as the reference. Counts include the 2026-11-20 vector specialization audit. The 2026-11-20 binder Host/interface-overload change recaptured the canonical IPC centers: Camera 808 -> 702 and ability_runtime 1762 -> 1641; ability_runtime edges_total 418036 -> 417915 and diagnostics 11944 -> 11945; HDF and HiView IPC counts are unchanged. The 2026-11-23 AAFwk TaskHandlerWrap::SubmitTask/SubmitTaskJust invoke models recaptured ability_runtime edges_total 417915 -> 418405, edges_indirect 2043 -> 2533 and public_edges_total 409148 -> 410574, with the same run reporting diagnostics 11944; the new probe pins AmsMgrScheduler::StartSpecifiedAbility reaching AppMgrServiceInner::StartSpecifiedAbility through its submitted lambda. The 2026-11-23 binder-wrapper member-resolution change recaptured ability_runtime functions_total 89063 -> 88690, functions_external 20414 -> 20041, edges_total 418405 -> 420602, edges_direct 255993 -> 257078, edges_external 158238 -> 159350, arg_flow_edges 455892 -> 457968, public_functions_total 85660 -> 85287 and public_edges_total 410574 -> 412771; diagnostics, IPC and indirect centers are unchanged. `budget_pops` is null so canonical runs use the analyzer's derived pop budget, which scales with the PAG constraint count and reaches a fixpoint instead of truncating at a flat cap (docs/POINTERS.md, Work budget). The range-for container read recaptured the modeled element counts (HDF 3 -> 4, HiView 33 -> 35, Camera 7 -> 8, Ability Runtime 38 -> 39) and ability_runtime edges_total 420602 -> 420605, edges_indirect 2533 -> 2536 and arg_flow_edges 457968 -> 457970, where ConnectServerManager's range-for callback dispatch now reaches its registered callbacks. The range-for pointee-const change recaptured ability_runtime edges_total 420605 -> 420591 and edges_direct 257078 -> 257064: const receivers no longer reach the non-const overload of ExtractInsightIntentGenericInfo::get(). See docs/EVAL_REPORT.md.",
   "analyze_args": [
     "--canonical-system-headers",
     "--compiler",
     "g++"
   ],
-  "budget_pops": 850000,
+  "budget_pops": null,
   "jobs": 8,
   "corpora": {
     "hdf": {
@@ -34,7 +34,7 @@
         {"case": "HdfDeviceLaunchNode", "caller": "%HdfDeviceLaunchNode", "line": 0, "resolution": "indirect", "expected": 127}
       ],
       "probes": [
-        {"name": "Modeled container element cells", "sql": "SELECT COUNT(*) FROM flow_nodes WHERE detail = 'array_summary' AND label LIKE 'elements:%'", "cmp": "exact", "value": 3}
+        {"name": "Modeled container element cells", "sql": "SELECT COUNT(*) FROM flow_nodes WHERE detail = 'array_summary' AND label LIKE 'elements:%'", "cmp": "exact", "value": 4}
       ]
     },
     "hiview": {
@@ -65,7 +65,7 @@
         {"case": "Raw data builder array dispatch", "caller": "%::InitArrayValueParams", "caller_file": "%raw_data_builder.cpp", "line": 425, "resolution": "indirect", "expected": 4}
       ],
       "probes": [
-        {"name": "Modeled container element cells", "sql": "SELECT COUNT(*) FROM flow_nodes WHERE detail = 'array_summary' AND label LIKE 'elements:%'", "cmp": "exact", "value": 33},
+        {"name": "Modeled container element cells", "sql": "SELECT COUNT(*) FROM flow_nodes WHERE detail = 'array_summary' AND label LIKE 'elements:%'", "cmp": "exact", "value": 35},
         {"name": "DecodedEvent array lookup reaches only its four local lambdas", "sql": "SELECT COUNT(*) = 4 AND SUM(t.name GLOB c.name || '::$lambda*') = 4 FROM call_edges e JOIN call_sites s ON s.id = e.call_site_id JOIN functions c ON c.id = e.caller_fn_id JOIN functions t ON t.id = e.callee_fn_id JOIN files p ON p.id = s.file_id WHERE p.path LIKE '%decoded_event.cpp' AND s.line = 162 AND c.name LIKE '%::AppendCustomizedArrayParam' AND e.resolution = 'indirect'", "cmp": "exact", "value": 1},
         {"name": "DecodedEvent scalar lookup reaches only its four local lambdas", "sql": "SELECT COUNT(*) = 4 AND SUM(t.name GLOB c.name || '::$lambda*') = 4 FROM call_edges e JOIN call_sites s ON s.id = e.call_site_id JOIN functions c ON c.id = e.caller_fn_id JOIN functions t ON t.id = e.callee_fn_id JOIN files p ON p.id = s.file_id WHERE p.path LIKE '%decoded_event.cpp' AND s.line = 201 AND c.name LIKE '%::AppendCustomizedParam' AND e.resolution = 'indirect'", "cmp": "exact", "value": 1},
         {"name": "DecodedEvent forwards param to every local lambda", "sql": "SELECT COUNT(DISTINCT a.formal_var_id) FROM arg_flow_edges a JOIN call_sites s ON s.id = a.call_site_id JOIN files p ON p.id = s.file_id JOIN functions c ON c.id = s.caller_fn_id JOIN variables u ON u.id = a.actual_var_id JOIN variables v ON v.id = a.formal_var_id JOIN functions t ON t.id = v.fn_id WHERE p.path LIKE '%decoded_event.cpp' AND s.line IN (162, 201) AND c.name LIKE '%::DecodedEvent::AppendCustomized%Param' AND a.arg_index = 0 AND u.fn_id = c.id AND u.name = 'param' AND v.name = 'param' AND t.name GLOB c.name || '::$lambda*'", "cmp": "exact", "value": 8}
@@ -99,7 +99,7 @@
         {"case": "System NAPI session factory subscript", "caller": "%::createSessionInstanceForSys", "caller_file": "%camera_session_for_sys_napi.cpp", "line": 2419, "resolution": "indirect", "expected": 19}
       ],
       "probes": [
-        {"name": "Modeled container element cells", "sql": "SELECT COUNT(*) FROM flow_nodes WHERE detail = 'array_summary' AND label LIKE 'elements:%'", "cmp": "exact", "value": 7},
+        {"name": "Modeled container element cells", "sql": "SELECT COUNT(*) FROM flow_nodes WHERE detail = 'array_summary' AND label LIKE 'elements:%'", "cmp": "exact", "value": 8},
         {"name": "Device protection map values reach the disconnect callback field", "sql": "SELECT COUNT(*) = 2 AND SUM(t.name IN ('OHOS::CameraStandard::HCameraDevice::DeviceEjectCallBack', 'OHOS::CameraStandard::HCameraDevice::DeviceFaultCallBack')) = 2 FROM call_edges e JOIN call_sites s ON s.id = e.call_site_id JOIN functions t ON t.id = e.callee_fn_id JOIN files p ON p.id = s.file_id WHERE p.path LIKE '%device_protection_ability_connection.cpp' AND s.line = 41 AND e.resolution = 'indirect'", "cmp": "exact", "value": 1}
       ]
     },
@@ -118,12 +118,12 @@
         "functions_total": {"cmp": "exact", "value": 88690},
         "functions_defined": {"cmp": "exact", "value": 68649},
         "functions_external": {"cmp": "exact", "value": 20041},
-        "edges_total": {"cmp": "exact", "value": 420602},
-        "edges_direct": {"cmp": "exact", "value": 257078},
-        "edges_indirect": {"cmp": "exact", "value": 2533},
+        "edges_total": {"cmp": "exact", "value": 420591},
+        "edges_direct": {"cmp": "exact", "value": 257064},
+        "edges_indirect": {"cmp": "exact", "value": 2536},
         "edges_external": {"cmp": "exact", "value": 159350},
         "edges_ipc": {"cmp": "exact", "value": 1641},
-        "arg_flow_edges": {"cmp": "exact", "value": 457968},
+        "arg_flow_edges": {"cmp": "exact", "value": 457970},
         "diagnostics": {"cmp": "exact", "value": 11944},
         "dlsym_edges": {"cmp": "exact", "value": 107},
         "public_functions_total": {"cmp": "band", "value": 85287, "tol": 400},
@@ -131,7 +131,7 @@
       },
       "probes": [
         {"name": "the solver converges within the check's budget (a partial fixpoint silently drops indirect edges, as 800000 pops did for #271)", "sql": "SELECT COUNT(*) FROM diagnostics WHERE stage='analyze' AND message LIKE 'solver stopped early%'", "cmp": "exact", "value": 0},
-        {"name": "Modeled container element cells", "sql": "SELECT COUNT(*) FROM flow_nodes WHERE detail = 'array_summary' AND label LIKE 'elements:%'", "cmp": "exact", "value": 38},
+        {"name": "Modeled container element cells", "sql": "SELECT COUNT(*) FROM flow_nodes WHERE detail = 'array_summary' AND label LIKE 'elements:%'", "cmp": "exact", "value": 39},
         {"name": "App death callback map lookup reaches the registered lambda through both dispatches", "sql": "SELECT COUNT(DISTINCT s.line) FROM call_edges e JOIN call_sites s ON s.id = e.call_site_id JOIN functions t ON t.id = e.callee_fn_id JOIN files p ON p.id = s.file_id WHERE p.path LIKE '%app_recovery_mgr.cpp' AND s.line IN (103, 108) AND t.name GLOB 'OHOS::AAFwk::AbilityManagerService::SetAppDeathRecipient::$lambda*' AND e.resolution = 'indirect'", "cmp": "exact", "value": 2},
         {"name": "an AAFwk task handler's submitted task reaches its callback from the submission site (AmsMgrScheduler::StartSpecifiedAbility -> AppMgrServiceInner::StartSpecifiedAbility)", "sql": "SELECT COUNT(DISTINCT t.id) FROM call_edges e JOIN functions c ON c.id=e.caller_fn_id JOIN functions t ON t.id=e.callee_fn_id WHERE e.resolution='indirect' AND c.name='OHOS::AppExecFwk::AmsMgrScheduler::StartSpecifiedAbility' AND t.name='OHOS::AppExecFwk::AppMgrServiceInner::StartSpecifiedAbility'", "relations": "public", "cmp": "exact", "value": 1}
       ]
