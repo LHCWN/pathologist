@@ -580,6 +580,16 @@ to inherit the previous aliases, supply a list to replace them, or use
 implementations. The built-ins recognize libc++'s `std::__1` owners and
 libstdc++'s `std::__cxx11::list`.
 
+Range iteration is separate from the `element` index: a `range-for` reads the
+element cell only for the standard iterable container names (`std::vector`,
+`std::deque`, `std::list`, `std::forward_list`, `std::array`, `std::span`,
+`std::set`, `std::unordered_set`, and their multiset spellings). Vendor
+inline-namespace spellings such as `std::__1::vector` and
+`std::__cxx11::list`, and a model's declaration aliases, normalize to those
+names. A custom `[[container]]` model's `element` index does not opt it into
+iteration, because that index names a template argument rather than what
+`begin()` yields.
+
 `initializer_entry` selects a zero-based value in each braced entry of an
 initializer list. A `store` operation can use `entry` to select a value from a
 braced argument, as in `map.insert({key, callback})`. A missing template

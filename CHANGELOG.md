@@ -4,6 +4,65 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Use the derived solver budget in canonical evaluation
+
+The canonical evaluation profile pinned `TRACE_SOLVE_BUDGET_POPS=850000`,
+which overrode the analyzer's derived `800 000 + 6 * constraints` pop budget.
+A corpus that converged above that cap produced a budget-truncated database,
+so its call graph was partial even though the analyzer would have reached a
+fixpoint. On the local Ability Runtime checkout the solve now converges at
+977,093 pops inside its 4,901,732-pop derived budget (the pinned cap stopped
+it early).
+
+`scripts/eval_check.py` now pins a budget only when the expectations file sets
+`budget_pops` or `--budget` is passed (`0` = unlimited). The canonical profile
+sets `budget_pops` to `null`, so canonical runs use the derived budget and
+always reach a fixpoint; the default profile keeps its pinned `800_000` for
+byte-identical exports. `scripts/build_pgo.py` omits `--solve-budget-pops` and
+clears an inherited override when no budget is pinned. See
+`docs/POINTERS.md`, "Work budget".
+
+### Track container elements through range-for
+
+Lowering connected a `range-for` variable to an array summary but gave a loop
+over a modeled container no element value. A callback or pointer inserted into
+a `std::vector` (or another modeled sequence or set container) was therefore
+reachable by subscript but not by iteration.
+
+A loop over a named modeled sequence or set container now reads the same typed,
+monotone element summary as a subscript read, so `for (T x : c) x();` reaches
+every compatible inserted callback and pointer elements keep their pointee type
+for member calls. Named containers stay isolated by variable; field-owned
+containers keep the documented declaring-member and element-type sharing. The
+read is flow-insensitive and monotone: `clear`, erasure, and replacement do not
+retract stored values. Arrays keep the array rule. Map iteration (which yields a
+pair), ranges over references or pointers to the container, nested containers,
+and structured bindings remain documented follow-ups. A reference loop variable
+receives the element value rather than aliasing the cell, so write-back through
+it is also a follow-up.
+
+Covered by range-for cases in `tests/fixtures/cpp_vector_elements` for typed and
+placeholder loop variables, unknown-index reads, sequences after `clear`,
+variable and field-owned isolation, pointer-element member calls, and a loop
+variable that shadows the range (`for (Callback callbacks : callbacks)`).
+The range source is resolved before the loop variable enters scope, the read is
+recorded in flow origins at the range expression, and an ignored range macro
+suppresses it even when the `for` statement starts outside the macro.
+Iteration is limited to standard iterable container models, so a custom
+`[[container]]` model's element index does not opt it into range iteration;
+vendor inline-namespace spellings (`std::__1::vector`, `std::__cxx11::list`)
+and declaration aliases are normalized for this gate.
+Placeholder (`auto`) loop variables take the container's resolved element
+descriptor, so a function-pointer element keeps its type through overload
+resolution and a const-pointee element keeps its qualification, selecting the
+const member overload. An ignored macro that supplies a field range's name,
+anywhere on the receiver chain (`holder.RANGE_MEMBER`,
+`outer.SELECT_NESTED.entries`), suppresses the read as well. A member call on
+a const receiver now reaches only const or static overloads; a non-const or
+unknown receiver keeps every candidate.
+
+Pinned canonical corpora gain the modeled element cells their loops read (HDF 3 -> 4, HiView 33 -> 35, Camera 7 -> 8, Ability Runtime 38 -> 39). Ability Runtime also gains three indirect edges and two argument-flow rows because `ConnectServerManager`'s range-for callback dispatch now reaches the callbacks its tests register. The const-receiver rule then removes the non-const `ExtractInsightIntentGenericInfo::get()` from const calls, recapturing ability_runtime edges_total 420602 -> 420591 and edges_direct 257078 -> 257064. The canonical check passes 81/81 and the default profile 190/190; see `docs/EVAL_REPORT.md`.
+
 ## 0.2.0 - 2026-11-23
 
 ### Resolve binder-wrapper interface members during lowering
@@ -1367,7 +1426,7 @@ expansion-only position conflated. See
 ### Solver work budget
 
 The solver's pop budget is no longer a fixed 800 000. The default now derives
-from the PAG's constraint count (`800 000 + 6 × constraints`), so rare-large
+from the PAG's constraint count (`800 000 + 6 * constraints`), so rare-large
 trees reach their real convergence instead of stopping at a partial result
 (ability runtime: 189,675 constraints derive a 1,938,050-pop budget, and the
 solve converges at 1,642,728 pops; the old flat 800 000 cut it off at 451 of

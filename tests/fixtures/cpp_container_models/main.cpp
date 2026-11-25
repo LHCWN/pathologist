@@ -39,6 +39,12 @@ void defaulted_box_dispatch() {
     callbacks.get()();
 }
 
+void custom_box_range() {
+    app::Box<Callback> callbacks;
+    callbacks.put(alpha);
+    for (Callback cb : callbacks) { cb(); }
+}
+
 void deque_dispatch(unsigned i) {
     std::deque<Callback> callbacks;
     callbacks.push_front(alpha);

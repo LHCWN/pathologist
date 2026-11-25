@@ -1602,6 +1602,24 @@ impl Elements {
             .0
     }
 
+    /// The stored element descriptor. Placeholder deduction uses it so an
+    /// `auto` loop variable gets the element type the container model
+    /// resolved, including a function-pointer alias the spelling walk cannot
+    /// classify.
+    pub(super) fn element(&self) -> &TypeDesc {
+        &self.element
+    }
+
+    /// Qualification recorded beside the element descriptor (const object or
+    /// pointee). A range-for variable carries it so overload resolution sees
+    /// `for (auto h : std::vector<const T*>)` as a `T const*`.
+    pub(super) fn cv(&self, program: &Program) -> trace_ir::CvQualification {
+        program
+            .types
+            .template_element_cv(&self.instance)
+            .unwrap_or_default()
+    }
+
     fn address(self, program: &mut Program, dst: VarId) -> trace_ir::TypeId {
         let element = program.types.intern(self.element);
         program.flow.push(FlowConstraint::ContainerElement {
@@ -1994,6 +2012,106 @@ pub(super) fn access<'t>(
     }
     let owner = member_lookup_owner(program, ctx, &elements.instance);
     available(program, ctx, &owner, &method, arity).then_some(Access::Direct(elements))
+}
+
+/// A standard-library class spelling with the inline namespaces libc++ and
+/// the libstdc++ ABI insert (`std::__1::vector`, `std::__cxx11::list`)
+/// removed. Only components directly under `std` are dropped, so a custom
+/// namespace never gains standard-container semantics.
+fn canonical_std_class(name: &str) -> String {
+    let name = name.trim().trim_start_matches("::");
+    let mut parts = name.split("::");
+    let Some(first) = parts.next() else {
+        return String::new();
+    };
+    let mut kept = vec![first];
+    let under_std = first == "std";
+    for part in parts {
+        // Only inline namespaces directly under `std` are ABI tags; once a
+        // real component follows, a later `__…` name is part of the class.
+        if under_std && kept.len() == 1 && is_inline_std_namespace(part) {
+            continue;
+        }
+        kept.push(part);
+    }
+    kept.join("::")
+}
+
+fn is_inline_std_namespace(part: &str) -> bool {
+    matches!(part, "__1" | "__cxx11" | "__debug" | "__ndk1")
+}
+
+/// The range models whose iteration value is their stored element. A custom
+/// `[[container]]` model's `element` index only names a template argument; it
+/// does not promise that `begin()` yields that element, so range iteration
+/// stays off unless the model names one of these standard iterable containers.
+/// Vendor inline-namespace spellings and declaration aliases are normalized,
+/// so a model registered as `std::__1::vector` or reached through an alias
+/// still counts.
+fn iterable_model(model: &ContainerModel) -> bool {
+    let iterable = |class: &str| {
+        matches!(
+            canonical_std_class(class).as_str(),
+            "std::vector"
+                | "std::deque"
+                | "std::list"
+                | "std::forward_list"
+                | "std::array"
+                | "std::span"
+                | "std::set"
+                | "std::multiset"
+                | "std::unordered_set"
+                | "std::unordered_multiset"
+        )
+    };
+    std::iter::once(model.name.as_str())
+        .chain(model.declaration_aliases().iter().map(String::as_str))
+        .any(iterable)
+}
+
+/// The element summary a `range-for` over `range` reads, or `None` when the
+/// range is not an iterable modeled container. Resolve this before the loop
+/// variable is declared so a declaration such as
+/// `for (Callback callbacks : callbacks)` still names the outer container.
+/// The caller (`range_source`) already filters ignored range macros.
+pub(super) fn range_elements(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    range: Node,
+) -> Option<Elements> {
+    if !ctx.is_cpp {
+        return None;
+    }
+    let elements = Elements::for_receiver(program, ctx, source, range)?;
+    let model = ctx.container_models.get(elements.class())?;
+    (model.element == 0 && iterable_model(model)).then_some(elements)
+}
+
+/// Connect a `range-for` variable to an already resolved element summary. The
+/// variable receives what a read of the element cell yields, matching
+/// `x = c[i]`; the load and copy are attributed to the range expression so a
+/// value slice shows where the read happens.
+pub(super) fn flow_range_element(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    range: Node,
+    elements: Elements,
+    var: VarId,
+) {
+    let element = elements.element.clone();
+    lower_operation(program, ctx, source, range, |program, ctx| {
+        let pointer = program.types.ptr_to(element.clone());
+        let ty = program.types.intern(element);
+        let address = alloc_load_temp(program, ctx, range, pointer);
+        elements.address(program, address);
+        let loaded = emit_load(program, ctx, range, address, ty);
+        program.flow.push(FlowConstraint::Copy {
+            dst: var,
+            src: loaded,
+        });
+    });
 }
 
 /// Reuse the type computed by member-call lookup. Only a modeled type can
@@ -2393,5 +2511,51 @@ mod tests {
             builtin_type_spelling("unsigned", &mut qualifiers).as_deref(),
             Some("unsigned int")
         );
+    }
+
+    fn container(name: &str, aliases: Option<&[&str]>) -> ContainerModel {
+        ContainerModel {
+            name: name.to_owned(),
+            declaration_aliases: aliases
+                .map(|aliases| aliases.iter().map(|alias| (*alias).to_owned()).collect()),
+            element: 0,
+            initializer_list: false,
+            initializer_entry: None,
+            initializer_allocator: None,
+            operations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn iterable_models_normalize_vendor_inline_namespaces() {
+        for name in [
+            "std::vector",
+            "::std::vector",
+            "std::__1::vector",
+            "std::__debug::vector",
+            "std::__cxx11::list",
+            "std::__ndk1::deque",
+            "std::__1::__debug::vector",
+        ] {
+            assert!(iterable_model(&container(name, None)), "{name}");
+        }
+        assert!(!iterable_model(&container("std::queue", None)));
+        // Only inline namespaces directly under `std` are dropped.
+        assert!(!iterable_model(&container("app::__1::vector", None)));
+        assert!(!iterable_model(&container("std::__detail::vector", None)));
+        assert!(!iterable_model(&container("std::vector::__1", None)));
+        assert!(!iterable_model(&container("std::foo::__1::vector", None)));
+    }
+
+    #[test]
+    fn iterable_models_accept_a_vendor_alias() {
+        assert!(iterable_model(&container(
+            "app::Cache",
+            Some(&["std::__1::set"])
+        )));
+        assert!(!iterable_model(&container(
+            "app::Cache",
+            Some(&["std::__1::map"])
+        )));
     }
 }

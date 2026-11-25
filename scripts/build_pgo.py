@@ -308,8 +308,15 @@ def run_analysis(binary, case, db, log, env, jobs, budget, timeout, measure=Fals
     db.unlink(missing_ok=True)
     run_env = env.copy()
     run_env["LC_ALL"] = "C"
-    command = [str(binary), "analyze", case["path"], "--require-local-inputs", "--jobs", str(jobs),
-               "--solve-budget-pops", str(budget), "-o", str(db), *case["args"]]
+    command = [str(binary), "analyze", case["path"], "--require-local-inputs", "--jobs", str(jobs)]
+    # No budget means the analyzer's derived default; omit the flag and any
+    # inherited environment override instead of passing a null value.
+    if budget is not None:
+        command += ["--solve-budget-pops", str(budget)]
+    else:
+        # The derived default, not an inherited experiment override.
+        run_env.pop("TRACE_SOLVE_BUDGET_POPS", None)
+    command += ["-o", str(db), *case["args"]]
     if measure:
         prefix = (["/usr/bin/time", "-f",
                    "TRACE_PGO_RSS_KIB=%M TRACE_PGO_USER_S=%U TRACE_PGO_SYSTEM_S=%S TRACE_PGO_WALL_S=%e"]
@@ -452,8 +459,12 @@ def main():
     version = re.search(r"(?:LLVM version|version)\s+(\d+)\.", profdata_version)
     if not version or version[1] != llvm_version.split(".")[0]:
         parser.error(f"llvm-profdata must match rustc LLVM {llvm_version}: {profdata_version}")
-    budget = args.budget if args.budget is not None else expected["budget_pops"]
-    env["TRACE_SOLVE_BUDGET_POPS"] = str(budget)
+    budget = args.budget if args.budget is not None else expected.get("budget_pops")
+    if budget is None:
+        # Use the analyzer's derived budget, which scales with the PAG.
+        env.pop("TRACE_SOLVE_BUDGET_POPS", None)
+    else:
+        env["TRACE_SOLVE_BUDGET_POPS"] = str(budget)
     source = source_identity()
     env["TRACE_BUILD_GIT_SHA"] = source["revision"][:7]
     env["TRACE_BUILD_GIT_DIRTY"] = str(bool(source["status"])).lower()

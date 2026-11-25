@@ -27,10 +27,15 @@ public relations instead, so the projection stays measured.
 
 Exit 0 when every check passes; non-zero otherwise. Uses only the stdlib.
 
+A run pins `TRACE_SOLVE_BUDGET_POPS` when the expectations file sets
+`budget_pops` or `--budget` is given (`0` = unlimited). Otherwise the analyzer's
+derived default, which scales with the PAG constraint count, is used; that is
+what the canonical profile relies on so every corpus reaches a fixpoint.
+
 Usage:
     python3 scripts/fetch_corpora.py      # once: check the pinned corpus revisions out
     python3 scripts/eval_check.py [--bin target/release/trace] [--jobs 8]
-        [--budget 800000] [--outdir /tmp/eval_check] [--expected scripts/eval_expected.json]
+        [--budget POPS] [--outdir /tmp/eval_check] [--expected scripts/eval_expected.json]
         [--corpus-base DIR] [--skip-rev-check] [--allow-dirty]
     python3 scripts/eval_check.py --expected scripts/eval_expected_canonical.json
 """
@@ -281,12 +286,34 @@ def check_probe(db, probe):
         FAILS += 1
 
 
+def solve_budget(expected, explicit):
+    """The pop budget to pin for this run, or None for the derived default.
+
+    An expectations file's `budget_pops` wins, including `0` (unlimited); a
+    `null`/absent value falls back to an explicit `--budget`. With neither, the
+    analyzer derives a budget that scales with the PAG and reaches a fixpoint.
+    """
+    pinned = expected.get("budget_pops")
+    return explicit if pinned is None else pinned
+
+
+def apply_budget_env(env, budget):
+    """Pin the solver pop budget in `env`, or clear an inherited override."""
+    if budget is None:
+        env.pop("TRACE_SOLVE_BUDGET_POPS", None)
+    else:
+        env["TRACE_SOLVE_BUDGET_POPS"] = str(budget)
+    return env
+
+
 def main():
     global FAILS, CHECKS
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default="target/release/trace.exe" if os.name == "nt" else "target/release/trace")
     ap.add_argument("--jobs", type=int, help="override the jobs set in the expectations file (default 8)")
-    ap.add_argument("--budget", type=int, default=800000)
+    ap.add_argument("--budget", type=int, default=None,
+                    help="explicit solver pop budget when the expectations file does not pin one "
+                         "(0 = unlimited; omit to use the analyzer's derived default)")
     ap.add_argument("--outdir", default="/tmp/eval_check")
     ap.add_argument("--expected", default="scripts/eval_expected.json")
     ap.add_argument("--corpus-base",
@@ -312,7 +339,7 @@ def main():
     base = corpus_base(args.corpus_base).resolve()
 
     env = dict(os.environ)
-    env["TRACE_SOLVE_BUDGET_POPS"] = str(expected.get("budget_pops", args.budget))
+    apply_budget_env(env, solve_budget(expected, args.budget))
 
     corpus_names = args.corpora or list(expected["corpora"].keys())
     for corpus in corpus_names:

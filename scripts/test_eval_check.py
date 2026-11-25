@@ -159,5 +159,31 @@ class RelationsTest(unittest.TestCase):
         self.assertEqual(self.probe(2, legacy, relations="public"), 0)
 
 
+class BudgetTest(unittest.TestCase):
+    def test_expectations_pin_wins_over_explicit(self):
+        self.assertEqual(eval_check.solve_budget({"budget_pops": 850000}, 1), 850000)
+
+    def test_zero_expectation_pins_unlimited(self):
+        self.assertEqual(eval_check.solve_budget({"budget_pops": 0}, None), 0)
+
+    def test_null_expectation_falls_back_to_explicit(self):
+        self.assertEqual(eval_check.solve_budget({"budget_pops": None}, 123), 123)
+
+    def test_absent_expectation_falls_back_to_explicit(self):
+        self.assertEqual(eval_check.solve_budget({}, 456), 456)
+
+    def test_no_pin_uses_the_analyzer_default(self):
+        self.assertIsNone(eval_check.solve_budget({}, None))
+        self.assertIsNone(eval_check.solve_budget({"budget_pops": None}, None))
+
+    def test_pinned_budget_is_exported_to_the_environment(self):
+        env = eval_check.apply_budget_env({}, 700000)
+        self.assertEqual(env["TRACE_SOLVE_BUDGET_POPS"], "700000")
+
+    def test_derived_budget_clears_an_inherited_override(self):
+        env = eval_check.apply_budget_env({"TRACE_SOLVE_BUDGET_POPS": "1"}, None)
+        self.assertNotIn("TRACE_SOLVE_BUDGET_POPS", env)
+
+
 if __name__ == "__main__":
     unittest.main()
