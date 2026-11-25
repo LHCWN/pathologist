@@ -557,6 +557,7 @@ fn conditional_compound_arms_keep_one_return_destination_per_call() {
                         dst,
                         callee_name,
                         caller: owner,
+                        ..
                     } if *owner == Some(calls[0].caller) && callee_name == name => Some(*dst),
                     _ => None,
                 })
@@ -704,6 +705,7 @@ fn conditional_and_standalone_comma_values_keep_operand_provenance() {
                     dst,
                     callee_name,
                     caller,
+                    ..
                 } if *caller == Some(owner) && callee_name == name => Some(*dst),
                 _ => None,
             })

@@ -838,6 +838,7 @@ fn export_flow_provenance(
                 dst,
                 callee_name,
                 caller,
+                ..
             } => (
                 *dst,
                 program

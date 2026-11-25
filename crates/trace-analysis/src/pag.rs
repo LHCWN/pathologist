@@ -896,15 +896,18 @@ impl Pag {
                     dst,
                     callee_name,
                     caller,
+                    occurrence,
                 } => {
                     let dst_n = self.var_node_id(*dst);
                     let mut visited = FxHashSet::default();
-                    let candidates =
-                        program
-                            .symbols
-                            .call_return_candidates(*caller, *dst, callee_name);
+                    let candidates = models.return_candidates(
+                        callee_name,
+                        *caller,
+                        *dst,
+                        occurrence.as_deref().copied(),
+                    );
                     let mut any_real = false;
-                    for callee in &candidates {
+                    for callee in candidates.iter() {
                         if self.expand_return_flows(program, dst_n, *callee, models, &mut visited) {
                             any_real = true;
                         }
@@ -915,8 +918,7 @@ impl Pag {
                     // name-resolution maps, so the model is consulted by
                     // call name directly.
                     if !any_real {
-                        if let Some((model, params)) =
-                            models.return_model(callee_name, *caller, *dst, &candidates)
+                        if let Some((model, params)) = models.return_model(callee_name, &candidates)
                         {
                             self.apply_return_model(program, dst_n, model, params);
                             // A file-scope initializer has no call record.
@@ -1087,12 +1089,9 @@ impl Pag {
             }
             if !any_real {
                 for cs in sites {
-                    if let Some((model, params)) = models.return_model(
-                        &cs.callee_name,
-                        Some(caller),
-                        dst_var,
-                        cs.callee_fn_id.as_slice(),
-                    ) {
+                    if let Some((model, params)) =
+                        models.return_model(&cs.callee_name, &program.callees_of(cs))
+                    {
                         self.apply_return_model(program, dst_n, model, params);
                         break;
                     }
@@ -1227,7 +1226,7 @@ impl Pag {
                             result,
                         } => {
                             let inner_candidates =
-                                program.symbols.return_flow_candidates(callee, &callee_name);
+                                models.return_candidates(&callee_name, Some(callee), result, None);
                             let mut inner_applied = false;
                             for inner in inner_candidates.iter().copied() {
                                 if self.expand_returns_in_mode(
@@ -1240,12 +1239,9 @@ impl Pag {
                             // realloc has no tree body): fall back to the
                             // modeled return effects.
                             if !inner_applied && !address {
-                                if let Some((model, params)) = models.return_model(
-                                    &callee_name,
-                                    Some(callee),
-                                    result,
-                                    &inner_candidates,
-                                ) {
+                                if let Some((model, params)) =
+                                    models.return_model(&callee_name, &inner_candidates)
+                                {
                                     inner_applied =
                                         self.apply_return_model(program, dst, model, params);
                                 }

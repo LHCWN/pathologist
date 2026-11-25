@@ -1588,3 +1588,27 @@ fn defaulted_move_checks_each_shared_subobject_layout_once() {
     assert_edge(&p, &a, "run", "std::move");
     assert!(!has_any_edge(&p, &a, "run", "Owner::Owner"));
 }
+
+#[test]
+fn const_subobjects_need_a_viable_copy_to_use_a_defaulted_move() {
+    let (p, a) = analyze(
+        r#"
+int value;
+struct Member { int&& reference; };
+struct Owner {
+    const Member member;
+    Owner(const Owner&) : member{static_cast<int&&>(value)} {}
+    Owner(Owner&&) = default;
+};
+struct Movable {
+    Member member;
+    Movable(const Movable&) : member{static_cast<int&&>(value)} {}
+    Movable(Movable&&) = default;
+};
+void copy(Owner& owner) { Owner dst = std::move(owner); }
+void move(Movable& owner) { Movable dst = std::move(owner); }
+"#,
+    );
+    assert_reference_target(&p, &a, "copy", "Owner::Owner", false);
+    assert!(!has_any_edge(&p, &a, "move", "Movable::Movable"));
+}

@@ -1047,3 +1047,69 @@ void through_return() { Tag* p = forwarded(); }
         assert_eq!(heap, allocates, "{caller}");
     }
 }
+
+#[test]
+fn allocation_models_keep_calls_to_the_same_destination_separate() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {} tag;
+Tag* malloc(Tag*) { return nullptr; }
+namespace std { extern "C" void* malloc(unsigned long); }
+#define ASSIGN(dst, callee, arg) dst = callee(arg)
+void run() {
+    void* p;
+    ASSIGN(p, std::malloc, 8UL);
+    ASSIGN(p, ::malloc, &tag);
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let dst = local_variable(&program, "run", "p");
+    let pointees = &result.points_to[&pag.var_node[&dst]];
+    assert_eq!(pointees.len(), 1, "{pointees:?}");
+    let loc = &pag.locations[pointees.iter().next().unwrap().0 as usize];
+    assert_eq!(loc.kind, trace_analysis::LocKind::Heap);
+}
+
+#[test]
+fn unselected_overload_returns_cannot_suppress_libc_allocation() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {} tag;
+extern "C" void* malloc(unsigned long);
+Tag* malloc(Tag*, int) { return &tag; }
+void run() { void* p = malloc(8UL); }
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let allocators: Vec<_> = result
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "run")
+        .map(|edge| program.symbols.function(edge.callee))
+        .collect();
+    assert_eq!(allocators.len(), 1);
+    assert_eq!(allocators[0].name, "malloc");
+    assert!(allocators[0].c_linkage);
+    let dst = local_variable(&program, "run", "p");
+    let pointees = &result.points_to[&pag.var_node[&dst]];
+    assert_eq!(pointees.len(), 1, "{pointees:?}");
+    let loc = &pag.locations[pointees.iter().next().unwrap().0 as usize];
+    assert_eq!(loc.kind, trace_analysis::LocKind::Heap);
+}

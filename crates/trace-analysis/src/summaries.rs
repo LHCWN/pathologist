@@ -7,9 +7,12 @@
 //! models") for semantics and the configuration format.
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
-use trace_ir::{ContainerModel, ContainerModels, FnId, Function, Program, VarId};
+use trace_ir::{
+    CallOccurrence, ContainerModel, ContainerModels, FnId, Function, Program, TempKind, VarId,
+};
 
 /// One parameter relation of a function model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,6 +647,8 @@ impl FnModel {
     }
 }
 
+type AllocationTargets = FxHashMap<(FnId, VarId, Option<CallOccurrence>), Vec<FnId>>;
+
 /// The one matcher every model lookup of an analysis goes through
 /// (`docs/MODELS.md`, "Model matching"): the model named for the function
 /// (`FnModelSet::named`), else the member models of a class the
@@ -657,7 +662,7 @@ pub struct ModelLookup<'m> {
     /// nearest class first, then by model name.
     member_models: RefCell<FxHashMap<String, Vec<&'m FnModel>>>,
     /// Lowering's selected targets for allocations with a recorded call site.
-    allocation_targets: OnceCell<FxHashMap<(FnId, VarId, &'m str), Vec<FnId>>>,
+    allocation_targets: OnceCell<AllocationTargets>,
 }
 
 impl<'m> ModelLookup<'m> {
@@ -683,35 +688,42 @@ impl<'m> ModelLookup<'m> {
             .then_some(model)
     }
 
-    pub(crate) fn return_model(
+    pub(crate) fn return_candidates(
         &self,
         name: &str,
         caller: Option<FnId>,
         dst: VarId,
+        occurrence: Option<CallOccurrence>,
+    ) -> Cow<'_, [FnId]> {
+        // Canonical lowering can attach an ordinary lookup namespace to an
+        // unqualified call that actually selected a global overload by ADL.
+        let bare = name.rsplit("::").next().unwrap_or(name);
+        let name = if self.is_builtin_allocator(bare) {
+            if let Some(selected) = caller.and_then(|caller| {
+                self.allocation_targets
+                    .get_or_init(|| self.collect_allocation_targets())
+                    .get(&(caller, dst, occurrence))
+            }) {
+                return Cow::Borrowed(selected);
+            }
+            name.trim_start_matches("::")
+        } else {
+            name
+        };
+        Cow::Owned(
+            self.program
+                .symbols
+                .call_return_candidates(caller, dst, name),
+        )
+    }
+
+    pub(crate) fn return_model(
+        &self,
+        name: &str,
         candidates: &[FnId],
     ) -> Option<(&'m FnModel, Option<&'m [VarId]>)> {
         let model = self.model(name, EffectGroup::Return)?;
         let guarded = self.models.c_api_models.contains(&model.name);
-        let selected = guarded
-            .then(|| {
-                self.allocation_targets
-                    .get_or_init(|| self.collect_allocation_targets())
-                    .get(&(caller?, dst, model.name.as_str()))
-            })
-            .flatten();
-        let qualified_candidates;
-        let candidates = if let Some(selected) = selected {
-            selected.as_slice()
-        } else if guarded && candidates.is_empty() && name.starts_with("::") {
-            qualified_candidates = self.program.symbols.call_return_candidates(
-                caller,
-                dst,
-                name.trim_start_matches("::"),
-            );
-            &qualified_candidates
-        } else {
-            candidates
-        };
         let mut eligible = candidates
             .iter()
             .map(|&id| self.program.symbols.function(id))
@@ -726,26 +738,38 @@ impl<'m> ModelLookup<'m> {
         Some((model, params))
     }
 
-    fn collect_allocation_targets(&self) -> FxHashMap<(FnId, VarId, &'m str), Vec<FnId>> {
-        let mut targets = FxHashMap::<_, Vec<_>>::default();
+    fn is_builtin_allocator(&self, name: &str) -> bool {
+        self.models
+            .named(name, EffectGroup::Return)
+            .is_some_and(|model| {
+                self.models.c_api_models.contains(&model.name) && model.has(EffectGroup::Return)
+            })
+    }
+
+    fn collect_allocation_targets(&self) -> AllocationTargets {
+        let mut targets = AllocationTargets::default();
         for site in &self.program.symbols.call_sites {
-            let Some(dst) = site.return_dst.filter(|_| !site.unevaluated) else {
-                continue;
-            };
-            let name = site.callee_fn_id.map_or(site.callee_name.as_ref(), |id| {
-                self.program.symbols.function(id).name.as_str()
-            });
-            let Some(model) = self
-                .models
-                .named(name, EffectGroup::Return)
-                .filter(|model| {
-                    self.models.c_api_models.contains(&model.name) && model.has(EffectGroup::Return)
-                })
+            let Some(dst) = site
+                .return_dst
+                .filter(|_| !site.unevaluated && site.callee_var.is_none())
             else {
                 continue;
             };
+            let spelling = site.callee_name.as_str();
+            // Additional ranked overloads of the same call site append
+            // their numeric ID to the spelling.
+            let name = spelling
+                .rsplit_once("::")
+                .filter(|(_, suffix)| suffix.parse::<u32>().is_ok())
+                .map_or(spelling, |(name, _)| name);
+            if !self.is_builtin_allocator(name) {
+                continue;
+            }
+            let occurrence = (self.program.symbols.variable(dst).temp
+                != Some(TempKind::ReturnedCall))
+            .then(|| site.occurrence());
             targets
-                .entry((site.caller, dst, model.name.as_str()))
+                .entry((site.caller, dst, occurrence))
                 .or_default()
                 .extend(self.program.callees_of(site));
         }

@@ -125,7 +125,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `Store { dst, src }` | store through pointer | `*p = y`, `field = val` |
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
 | `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
-| `CallReturn { dst, callee_name, caller }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer) | `p = GetOps()`; `void *g = GetOps();` |
+| `CallReturn { dst, callee_name, caller, occurrence }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer). Allocation calls in a body record the source occurrence for binding to the selected call site's targets. | `p = GetOps()`; `void *g = GetOps();` |
 | `CallReturnResolved { dst, callee }` | return from an exact selected function | selected free arrow-star overload or post-merge file-scope getter return |
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
@@ -353,6 +353,8 @@ subobjects, lowering also considers the overloads that could win without it.
 An own move-assignment declaration on a subobject can suppress its implicit
 move constructor and delete its implicit copy constructor. The viability
 check reuses the result for layouts reached through multiple subobjects.
+A const class subobject requires a viable copy. A reference field can make
+that copy unavailable when the field is an rvalue reference.
 The call graph records selected user-provided constructors. Reference
 declarations bind directly to the initializer, and same-type prvalues
 construct the destination directly under C++17 copy elision. Same-class assignments record

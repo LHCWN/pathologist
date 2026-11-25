@@ -69,6 +69,8 @@ pub enum FlowConstraint {
         dst: VarId,
         callee_name: String,
         caller: Option<FnId>,
+        /// Identifies an allocator call with a recorded overload selection.
+        occurrence: Option<Box<crate::CallOccurrence>>,
     },
     /// Return from an exact, already-resolved function (not name-only lookup).
     /// Used for selected free operators and after merge when a file-scope

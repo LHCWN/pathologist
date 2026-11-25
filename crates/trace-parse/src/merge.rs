@@ -1603,7 +1603,7 @@ fn merge_unit(
         if !valid_flow(flow) {
             continue;
         }
-        let remapped = remap_flow(flow, &fn_map, &var_map, &type_map);
+        let remapped = remap_flow(flow, &fn_map, &var_map, &type_map, &map_file);
         let shared_body = !shared_vars.is_empty() && flow.vars().any(|v| shared_vars.contains(&v));
         let seen = if shared_body {
             Some(&mut program.dedup.header_flow)
@@ -1952,6 +1952,7 @@ fn remap_flow(
     fn_map: &FxHashMap<FnId, FnId>,
     var_map: &FxHashMap<VarId, VarId>,
     type_map: &[TypeId],
+    map_file: &impl Fn(trace_ir::FileId) -> trace_ir::FileId,
 ) -> FlowConstraint {
     let rv = |v: VarId| var_map.get(&v).copied().unwrap_or(v);
     let rf = |f: FnId| fn_map.get(&f).copied().unwrap_or(f);
@@ -2013,10 +2014,19 @@ fn remap_flow(
             dst,
             callee_name,
             caller,
+            occurrence,
         } => FlowConstraint::CallReturn {
             dst: rv(*dst),
             callee_name: callee_name.clone(),
             caller: caller.map(rf),
+            occurrence: occurrence.as_deref().map(|&occurrence| {
+                let mut occurrence = occurrence;
+                occurrence.span.file = map_file(occurrence.span.file);
+                if let Some(span) = &mut occurrence.expansion_span {
+                    span.file = map_file(span.file);
+                }
+                Box::new(occurrence)
+            }),
         },
         FlowConstraint::CallReturnResolved { dst, callee } => FlowConstraint::CallReturnResolved {
             dst: rv(*dst),
@@ -2272,7 +2282,7 @@ mod tests {
             src: VarId(2),
         };
         assert_eq!(
-            remap_flow(&flow, &FxHashMap::default(), &var_map, &[]),
+            remap_flow(&flow, &FxHashMap::default(), &var_map, &[], &|file| file),
             FlowConstraint::UnwrapPointer {
                 dst: VarId(11),
                 src: VarId(12),

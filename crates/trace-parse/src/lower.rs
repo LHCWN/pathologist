@@ -15344,7 +15344,7 @@ fn lower_copy_initialization(
     };
     let mut selected = select(targets.clone());
     if selected.iter().copied().any(defaulted_move)
-        && !subobjects_have_simple_move(program, &cls, &mut HashMap::default())
+        && !subobjects_have_simple_construction(program, &cls, false, &mut Default::default())
     {
         // An implicitly deleted defaulted move is ignored by overload
         // resolution. Keep the fallback when subobject viability is uncertain.
@@ -15387,12 +15387,14 @@ fn lower_copy_initialization(
 
 /// Prove movability for simple subobjects. Special members, incomplete
 /// layouts, and union variants can require C++ checks the index cannot make.
-fn subobjects_have_simple_move(
+fn subobjects_have_simple_construction(
     program: &Program,
     class: &str,
-    memo: &mut HashMap<String, bool>,
+    copy: bool,
+    memo: &mut [HashMap<String, bool>; 2],
 ) -> bool {
-    if let Some(&simple) = memo.get(class) {
+    let mode = usize::from(copy);
+    if let Some(&simple) = memo[mode].get(class) {
         return simple;
     }
     let Some(ty) = program.types.class_type_id(class) else {
@@ -15403,8 +15405,8 @@ fn subobjects_have_simple_move(
     }
     // A cycle in a partial index cannot establish a viable move. Completed
     // layouts reuse their answer even when reached through multiple fields.
-    memo.insert(class.to_owned(), false);
-    let mut simple_class = |subobject: &str| {
+    memo[mode].insert(class.to_owned(), false);
+    let mut simple_class = |subobject: &str, copy| {
         let subobject = receiver_lookup_name(subobject);
         !program.types.has_declared_constructor(&subobject)
             && !program
@@ -15422,20 +15424,30 @@ fn subobjects_have_simple_move(
                             .is_some_and(|form| form.is_some_and(|reference| reference.rvalue))
                         && takes_own_class(program, id, &subobject)
                 })
-            && subobjects_have_simple_move(program, &subobject, memo)
+            && subobjects_have_simple_construction(program, &subobject, copy, memo)
     };
-    let simple = program.base_names(class).all(&mut simple_class)
+    let simple = program
+        .base_names(class)
+        .all(|base| simple_class(base, copy))
         && program.types.get(ty).layout.fields.values().all(|field| {
             if program.types.field_is_reference(class, &field.name) {
-                return true;
+                // Field metadata does not distinguish lvalue and rvalue
+                // references. The latter delete an implicit copy.
+                return !copy;
             }
             match peel_arrays(program.types.get(field.type_id).desc.as_ref()).0 {
-                TypeDesc::Struct { name, .. } => simple_class(name),
+                TypeDesc::Struct { name, .. } => {
+                    let is_const = program
+                        .types
+                        .field_qualification(class, &field.name)
+                        .is_some_and(|qual| qual.cv.object_const);
+                    simple_class(name, copy || is_const)
+                }
                 TypeDesc::Union { .. } | TypeDesc::Unknown => false,
                 _ => true,
             }
         });
-    *memo.get_mut(class).unwrap() = simple;
+    *memo[mode].get_mut(class).unwrap() = simple;
     simple
 }
 
@@ -17105,6 +17117,11 @@ fn collect_call_at_node(
     }
     if let Some(node) = occurrence_node {
         record_call_occurrence(program, ctx, first_site, node);
+    } else if node_has_expansion_location(ctx, node)
+        && ctx.call_return_dst.borrow().contains_key(&node.id())
+        && resolve_direct_call_name(source, node).is_some_and(|name| is_allocator_name(&name))
+    {
+        record_call_occurrence(program, ctx, first_site, node);
     }
 }
 
@@ -17114,13 +17131,17 @@ fn record_call_occurrence(
     first_site: usize,
     node: Node,
 ) {
-    let occurrence = CallOccurrence {
+    let occurrence = call_occurrence(program, ctx, node);
+    for site in &mut program.symbols.call_sites[first_site..] {
+        site.details_mut().occurrence.get_or_insert(occurrence);
+    }
+}
+
+fn call_occurrence(program: &mut Program, ctx: &LowerContext, node: Node) -> CallOccurrence {
+    CallOccurrence {
         span: node_call_span(program, ctx, node),
         expansion_span: node_expansion_span(program, ctx, node),
         expansion_id: node_expansion_id(ctx, node),
-    };
-    for site in &mut program.symbols.call_sites[first_site..] {
-        site.details_mut().occurrence.get_or_insert(occurrence);
     }
 }
 
@@ -26603,12 +26624,19 @@ fn emit_call_return(
     dst: VarId,
     callee_name: String,
 ) {
+    let occurrence = (ctx.current_fn.is_some() && is_allocator_name(&callee_name))
+        .then(|| Box::new(call_occurrence(program, ctx, call_node)));
     program.flow.push(FlowConstraint::CallReturn {
         dst,
         callee_name,
         caller: ctx.current_fn,
+        occurrence,
     });
     ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
+}
+
+fn is_allocator_name(name: &str) -> bool {
+    matches!(last_segment_of(name), "malloc" | "calloc" | "realloc")
 }
 
 fn is_symbol_lookup_callee(name: &str) -> bool {
