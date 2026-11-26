@@ -1219,10 +1219,16 @@ struct Tag {};
 Tag address_tag;
 Tag* malloc(Tag*) { return &address_tag; }
 }
+namespace identity {
+struct Tag {};
+Tag identity_tag;
+Tag* malloc(Tag*);
+}
 struct Size { operator unsigned long() const { return 8; } };
 void* no_allocation = malloc(&app::tag);
 void* adl_address = malloc(&address::address_tag);
 void* libc_allocation = malloc(8UL);
+void* adl_argument = malloc(&identity::identity_tag);
 namespace inner {
 void* malloc(int, int);
 Size size;
@@ -1231,8 +1237,22 @@ void* adl_allocation = malloc(size);
 "#,
         ),
         (
+            "casts.cpp",
+            r#"
+extern "C" void* malloc(unsigned long);
+struct CastTag {};
+CastTag cast_tag;
+CastTag* malloc(CastTag*) { return &cast_tag; }
+void* cast_allocation = malloc(((unsigned long)8));
+void* cast_address = malloc((CastTag*)&cast_tag);
+"#,
+        ),
+        (
             "overload.cpp",
-            "namespace app { struct Tag {}; Tag* malloc(Tag*) { return nullptr; } }",
+            r#"
+namespace app { struct Tag {}; Tag* malloc(Tag*) { return nullptr; } }
+namespace identity { struct Tag {}; Tag* malloc(Tag* value) { return value; } }
+"#,
         ),
     ]);
     let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
@@ -1252,12 +1272,19 @@ void* adl_allocation = malloc(size);
             .flatten()
     };
     assert_eq!(pointees("no_allocation").count(), 0);
-    let tag = only_variable(&program, "address_tag");
-    assert_eq!(
-        pointees("adl_address").copied().collect::<Vec<_>>(),
-        [pag.var_location[&tag]],
-    );
-    for name in ["libc_allocation", "adl_allocation"] {
+    for (result, object) in [
+        ("adl_address", "address_tag"),
+        ("cast_address", "cast_tag"),
+        ("adl_argument", "identity_tag"),
+    ] {
+        let tag = only_variable(&program, object);
+        assert_eq!(
+            pointees(result).copied().collect::<Vec<_>>(),
+            [pag.var_location[&tag]],
+            "{result}",
+        );
+    }
+    for name in ["libc_allocation", "cast_allocation", "adl_allocation"] {
         let locations: Vec<_> = pointees(name).collect();
         assert_eq!(locations.len(), 1, "{name}");
         assert_eq!(

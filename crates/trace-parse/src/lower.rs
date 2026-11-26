@@ -26657,7 +26657,7 @@ fn std_move_forward<'t>(
 
 fn emit_call_return(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     call_node: Node,
     dst: VarId,
@@ -26686,8 +26686,8 @@ fn emit_call_return(
 }
 
 fn initializer_allocation_binding(
-    program: &Program,
-    ctx: &LowerContext,
+    program: &mut Program,
+    ctx: &mut LowerContext,
     source: &str,
     call: Node,
 ) -> Option<CallReturnBinding> {
@@ -26696,7 +26696,7 @@ fn initializer_allocation_binding(
     let nodes = call_arg_nodes(call);
     let args: Vec<_> = nodes
         .iter()
-        .map(|&arg| known_arg_type(program, ctx, source, arg))
+        .map(|&arg| arg_expr_type(program, ctx, source, arg))
         .collect();
     let candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
     let selected = rank_free_call_overloads(
@@ -26707,7 +26707,30 @@ fn initializer_allocation_binding(
         &move_argument_references(program, ctx, source, call),
         nodes.len(),
     );
-    (!selected.is_empty()).then_some(CallReturnBinding::InitializerDeclarations(selected))
+    if selected.is_empty() {
+        return None;
+    }
+    let mut actuals = collect_call_arg_nodes(program, ctx, source, nodes.iter().copied());
+    let origin = node_expansion_span(program, ctx, call)
+        .unwrap_or_else(|| node_call_span(program, ctx, call));
+    let last = selected.len() - 1;
+    let calls = selected
+        .into_iter()
+        .enumerate()
+        .map(|(index, callee)| {
+            let args = initializer_call_arguments(
+                program,
+                ctx,
+                source,
+                &nodes,
+                callee,
+                actuals.take_for(index == last),
+                origin,
+            );
+            trace_ir::InitializerCall { callee, args }
+        })
+        .collect();
+    Some(CallReturnBinding::InitializerDeclarations(calls))
 }
 
 fn is_allocator_name(name: &str) -> bool {
@@ -28541,6 +28564,69 @@ fn settle_default_call_arguments(program: &mut Program, ctx: &mut LowerContext) 
     ctx.ast_depth = saved_depth;
 }
 
+/// Lower actuals for one selected initializer declaration without a call site.
+fn initializer_call_arguments(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    nodes: &[Node],
+    callee: FnId,
+    actuals: CallArgs,
+    origin: Span,
+) -> Vec<(u32, VarId)> {
+    let actuals = actuals.for_callee(program, ctx, Some(callee), false);
+    let mut args = actuals.var_args;
+    for (index, actual) in &mut args {
+        let node = nodes[*index as usize];
+        if program
+            .symbols
+            .function(callee)
+            .reference_params
+            .get(*index as usize)
+            == Some(&true)
+            && expression_is_lvalue(program, ctx, source, node)
+        {
+            let type_id = program
+                .types
+                .ptr_to(expression_desc(program, ctx, source, node));
+            let address = RhsDst::Load {
+                span: node,
+                type_id,
+                var: Cell::new(None),
+            };
+            lower_operation(program, ctx, source, node, |program, ctx| {
+                address_flow(program, ctx, source, node, &address)
+            });
+            if let Some(value) = address.allocated() {
+                *actual = value;
+            }
+        }
+    }
+    for (index, function) in actuals.fn_args {
+        let argument = nodes[index as usize];
+        let value = alloc_ret_temp(program, ctx, argument);
+        program.flow.push(FlowConstraint::AddrOfFn {
+            dst: value,
+            callee: function,
+        });
+        args.push((index, value));
+    }
+    args.extend(
+        lower_default_arguments(
+            program,
+            ctx,
+            callee,
+            nodes.len(),
+            origin,
+            None,
+            &mut HashMap::default(),
+        )
+        .values,
+    );
+    args.sort_by_key(|(index, _)| *index);
+    args
+}
+
 /// Instantiate omitted arguments in declaration scope. Returned indices
 /// name explicit argument positions, excluding an implicit `this` parameter.
 fn lower_default_arguments(
@@ -28814,70 +28900,19 @@ fn address_flow_inner(
                     let dst = dst.var(program, ctx);
                     let mut actuals =
                         collect_call_arg_nodes(program, ctx, source, nodes.iter().copied());
+                    let origin = node_expansion_span(program, ctx, node)
+                        .unwrap_or_else(|| node_call_span(program, ctx, node));
                     let last = selected.len() - 1;
                     for (index, callee) in selected.into_iter().enumerate() {
-                        let actuals = actuals.take_for(index == last).for_callee(
+                        let args = initializer_call_arguments(
                             program,
                             ctx,
-                            Some(callee),
-                            false,
+                            source,
+                            &nodes,
+                            callee,
+                            actuals.take_for(index == last),
+                            origin,
                         );
-                        let mut args = actuals.var_args;
-                        for (index, actual) in &mut args {
-                            if program
-                                .symbols
-                                .function(callee)
-                                .reference_params
-                                .get(*index as usize)
-                                == Some(&true)
-                                && expression_is_lvalue(
-                                    program,
-                                    ctx,
-                                    source,
-                                    nodes[*index as usize],
-                                )
-                            {
-                                let node = nodes[*index as usize];
-                                let type_id = program
-                                    .types
-                                    .ptr_to(expression_desc(program, ctx, source, node));
-                                let address = RhsDst::Load {
-                                    span: node,
-                                    type_id,
-                                    var: Cell::new(None),
-                                };
-                                lower_operation(program, ctx, source, node, |program, ctx| {
-                                    address_flow(program, ctx, source, node, &address)
-                                });
-                                if let Some(value) = address.allocated() {
-                                    *actual = value;
-                                }
-                            }
-                        }
-                        for (index, function) in actuals.fn_args {
-                            let argument = nodes[index as usize];
-                            let value = alloc_ret_temp(program, ctx, argument);
-                            program.flow.push(FlowConstraint::AddrOfFn {
-                                dst: value,
-                                callee: function,
-                            });
-                            args.push((index, value));
-                        }
-                        let origin = node_expansion_span(program, ctx, node)
-                            .unwrap_or_else(|| node_call_span(program, ctx, node));
-                        args.extend(
-                            lower_default_arguments(
-                                program,
-                                ctx,
-                                callee,
-                                nodes.len(),
-                                origin,
-                                None,
-                                &mut HashMap::default(),
-                            )
-                            .values,
-                        );
-                        args.sort_by_key(|(index, _)| *index);
                         program
                             .flow
                             .push(FlowConstraint::CallReferenceReturnDeclared {

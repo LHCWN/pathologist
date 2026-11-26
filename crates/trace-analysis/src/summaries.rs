@@ -664,17 +664,16 @@ impl AllocationTargets {
         binding: Option<&CallReturnBinding>,
     ) -> Cow<'_, [FnId]> {
         let occurrence = match binding {
-            Some(CallReturnBinding::InitializerDeclarations(declarations)) => {
+            Some(CallReturnBinding::InitializerDeclarations(calls)) => {
                 let mut candidates = Vec::new();
-                for &declaration in declarations {
-                    for callee in program.symbols.initializer_declaration_candidates(
-                        dst,
-                        declaration,
-                        &program.types,
-                    ) {
-                        if !candidates.contains(&callee) {
-                            candidates.push(callee);
-                        }
+                let calls = calls.iter().map(|call| (call.callee, call.args.as_slice()));
+                for (callee, _) in
+                    program
+                        .symbols
+                        .initializer_call_targets(dst, calls, &program.types)
+                {
+                    if !candidates.contains(&callee) {
+                        candidates.push(callee);
                     }
                 }
                 return Cow::Owned(candidates);

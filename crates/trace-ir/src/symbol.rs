@@ -3100,6 +3100,21 @@ impl SymbolTable {
         candidates
     }
 
+    /// Match selected initializer declarations in the destination's context,
+    /// carrying the actuals lowered for each declaration to its targets.
+    pub fn initializer_call_targets<'a>(
+        &'a self,
+        dst: VarId,
+        calls: impl Iterator<Item = (FnId, &'a [(u32, VarId)])> + 'a,
+        types: &'a crate::TypeTable,
+    ) -> impl Iterator<Item = (FnId, &'a [(u32, VarId)])> + 'a {
+        calls.flat_map(move |(declaration, args)| {
+            self.initializer_declaration_candidates(dst, declaration, types)
+                .into_iter()
+                .map(move |callee| (callee, args))
+        })
+    }
+
     /// Explicit initializer arguments bound to a selected definition's
     /// parameter variables, past a member's implicit receiver.
     pub fn initializer_argument_bindings<'a>(

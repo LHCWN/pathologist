@@ -148,9 +148,11 @@ explicit C++ `nullptr` rule.
 
 A direct allocation return can preserve overload selection. In a function
 body the occurrence identifies the call site's selected targets. At file scope
-lowering retains the selected C++ declarations and PAG construction matches
-their signatures in the destination's file and link target. Export uses the
-same targets when attributing return flow to source occurrences.
+lowering ranks overloads with the same argument types as body calls, including
+explicit casts. It retains the selected C++ declarations and their actual
+arguments. PAG construction matches their signatures in the destination's
+file and link target and wires actuals to the matched formals before expanding
+returns. Export uses the same targets to attribute argument and return flow.
 
 When only a callee name is available, file-scope direct reference-getter
 addresses use `CallReferenceReturn { dst, callee_name }`. PAG construction

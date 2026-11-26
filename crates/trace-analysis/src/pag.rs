@@ -929,6 +929,15 @@ impl Pag {
                         binding.as_deref(),
                         Some(CallReturnBinding::InitializerDeclarations(_)),
                     );
+                    if declared {
+                        for (callee, args) in program.symbols.initializer_call_targets(
+                            *dst,
+                            flow.initializer_calls(),
+                            &program.types,
+                        ) {
+                            self.wire_initializer_arguments(program, callee, args);
+                        }
+                    }
                     let mut any_real = false;
                     for callee in candidates.iter() {
                         if self.expand_return_flows(program, dst_n, *callee, models, &mut visited) {
@@ -978,14 +987,7 @@ impl Pag {
                         *callee,
                         &program.types,
                     ) {
-                        for (formal, actual) in program
-                            .symbols
-                            .initializer_argument_bindings(definition, args)
-                        {
-                            let dst = self.var_node_id(formal);
-                            let src = self.var_node_id(actual);
-                            self.add_copy(dst, src);
-                        }
+                        self.wire_initializer_arguments(program, definition, args);
                         self.expand_reference_returns(
                             program,
                             dst_node,
@@ -1562,6 +1564,19 @@ impl Pag {
         let id = self.alloc_node(PagNodeKind::CallTarget(cs));
         self.call_targets.insert(cs, id);
         id
+    }
+
+    fn wire_initializer_arguments(
+        &mut self,
+        program: &Program,
+        callee: FnId,
+        args: &[(u32, VarId)],
+    ) {
+        for (formal, actual) in program.symbols.initializer_argument_bindings(callee, args) {
+            let dst = self.var_node_id(formal);
+            let src = self.var_node_id(actual);
+            self.add_copy(dst, src);
+        }
     }
 
     pub fn add_copy(&mut self, dst: PagNodeId, src: PagNodeId) {

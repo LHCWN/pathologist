@@ -35,7 +35,14 @@ pub enum ContainerOwner {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CallReturnBinding {
     Occurrence(crate::CallOccurrence),
-    InitializerDeclarations(Vec<FnId>),
+    InitializerDeclarations(Vec<InitializerCall>),
+}
+
+/// A selected file-scope declaration and the arguments lowered for it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InitializerCall {
+    pub callee: FnId,
+    pub args: Vec<(u32, VarId)>,
 }
 
 /// Statement-level flow facts extracted during IR lowering.
@@ -135,13 +142,27 @@ impl FlowConstraint {
             | FlowConstraint::StringConst { dst, .. }
             | FlowConstraint::NullPointer { dst } => (dst, None),
         };
-        let arguments = match self {
-            FlowConstraint::CallReferenceReturnDeclared { args, .. } => args.as_slice(),
-            _ => &[],
+        std::iter::once(first).chain(second).chain(
+            self.initializer_calls()
+                .flat_map(|(_, args)| args.iter().map(|&(_, var)| var)),
+        )
+    }
+
+    /// Selected initializer declarations and the actuals associated with each.
+    pub fn initializer_calls(&self) -> impl Iterator<Item = (FnId, &[(u32, VarId)])> + '_ {
+        let (reference, value) = match self {
+            Self::CallReferenceReturnDeclared { callee, args, .. } => {
+                (Some((*callee, args.as_slice())), &[][..])
+            }
+            Self::CallReturn { binding, .. } => match binding.as_deref() {
+                Some(CallReturnBinding::InitializerDeclarations(calls)) => (None, calls.as_slice()),
+                _ => (None, &[][..]),
+            },
+            _ => (None, &[][..]),
         };
-        std::iter::once(first)
-            .chain(second)
-            .chain(arguments.iter().map(|(_, var)| *var))
+        reference
+            .into_iter()
+            .chain(value.iter().map(|call| (call.callee, call.args.as_slice())))
     }
 }
 

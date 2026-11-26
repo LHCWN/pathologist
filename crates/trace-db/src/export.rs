@@ -776,22 +776,33 @@ fn export_flow_provenance(
             _ => None,
         })
         .collect();
-    for flow in &unique_flows {
-        if let trace_ir::FlowConstraint::CallReferenceReturnDeclared { dst, callee, args } = flow {
-            if args.is_empty() {
-                continue;
-            }
-            for definition in
-                program
-                    .symbols
-                    .initializer_declaration_candidates(*dst, *callee, &program.types)
-            {
-                return_destinations.extend(
-                    program
-                        .symbols
-                        .initializer_argument_bindings(definition, args)
-                        .filter_map(|(formal, _)| pag.var_node.get(&formal).copied()),
-                );
+    let mut initializer_wiring = FxHashMap::<_, Vec<_>>::default();
+    for &flow in &unique_flows {
+        let calls = flow
+            .initializer_calls()
+            .filter(|(_, args)| !args.is_empty());
+        let Some(dst) = (match flow {
+            trace_ir::FlowConstraint::CallReferenceReturnDeclared { dst, .. }
+            | trace_ir::FlowConstraint::CallReturn { dst, .. } => Some(*dst),
+            _ => None,
+        }) else {
+            continue;
+        };
+        for (callee, args) in program
+            .symbols
+            .initializer_call_targets(dst, calls, &program.types)
+        {
+            for (formal, actual) in program.symbols.initializer_argument_bindings(callee, args) {
+                if let (Some(&src), Some(&dst)) =
+                    (pag.var_node.get(&actual), pag.var_node.get(&formal))
+                {
+                    return_destinations.insert(dst);
+                    let wiring = initializer_wiring.entry(flow).or_default();
+                    let edge = (callee, src, dst);
+                    if !wiring.contains(&edge) {
+                        wiring.push(edge);
+                    }
+                }
             }
         }
     }
@@ -887,30 +898,25 @@ fn export_flow_provenance(
             if returned_by_callee.contains_key(&root) {
                 continue;
             }
-            if let trace_ir::FlowConstraint::CallReferenceReturnDeclared { args, .. } = flow {
-                for (formal, actual) in program.symbols.initializer_argument_bindings(root, args) {
-                    if let (Some(src), Some(dst)) =
-                        (pag.var_node.get(&actual), pag.var_node.get(&formal))
-                    {
-                        if incoming
-                            .get(dst)
-                            .into_iter()
-                            .flatten()
-                            .any(|edge| edge.src == *src && edge.kind == ConstraintKind::Copy)
-                        {
-                            for (span, expression) in sites {
-                                origins.execute(params![
-                                    src.0,
-                                    dst.0,
-                                    strings.intern("copy")?,
-                                    span.file.0,
-                                    span.line,
-                                    span.col,
-                                    strings.intern(expression.as_ref())?,
-                                    strings.intern("argument")?
-                                ])?;
-                            }
-                        }
+            for &(callee, src, dst) in initializer_wiring.get(*flow).into_iter().flatten() {
+                if callee == root
+                    && incoming
+                        .get(&dst)
+                        .into_iter()
+                        .flatten()
+                        .any(|edge| edge.src == src && edge.kind == ConstraintKind::Copy)
+                {
+                    for (span, expression) in sites {
+                        origins.execute(params![
+                            src.0,
+                            dst.0,
+                            strings.intern("copy")?,
+                            span.file.0,
+                            span.line,
+                            span.col,
+                            strings.intern(expression.as_ref())?,
+                            strings.intern("argument")?
+                        ])?;
                     }
                 }
             }

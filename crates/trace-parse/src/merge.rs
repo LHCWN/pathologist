@@ -1692,27 +1692,16 @@ fn merges_body(program: &Program, mode: MergeMode, function: &Function) -> bool 
 }
 
 fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> + '_ {
-    use trace_ir::CallReturnBinding;
-    let (one, declarations) = match flow {
+    let one = match flow {
         FlowConstraint::AddrOfFn { callee, .. }
         | FlowConstraint::ArrayFnMember { callee, .. }
-        | FlowConstraint::CallReturnResolved { callee, .. }
-        | FlowConstraint::CallReferenceReturnDeclared { callee, .. } => (Some(*callee), &[][..]),
+        | FlowConstraint::CallReturnResolved { callee, .. } => Some(*callee),
         // A call follows the function it is written in.
-        FlowConstraint::CallReturn {
-            caller, binding, ..
-        } => (
-            *caller,
-            match binding.as_deref() {
-                Some(CallReturnBinding::InitializerDeclarations(declarations)) => {
-                    declarations.as_slice()
-                }
-                _ => &[],
-            },
-        ),
-        _ => (None, &[][..]),
+        FlowConstraint::CallReturn { caller, .. } => *caller,
+        _ => None,
     };
-    one.into_iter().chain(declarations.iter().copied())
+    one.into_iter()
+        .chain(flow.initializer_calls().map(|(id, _)| id))
 }
 
 fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> {
@@ -2043,7 +2032,17 @@ fn remap_flow(
                         }
                         CallReturnBinding::InitializerDeclarations(declarations) => {
                             CallReturnBinding::InitializerDeclarations(
-                                declarations.iter().copied().map(rf).collect(),
+                                declarations
+                                    .iter()
+                                    .map(|call| trace_ir::InitializerCall {
+                                        callee: rf(call.callee),
+                                        args: call
+                                            .args
+                                            .iter()
+                                            .map(|&(index, var)| (index, rv(var)))
+                                            .collect(),
+                                    })
+                                    .collect(),
                             )
                         }
                     })

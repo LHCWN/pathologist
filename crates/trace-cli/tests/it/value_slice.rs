@@ -2062,3 +2062,38 @@ fn allocator_return_origins_follow_the_selected_overload() {
         .collect();
     assert_eq!(sites, [8]);
 }
+
+#[test]
+fn file_scope_allocator_actual_and_return_share_the_initializer_origin() {
+    let (_dir, _db, conn) = scratch_db(&[(
+        "alloc.cpp",
+        "extern \"C\" void* malloc(unsigned long);\n\
+         namespace app {\n\
+             struct Tag {};\n\
+             Tag tag;\n\
+             Tag* malloc(Tag* value) { return value; }\n\
+         }\n\
+         void* p = malloc(&app::tag);\n",
+    )]);
+    let sites: Vec<(String, i64, String)> = conn
+        .prepare(
+            "SELECT o.operation, o.line, v.name FROM flow_origins o \
+             JOIN flow_nodes dst ON dst.id = o.dst_node \
+             JOIN variables v ON v.id = dst.var_id \
+             WHERE o.kind = 'copy' AND v.name IN ('value', 'p') \
+               AND o.operation IN ('argument', 'return value') \
+             ORDER BY o.operation",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        sites,
+        [
+            ("argument".into(), 7, "value".into()),
+            ("return value".into(), 7, "p".into()),
+        ]
+    );
+}
