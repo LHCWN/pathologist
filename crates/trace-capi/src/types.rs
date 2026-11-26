@@ -48,6 +48,7 @@ pub enum TraceLocKind {
     TraceLocArraySummary = 7,
     TraceLocFunction = 8,
     TraceLocStringLit = 9,
+    TraceLocBound = 10,
     TraceLocUnknown = -1,
 }
 

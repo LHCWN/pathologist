@@ -399,6 +399,7 @@ fn export_flow_graph(
                 let kind_str = crate::inspect::loc_kind_schema_str(loc.kind);
                 let label = match (loc.kind, loc.var) {
                     (LocKind::Function, _) => format!("fn:{}", loc.desc),
+                    (LocKind::Bound, _) => format!("bind:{}", loc.desc),
                     (LocKind::StringLit, _) => format!("string:{}", loc.desc),
                     (_, Some(v)) => match program.symbols.variable_by_id(v) {
                         Some(var) => format!("{} of {}", loc.desc, var.name),
@@ -504,12 +505,7 @@ fn export_flow_graph(
                 // value the formal receives is the call site's actual, the
                 // temporary holding `&x`, which the graph reaches from `x`'s
                 // location through `addr_of`.
-                let passed = program
-                    .symbols
-                    .call_site_by_id(e.call_site)
-                    .filter(|cs| cs.addr_of_args().contains(&e.arg_index))
-                    .and_then(|cs| cs.var_args.iter().find(|(i, _)| *i == e.arg_index))
-                    .map_or(actual, |(_, temp)| *temp);
+                let passed = e.actual_address.unwrap_or(actual);
                 let Some(actual_node) = pag.var_node.get(&passed) else {
                     continue;
                 };
@@ -544,15 +540,12 @@ fn export_flow_graph(
     // per (call site, parameter) with an edge from the cleared actual, so
     // dataflow walks show where value chains are zeroed.
     let mut next_node_id = pag.nodes.len() as u64;
-    let mut seen_terms: FxHashSet<(trace_ir::CallSiteId, u32)> = FxHashSet::default();
-    for &(cs_id, param) in &analysis.terminator_events {
-        if !seen_terms.insert((cs_id, param)) {
+    let mut seen_terms = FxHashSet::default();
+    for &(cs_id, param, actual) in &analysis.terminator_events {
+        if !seen_terms.insert((cs_id, param, actual)) {
             continue;
         }
         let Some(site) = program.symbols.call_site_by_id(cs_id) else {
-            continue;
-        };
-        let Some(actual) = pag.argument_var(site, param) else {
             continue;
         };
         let Some(&actual_node) = pag.var_node.get(&actual) else {
@@ -695,12 +688,10 @@ fn export_flow_provenance(
             }
         }
     }
-    // The heap object a `new` allocates into `dst`: the source of the
-    // `addr_of` the PAG built for its `NewHeap` fact, which the fact itself
-    // does not name.
-    let new_heap = |dst: &PagNodeId| -> Option<&PagNodeId> {
+    // Find the location created by the PAG for a producer fact.
+    let new_heap = |dst: &PagNodeId| -> Option<PagNodeId> {
         pag.indices.addr_of_dst.get(dst)?.iter().find_map(|&i| {
-            let src = &pag.constraints[i].src;
+            let src = pag.constraints[i].src;
             match pag.nodes[src.0 as usize].kind {
                 PagNodeKind::Loc(loc) if pag.locations[loc.0 as usize].kind == LocKind::Heap => {
                     Some(src)
@@ -719,25 +710,33 @@ fn export_flow_provenance(
             continue;
         };
         let (src, kind) = match flow {
-            F::Copy { src, .. } => (pag.var_node.get(src), "copy"),
-            F::Store { src, .. } => (pag.var_node.get(src), "store"),
-            F::Load { src, .. } => (pag.var_node.get(src), "load"),
-            F::GepField { base, .. } => (pag.var_node.get(base), "gep"),
-            F::UnwrapPointer { src, .. } => (pag.var_node.get(src), "unwrap"),
+            F::Copy { src, .. } => (pag.var_node.get(src).copied(), "copy"),
+            F::Store { src, .. } => (pag.var_node.get(src).copied(), "store"),
+            F::Load { src, .. } => (pag.var_node.get(src).copied(), "load"),
+            F::GepField { base, .. } => (pag.var_node.get(base).copied(), "gep"),
+            F::UnwrapPointer { src, .. } => (pag.var_node.get(src).copied(), "unwrap"),
             F::AddrOfVar { src, .. } => (
-                pag.var_location.get(src).and_then(|l| pag.loc_node.get(l)),
+                pag.var_location
+                    .get(src)
+                    .and_then(|l| pag.loc_node.get(l))
+                    .copied(),
                 "addr_of",
             ),
             F::AddrOfFn { callee, .. } | F::ArrayFnMember { callee, .. } => (
                 pag.fn_locations
                     .get(callee)
-                    .and_then(|l| pag.loc_node.get(l)),
+                    .and_then(|l| pag.loc_node.get(l))
+                    .copied(),
                 "addr_of",
             ),
-            F::NullPointer { .. } => (pag.null_node.as_ref(), "copy"),
+            F::NullPointer { .. } => (pag.null_node, "copy"),
             F::NewHeap { .. } => (new_heap(d), "addr_of"),
+            F::BindCallable { .. } => (pag.bound_location(flow), "addr_of"),
             F::StringConst { value, .. } => (
-                pag.string_locs.get(value).and_then(|l| pag.loc_node.get(l)),
+                pag.string_locs
+                    .get(value)
+                    .and_then(|l| pag.loc_node.get(l))
+                    .copied(),
                 "addr_of",
             ),
             _ => continue,

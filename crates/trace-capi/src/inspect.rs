@@ -461,6 +461,7 @@ fn node_loc_kind(k: Option<trace_db::LocKind>) -> TraceLocKind {
         Some(L::ArraySummary) => TraceLocKind::TraceLocArraySummary,
         Some(L::Function) => TraceLocKind::TraceLocFunction,
         Some(L::StringLit) => TraceLocKind::TraceLocStringLit,
+        Some(L::Bound) => TraceLocKind::TraceLocBound,
     }
 }
 

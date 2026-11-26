@@ -248,61 +248,29 @@ image as an indirect call's targets are.
   and no `async_start` boundary. Only an `invoke` may say it (an `entry` is
   where a context starts), and the context graph then treats the wrapping
   site's edge as an ordinary call.
-- **Not modeled.** No ordering or scheduling (the callback is simply
-  reachable from the starting site), no return value, and no bound state:
-  a `std::bind` result, a `std::packaged_task` and a `std::function` object
-  are not looked into. What the first two do keep reachable is
-  [Callable wrappers](#callable-wrappers).
+- **Bound callables.** An invocation of a [bound callable](IR.md#bound-callables)
+  composes the arguments forwarded by the model with the stored arguments
+  and receiver. A supplied value occupies the first invocation slot
+  when the callback accepts it, shifting which arguments later
+  placeholders receive. The model attributes the callback and its
+  execution context to the submission site. Callback scheduling and
+  callback returns to the submitting API are outside this mapping.
 
 #### Callable wrappers
 
-`std::bind(f, args...)` and `std::packaged_task<R(A...)>(f)` only wrap a
-callable that something runs later, usually a thread pool's worker. No value in the analysis carries a
-callable on, so the later call, `task()` or `(*task)()`, cannot be tied back
-to `f`. Both are therefore `invoke` models that start no context, `context =
-"none"` ([Built-in models](#built-in-models)): `std::bind` with `param = 0,
-rest = 1` and `std::packaged_task::packaged_task` with `param = 0, rest = 1`: the
-constructor forwards no argument, and `rest` (not an empty `args`) lets the
-stored callable take any number of parameters, as the task's signature, not the
-constructor, says what it is called with. This is what keeps a
-`Submit`-style pool's `Submit -> f` edge, from `std::bind(std::forward<F>(f),
-...)` inside `Submit`, where `f` is the callable the pool's caller passed.
+[Bound callables](IR.md#bound-callables) describes the modeled subset of
+`std::bind`, which builds a value without invoking anything. A
+`std::function` slot carries the value through ordinary points-to flow and
+invokes it through an indirect call.
 
-- **The edge is the wrapping site's.** It runs from the function that builds
-  the bind or the task, at that site, not from the caller of `operator()`.
-  It is an over-approximation: it exists whether or not the task ever runs,
-  and a bind that is built and then dropped has it too.
-- **Bound arguments.** `rest = 1` wires the arguments after the callable into
-  the callable's formals as for `std::thread`, so a named bound argument
-  reaches the callable's formal. The model does not read `std::placeholders`:
-  nothing supplies the later caller's arguments.
-- **A parameter pack is followed.** An argument passed through a
-  variadic template's `Args&&... args` reaches the callable's formal:
-  `Submit(f, a)` carries `a` through the pack and out through
-  `std::forward<Args>(args)...` into `f`'s formals, as a named parameter
-  would ([Variadic parameter packs](POINTERS.md#variadic-parameter-packs), including
-  what it over-approximates).
-- **No execution context.** Both models state `context = "none"`: nothing
-  starts at a bind or at a task's construction, so a match exports no
-  `execution_contexts` row and, in call sequencing, no `async_start`
-  boundary; the wrapping site is an ordinary call. Where the callable runs
-  is for whatever later calls the task, which the analysis does not follow.
-  A `--models` entry for another wrapper (a task-making helper, an
-  `emplace`-style forwarder) states `context = "none"` the same way.
-- **Built through a factory.** `std::make_shared<std::packaged_task<void()>>(f)`
-  and `std::make_unique<...>(f)` take the constructor model too, from a named
-  function or a lambda: the factory's constructor site
-  ([Factory construction](CXX.md#factory-construction)) is the one the model
-  matches, with `f` as its first argument, so the edge runs from the function
-  holding the factory call. Pinned by `tests/fixtures/cpp_bind_packaged_task`.
-  A task whose signature names an enclosing template's parameter
-  (`std::packaged_task<R()>` in `template <typename R>`) is the same class,
-  so it reaches its callable too, as `new std::packaged_task<R()>(f)` does.
-  `Submit`'s `std::packaged_task<ReturnType()>` records the site as well, but
-  its argument is a bind result, not a function, so the site adds an external
-  edge and the edge to the callable still comes from the `std::bind`.
-- **`std::function`.** No model: a callable stored in one flows through the
-  ordinary copy and points-to handling, and calling it is an indirect call.
+The `std::packaged_task` constructor retains its legacy context-less
+reachability edge for ordinary function values. Its `param = 0, rest = 1`
+model permits the stored function's arity to differ from the constructor's
+arity. Smart-pointer factories emit the same constructor site
+([Factory construction](CXX.md#factory-construction)). The constructor
+starts no execution context. Propagating a bound value from this
+constructor to `task()` or `(*task)()` still requires a model of the
+packaged task's storage and invocation.
 
 ### Execution contexts
 
@@ -442,7 +410,6 @@ entries:
 | `std::thread::thread` | `invoke param=0 rest=1 context=thread` (callable and everything after it); covers a temporary recorded as `std::thread` |
 | `std::jthread::jthread` | `invoke param=0 rest=1 supplies=std::stop_token context=thread` (as `std::thread`, with the thread's stop token first to a callable that takes one); covers a temporary recorded as `std::jthread` |
 | `std::async` | `invoke param=0 rest=1 unless_arg={param=0, type=std::launch} context=thread` and `invoke param=1 rest=2 if_arg={param=0, type=std::launch} context=thread` (the callable first, or after a launch policy) |
-| `std::bind` | `invoke param=0 rest=1 context=none` (the callable and the arguments bound after it; [Callable wrappers](#callable-wrappers)) |
 | `std::packaged_task::packaged_task` | `invoke param=0 rest=1 context=none` (the callable the task stores, of any arity; the constructor forwards no argument; a bind result is not a function, so the bind site makes the edge) |
 | `OHOS::Thread::Run` | `entry context=thread` (c_utils runs it on the thread `Start` creates) |
 | `OHOS::AppExecFwk::EventHandler::ProcessEvent` | `entry context=serial_task` (the handler's event runner calls it) |
@@ -816,8 +783,8 @@ effects = [ { kind = "invoke", param = 0, rest = 1, supplies = "Token", context 
 
 **Wrappers that start nothing**
 
-`std::bind` and `std::packaged_task` keep a callable reachable without running
-it. `context = "none"` keeps the call edge and forwarded arguments but starts no
+A model can keep a callable reachable from a wrapper such as a
+`std::packaged_task` constructor. `context = "none"` keeps the call edge and forwarded arguments but starts no
 execution context and no `async_start` boundary:
 
 ```toml

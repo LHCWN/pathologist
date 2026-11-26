@@ -44,7 +44,7 @@ pub enum Effect {
     /// The callee may invoke the callback in `param[param]`, passing it
     /// `args`, in an execution context of kind `context`, or in none when
     /// `context` is `None`: a model that only wraps the callback
-    /// (`std::bind`) keeps the call edge and the argument wiring but starts
+    /// keeps the call edge and the argument wiring but starts
     /// nothing. Parameter indexes count explicit arguments, excluding a
     /// member's `this`. Not restricted to a bodyless callee, unlike the
     /// effects above that introduce a value.
@@ -383,10 +383,8 @@ impl FnModelSet {
                 })
                 .collect(),
         );
-        // Wrappers that keep a callable reachable without running it where
-        // they are built: the edge is the wrapping site's, since no value
-        // carries the callable on (`docs/MODELS.md`, "Callable wrappers").
-        reg("std::bind", wraps(0, InvokeArgs::Rest(1)));
+        // Retain the legacy reachability edge for a packaged task's
+        // unbound callable. Bind expressions produce separate callable values.
         reg(
             "std::packaged_task::packaged_task",
             wraps(0, InvokeArgs::Rest(1)),
@@ -1226,13 +1224,11 @@ effects = [ { kind = "dlsym", param = 1 } ]
     #[test]
     fn builtin_wrappers_start_no_context() {
         let m = FnModelSet::builtin();
-        for name in ["std::bind", "std::packaged_task::packaged_task"] {
-            assert_eq!(
-                m.get(name).unwrap().effects,
-                wraps(0, InvokeArgs::Rest(1)),
-                "{name} keeps its callable reachable and starts nothing"
-            );
-        }
+        assert!(m.get("std::bind").is_none());
+        assert_eq!(
+            m.get("std::packaged_task::packaged_task").unwrap().effects,
+            wraps(0, InvokeArgs::Rest(1)),
+        );
     }
 
     #[test]
@@ -1551,11 +1547,6 @@ effects = [{ kind = "invoke", param = 0, rest = 1 }]
                 supplies: Some("std::stop_token".into()),
                 when: None,
             }]
-        );
-        assert_eq!(
-            effects("std::bind"),
-            wraps(0, InvokeArgs::Rest(1)),
-            "the callable and the arguments bound after it"
         );
         assert_eq!(
             effects("std::packaged_task::packaged_task"),

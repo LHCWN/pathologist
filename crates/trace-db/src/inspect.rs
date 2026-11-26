@@ -218,6 +218,7 @@ pub fn loc_kind_schema_str(kind: LocKind) -> &'static str {
         LocKind::ArraySummary => "array_summary",
         LocKind::Function => "function",
         LocKind::StringLit => "string_lit",
+        LocKind::Bound => "bound",
     }
 }
 
@@ -235,6 +236,7 @@ pub fn loc_kind_from_schema_str(s: &str) -> Option<LocKind> {
         "array_summary" => Some(LocKind::ArraySummary),
         "function" => Some(LocKind::Function),
         "string_lit" => Some(LocKind::StringLit),
+        "bound" => Some(LocKind::Bound),
         _ => None,
     }
 }

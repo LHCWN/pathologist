@@ -572,8 +572,8 @@ is added: the wiring is the ordinary actual-to-formal copy of
   position too, as a pack variable: it may reach any formal from there on.
 - **Arity.** An expansion may be empty. At an `invoke` site
   ([Callback invocation](MODELS.md#callback-invocation-invoke)) only the positions before
-  it count as passed, so a callable that takes nothing is still the one a
-  `std::bind(f, args...)` runs when `args` is empty.
+  it count as passed, so a model can invoke a zero-argument callback when
+  its forwarded pack may be empty.
 - **Arg-flow rows.** A row is the position the actual is recorded at and the
   formal it reached, so a pack formal has one row per later position that
   passes a variable or a function (a literal records none), and a formal

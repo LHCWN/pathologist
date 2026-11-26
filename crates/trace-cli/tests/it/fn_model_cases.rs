@@ -313,7 +313,7 @@ void std_clear(void) { std::memset(&g_std_cleared, 0, sizeof(op_t)); }
     let cleared_in: Vec<String> = analysis
         .terminator_events
         .iter()
-        .map(|(cs, _)| {
+        .map(|(cs, _, _)| {
             let site = program
                 .symbols
                 .call_sites

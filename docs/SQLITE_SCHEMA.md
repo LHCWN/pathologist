@@ -624,7 +624,7 @@ contract.
 |--------|------|-------------|
 | `id` | INTEGER PK | Edge id |
 | `call_site_id` | INTEGER FK → `call_sites` | Call site |
-| `arg_index` | INTEGER | 0-based parameter position the argument binds to; for a C++ member function or constructor 0 is the implicit `this`, so explicit arguments start at 1 |
+| `arg_index` | INTEGER | 0-based argument position at the call site. A member or constructor can record its receiver at position 0. A stored bind argument uses the position of its destination formal |
 | `actual_var_id` | INTEGER FK → `variables` | Actual variable (`NULL` if actual is a function) |
 | `actual_fn_id` | INTEGER FK → `functions` | Actual function for fn-ptr args (`NULL` if actual is a variable) |
 | `formal_var_id` | INTEGER FK → `variables` | Callee parameter var |
@@ -642,7 +642,7 @@ v7 export written before it existed has no `execution_contexts` table, so a
 reader checks for the table (and the columns it reads) instead of the schema
 version; in an ordinary analysis an empty table means no context was found. A
 callable only wrapped (`std::bind`, `std::packaged_task`) starts nothing and
-has no row: a model states that with `context = "none"`, which is no `kind`.
+has no row. A packaged-task wrapper model uses `context = "none"`.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -902,7 +902,7 @@ PAG abstract locations (`--full-export` or `--debug-points-to`).
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Location id |
-| `kind` | TEXT | `Global`, `FileStatic`, `FnStatic`, `Local`, `Heap`, `Field`, `FieldSummary`, `ArraySummary`, `Function`, `StringLit` |
+| `kind` | TEXT | `Global`, `FileStatic`, `FnStatic`, `Local`, `Heap`, `Field`, `FieldSummary`, `ArraySummary`, `Function`, `StringLit`, `Bound` |
 | `desc` | TEXT | Description |
 | `type_id` | INTEGER FK → `types` | Optional |
 

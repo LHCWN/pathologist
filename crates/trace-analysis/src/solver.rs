@@ -3,14 +3,18 @@ use crate::constraints::{
 };
 use crate::contexts::{self, ContextStart, ExecutionContext};
 use crate::memory::MemoryAccess;
-use crate::pag::{Pag, PagNodeKind, SolverIndices};
+use crate::pag::{BoundCallable, Pag, PagNodeKind, SolverIndices};
 use crate::summaries::{
     class_type, is_value_of, ArgType, ContextKind, Effect, EffectGroup, FnModelSet, InvokeArgs,
     ModelLookup,
 };
 use indexmap::{IndexMap, IndexSet};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
-use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, TargetId, VarId};
+use std::sync::Arc;
+use trace_ir::{
+    BoundArg, CallSite, CallSiteDetails, CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass,
+    TargetId, VarId,
+};
 
 /// Sentinel `CallSiteId` used for synthetic IPC bridge call edges. Real call
 /// sites are allocated sequentially from `0`; this value marks an edge that
@@ -135,9 +139,9 @@ pub struct AnalysisResult {
     /// Arguments a modelled callee forwards to a callback (`invoke`), by
     /// call site and callback: each `(formal index, argument position)` wired.
     pub forwarded_arg_flow: ForwardedArgFlow,
-    /// Applied `clears` effects: `(call site, cleared parameter index)`.
+    /// Applied `clears` effects: `(call site, cleared parameter index, actual)`.
     /// Exported as terminator nodes/edges in the flow graph.
-    pub terminator_events: Vec<(CallSiteId, u32)>,
+    pub terminator_events: Vec<(CallSiteId, u32, VarId)>,
     /// Where threads, tasks and IPC requests start running code: one per
     /// resolved callback invocation, then one per IPC stub handler
     /// (`docs/MODELS.md`, "Execution contexts").
@@ -170,6 +174,7 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
         opts.solve_budget_pops,
         opts.solve_budget_secs,
     );
+    let bound_args = std::mem::take(&mut result.arg_flow_edges);
     extract_arg_flow(
         program,
         &pag,
@@ -178,6 +183,14 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
         &result.forwarded_arg_flow,
         &mut result.arg_flow_edges,
     );
+    if !bound_args.is_empty() {
+        let bound_sites: FxHashSet<_> = bound_args.iter().map(|row| row.call_site).collect();
+        let mut seen = FxHashSet::default();
+        result.arg_flow_edges.extend(bound_args);
+        result
+            .arg_flow_edges
+            .retain(|row| !bound_sites.contains(&row.call_site) || seen.insert(row.clone()));
+    }
     (pag, result)
 }
 
@@ -283,9 +296,9 @@ struct SolverState {
     cell_owner: FxHashMap<LocId, PagNodeId>,
     /// What [`wire_callback`] wired, for the arg-flow rows.
     forwarded_arg_flow: ForwardedArgFlow,
-    /// `(call site, parameter)` terminator events already recorded, so each
-    /// is recorded once without scanning the event list.
-    terminators_seen: FxHashSet<(CallSiteId, u32)>,
+    bound_arg_flow: Vec<ArgFlowEdge>,
+    /// Cleared actuals already recorded at a call site's model parameter.
+    terminators_seen: FxHashSet<(CallSiteId, u32, VarId)>,
     /// Membership bits mirroring the large `pts` and `memory_pts` sets
     /// ([`LocBits`]): the sets stay the storage and the iteration order,
     /// the bits only answer "already held" without hashing.
@@ -988,9 +1001,13 @@ fn solve(
     }
 
     let mut call_edges: Vec<CallGraphEdge> = Vec::new();
-    let mut resolved_indirect: FxHashMap<CallSiteId, Vec<FnId>> = FxHashMap::default();
+    // One edge per target, with ordinary function values wired separately
+    // from each bound location that reaches that target.
+    let mut resolved_indirect = IndirectTargets::default();
+    let mut wired_bindings = FxHashSet::default();
     let mut wired_arg_flow: FxHashSet<(CallSiteId, u32, FnId)> = FxHashSet::default();
-    let mut terminator_events: Vec<(CallSiteId, u32)> = Vec::new();
+    let mut terminator_events = Vec::new();
+    let mut bound_model_sites = BoundModelSites::default();
     let invoked = invoked_params(program, models);
     let mut invoke_watch = InvokeWatch::default();
 
@@ -1071,7 +1088,7 @@ fn solve(
                 program,
                 &mut st,
                 &mut scratch,
-                cs,
+                &InvocationSite::source(cs),
                 invoked.get(&callee),
                 &mut invoke_watch,
             );
@@ -1559,13 +1576,25 @@ fn solve(
                 let caller_target = program.symbols.function(cs.caller).target;
                 for &loc in delta.iter() {
                     if let Some(fn_id) = fn_for_loc(pag, loc) {
-                        if cs.args_bound_past_this {
-                            new_callees.extend(member_pointer_targets(
-                                program,
-                                cs,
-                                fn_id,
-                                pag.is_reinterpreted_location(loc),
-                            ));
+                        if pag.locations[loc.0 as usize].kind == LocKind::Bound {
+                            if wired_bindings.insert((cs.id, loc)) {
+                                new_callees.extend(
+                                    reached_definitions(program, fn_id, caller_target)
+                                        .into_iter()
+                                        .map(|callee| (callee, Some(loc))),
+                                );
+                            }
+                        } else if cs.args_bound_past_this {
+                            new_callees.extend(
+                                member_pointer_targets(
+                                    program,
+                                    cs,
+                                    fn_id,
+                                    pag.is_reinterpreted_location(loc),
+                                )
+                                .into_iter()
+                                .map(|callee| (callee, None)),
+                            );
                         } else {
                             if pag.is_reinterpreted_location(loc)
                                 && cs.callee_var.is_some_and(|var| {
@@ -1584,20 +1613,69 @@ fn solve(
                             {
                                 continue;
                             }
-                            new_callees.extend(reached_definitions(program, fn_id, caller_target));
+                            new_callees.extend(
+                                reached_definitions(program, fn_id, caller_target)
+                                    .into_iter()
+                                    .map(|callee| (callee, None)),
+                            );
                         }
                     }
                 }
                 let prev = resolved_indirect.entry(cs_id).or_default();
-                for callee in new_callees {
-                    if !prev.contains(&callee) {
-                        prev.push(callee);
-                        call_edges.push(CallGraphEdge {
-                            call_site: cs.id,
-                            caller: cs.caller,
+                for (callee, bound_loc) in new_callees {
+                    let ordinary = bound_loc.is_none();
+                    let (new_edge, wire_ordinary) = if let Some((_, wired)) =
+                        prev.iter_mut().find(|(target, _)| *target == callee)
+                    {
+                        (false, ordinary && !std::mem::replace(wired, true))
+                    } else {
+                        prev.push((callee, ordinary));
+                        (true, ordinary)
+                    };
+                    if let Some(loc) = bound_loc {
+                        let binding = pag.bound_callables[&loc].clone();
+                        wire_bound_callable(
+                            pag,
+                            program,
+                            &mut st,
+                            &mut scratch,
+                            &InvocationSite::source(cs),
                             callee,
-                            resolution: ResolutionKind::Indirect,
-                        });
+                            &binding,
+                            |position| invoke_site_index(cs, position),
+                        );
+                        let name = &program.symbols.function(callee).name;
+                        let invokes = invoked.get(&callee);
+                        if invokes.is_some() || models.model(name, EffectGroup::Args).is_some() {
+                            let site = compose_bound_site(program, cs, callee, &binding);
+                            apply_fn_model(
+                                pag,
+                                program,
+                                &mut st,
+                                &mut scratch,
+                                site.arguments(),
+                                name,
+                                models,
+                                &mut terminator_events,
+                            );
+                            if invokes.is_some() {
+                                wire_invocations(
+                                    pag,
+                                    program,
+                                    &mut st,
+                                    &mut scratch,
+                                    &site,
+                                    invokes,
+                                    &mut invoke_watch,
+                                );
+                                bound_model_sites
+                                    .entry((cs.id, callee))
+                                    .or_default()
+                                    .push(site);
+                            }
+                        }
+                    }
+                    if wire_ordinary {
                         wire_params(
                             pag,
                             program,
@@ -1607,6 +1685,14 @@ fn solve(
                             &mut scratch,
                             &mut wired_arg_flow,
                         );
+                    }
+                    if new_edge {
+                        call_edges.push(CallGraphEdge {
+                            call_site: cs.id,
+                            caller: cs.caller,
+                            callee,
+                            resolution: ResolutionKind::Indirect,
+                        });
                         // Expand return flows from the callee into the
                         // `CallReturnIndirect` destination so the return
                         // value reaches the assignment LHS (e.g.
@@ -1656,6 +1742,8 @@ fn solve(
                                 before,
                             );
                         }
+                    }
+                    if wire_ordinary {
                         apply_fn_model(
                             pag,
                             program,
@@ -1671,7 +1759,7 @@ fn solve(
                             program,
                             &mut st,
                             &mut scratch,
-                            cs,
+                            &InvocationSite::source(cs),
                             invoked.get(&callee),
                             &mut invoke_watch,
                         );
@@ -1688,17 +1776,25 @@ fn solve(
             .then(|| invoke_watch.get(&node))
             .flatten()
         {
-            let gained: Vec<FnId> = delta.iter().filter_map(|&l| fn_for_loc(pag, l)).collect();
             for (cs, invoked) in watchers {
-                for &callback in &gained {
-                    wire_callback(pag, program, &mut st, &mut scratch, cs, callback, invoked);
+                for &loc in delta.iter() {
+                    wire_callback(pag, program, &mut st, &mut scratch, cs, loc, invoked);
                 }
             }
         }
     }
 
-    let (callbacks, invocations) = callback_edges(program, pag, &st, &invoked, &call_edges);
+    let (callbacks, invocations) = callback_edges(
+        program,
+        pag,
+        &st,
+        &invoked,
+        &call_edges,
+        &resolved_indirect,
+        &bound_model_sites,
+    );
     call_edges.extend(callbacks);
+    drop(bound_model_sites);
 
     // Emit synthetic call edges for IPC proxy→stub bridges detected at PAG
     // build. These connect the proxy method to the stub handler it would
@@ -1737,6 +1833,17 @@ fn solve(
         )
     });
     let forwarded_arg_flow = std::mem::take(&mut st.forwarded_arg_flow);
+    let mut bound_arg_flow = std::mem::take(&mut st.bound_arg_flow);
+    bound_arg_flow.sort_unstable_by_key(|edge| {
+        (
+            edge.call_site,
+            edge.arg_index,
+            edge.formal,
+            edge.actual_var,
+            edge.actual_address,
+            edge.actual_fn,
+        )
+    });
     let memory_accesses = crate::memory::memory_accesses(pag, &st.pts, &st.designated);
     let points_to = if retain_points_to {
         std::mem::take(&mut st.pts).into_iter().collect()
@@ -1749,6 +1856,7 @@ fn solve(
     drop(invoke_watch);
     drop(invoked);
     drop(resolved_indirect);
+    drop(wired_bindings);
     drop(unwrap_memo);
     drop(new_in_order);
     drop(scratch);
@@ -1792,7 +1900,7 @@ fn solve(
     AnalysisResult {
         points_to,
         call_edges,
-        arg_flow_edges: Vec::new(),
+        arg_flow_edges: bound_arg_flow,
         wired_arg_flow,
         forwarded_arg_flow,
         terminator_events,
@@ -1827,7 +1935,7 @@ fn apply_fn_model(
     cs: &trace_ir::CallSite,
     callee_name: &str,
     models: &ModelLookup,
-    terminator_events: &mut Vec<(CallSiteId, u32)>,
+    terminator_events: &mut Vec<(CallSiteId, u32, VarId)>,
 ) {
     let Some(model) = models.model(callee_name, EffectGroup::Args) else {
         return;
@@ -1951,8 +2059,8 @@ fn apply_fn_model(
                 }
             }
             Effect::Clears { param } => {
-                if arg_node(pag, *param).is_some() {
-                    let event = (cs.id, *param);
+                if let Some(actual) = pag.argument_var(cs, *param) {
+                    let event = (cs.id, *param, actual);
                     if st.terminators_seen.insert(event) {
                         terminator_events.push(event);
                     }
@@ -2025,7 +2133,10 @@ fn unwrap_admits(
     pointee: trace_ir::TypeId,
 ) -> bool {
     let loc = &pag.locations[loc.0 as usize];
-    if matches!(loc.kind, LocKind::Function | LocKind::StringLit) {
+    if matches!(
+        loc.kind,
+        LocKind::Function | LocKind::Bound | LocKind::StringLit
+    ) {
         return false;
     }
     *memo
@@ -2604,7 +2715,7 @@ fn wire_params(
         st,
         scratch,
         Some,
-        |st, formal, arg| {
+        |_, st, formal, arg| {
             if formal == arg {
                 wired.insert((cs.id, formal, callee));
             } else {
@@ -2645,7 +2756,7 @@ fn recorded_position(program: &Program, cs: &trace_ir::CallSite, idx: u32) -> Op
 }
 
 /// Wire `cs`'s actuals into `callee`'s formals: formal `i` takes what the site
-/// records at position `actual_of(i)`, and `on_wired(st, i, at)` records each
+/// records at position `actual_of(i)`, and `on_wired` records each
 /// formal that took something and the position it was recorded at, for the
 /// arg-flow rows. An ordinary call passes position `i` to formal `i`; a
 /// callback a model invokes takes the positions the model forwards; a pack
@@ -2660,7 +2771,7 @@ fn wire_actuals(
     st: &mut SolverState,
     scratch: &mut Scratch,
     actual_of: impl Fn(u32) -> Option<u32>,
-    mut on_wired: impl FnMut(&mut SolverState, u32, u32),
+    mut on_wired: impl FnMut(&Pag, &mut SolverState, u32, u32),
 ) {
     let callee_fn = program.symbols.function(callee);
     let this = u32::from(program.symbols.has_this_param(callee));
@@ -2751,39 +2862,11 @@ fn wire_one(
     formal: VarId,
     formal_idx: u32,
     at: u32,
-    on_wired: &mut impl FnMut(&mut SolverState, u32, u32),
+    on_wired: &mut impl FnMut(&Pag, &mut SolverState, u32, u32),
 ) {
     let mut wired = false;
     for &(_, actual) in cs.var_args.iter().filter(|(j, _)| *j == at) {
-        let formal_node = pag.var_node.get(&formal).copied().expect("formal var node");
-        let actual_node = pag.var_node.get(&actual).copied().expect("actual var node");
-        // Persistent copy constraint: the actual's points-to may still be
-        // growing when the edge is first discovered (direct sites are
-        // wired before the first propagation round). A one-shot snapshot
-        // here loses interprocedural flow (observed as missed indirect
-        // targets passed through parameters). Scalars cannot contribute
-        // pointees and are skipped to bound constraint volume.
-        let actual_pointee = var_may_hold_pointee(program, actual);
-        let formal_pointee = var_may_hold_pointee(program, formal);
-        // Erasure can hide a callback slot or aggregate, but a known scalar
-        // buffer on either side still cannot carry callable contents.
-        let carries_pointee = (actual_pointee || var_is_opaque_pointer(program, actual))
-            && (formal_pointee || var_is_opaque_pointer(program, formal));
-        if carries_pointee && st.wired_copies.insert((actual_node, formal_node)) {
-            ensure_param_copy(pag, st, actual_node, formal_node);
-        }
-        if let Some(actual_pts) = st.pts.get(&actual_node) {
-            // Snapshotted rather than cloned: this used to copy the
-            // actual's whole points-to set once per wired argument.
-            scratch.wire_src.clear();
-            scratch.wire_src.extend(actual_pts.iter().copied());
-            propagate_locs(
-                st,
-                &mut scratch.fresh,
-                formal_node,
-                scratch.wire_src.iter().copied(),
-            );
-        }
+        wire_var_actual(pag, program, st, scratch, formal, actual);
         wired = true;
     }
     // A name with overloads passes each one it may mean; an expansion's
@@ -2799,8 +2882,127 @@ fn wire_one(
         wired = true;
     }
     if wired {
-        on_wired(st, formal_idx, at);
+        on_wired(pag, st, formal_idx, at);
     }
+}
+
+/// Connect an actual variable to a formal and replay its current value.
+fn wire_var_actual(
+    pag: &mut Pag,
+    program: &Program,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    formal: VarId,
+    actual: VarId,
+) {
+    let formal_node = pag.var_node.get(&formal).copied().expect("formal var node");
+    let actual_node = pag.var_node.get(&actual).copied().expect("actual var node");
+    // Persistent copy constraint: the actual's points-to may still be
+    // growing when the edge is first discovered (direct sites are
+    // wired before the first propagation round). A one-shot snapshot
+    // here loses interprocedural flow (observed as missed indirect
+    // targets passed through parameters). Scalars cannot contribute
+    // pointees and are skipped to bound constraint volume.
+    let actual_pointee = var_may_hold_pointee(program, actual);
+    let formal_pointee = var_may_hold_pointee(program, formal);
+    // Erasure can hide a callback slot or aggregate, but a known scalar
+    // buffer on either side still cannot carry callable contents.
+    let carries_pointee = (actual_pointee || var_is_opaque_pointer(program, actual))
+        && (formal_pointee || var_is_opaque_pointer(program, formal));
+    if carries_pointee && st.wired_copies.insert((actual_node, formal_node)) {
+        ensure_param_copy(pag, st, actual_node, formal_node);
+    }
+    if let Some(actual_pts) = st.pts.get(&actual_node) {
+        // Snapshotted rather than cloned: this used to copy the
+        // actual's whole points-to set once per wired argument.
+        scratch.wire_src.clear();
+        scratch.wire_src.extend(actual_pts.iter().copied());
+        propagate_locs(
+            st,
+            &mut scratch.fresh,
+            formal_node,
+            scratch.wire_src.iter().copied(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_bound_callable(
+    pag: &mut Pag,
+    program: &Program,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    site: &InvocationSite<'_>,
+    callee: FnId,
+    binding: &BoundCallable,
+    invocation_position: impl Fn(u32) -> Option<u32>,
+) {
+    let cs = site.arguments();
+    let function = program.symbols.function(callee);
+    let bindings = bound_slots(program, callee, binding);
+    for (i, (&formal, bound)) in function.params.iter().zip(bindings).enumerate() {
+        let index = i as u32;
+        let (actual_var, actual_fn) = match bound {
+            BoundArg::Stored(var) => {
+                wire_var_actual(pag, program, st, scratch, formal, var);
+                (Some(var), None)
+            }
+            BoundArg::Function(function) => {
+                if let Some(&loc) = pag.fn_locations.get(&function) {
+                    add_pts(st, pag.var_node[&formal], loc);
+                }
+                (None, Some(function))
+            }
+            BoundArg::Placeholder(n) => {
+                if let Some(at) = n
+                    .checked_sub(1)
+                    .and_then(&invocation_position)
+                    .and_then(|at| recorded_position(program, cs, at))
+                {
+                    wire_one(
+                        pag,
+                        program,
+                        cs,
+                        st,
+                        scratch,
+                        formal,
+                        index,
+                        at,
+                        &mut |pag, st, formal, arg| {
+                            record_model_forwarded(program, pag, st, site, callee, formal, arg);
+                        },
+                    );
+                }
+                continue;
+            }
+            BoundArg::Opaque => continue,
+        };
+        st.bound_arg_flow.push(ArgFlowEdge {
+            call_site: cs.id,
+            arg_index: index,
+            actual_var,
+            actual_address: None,
+            actual_fn,
+            formal,
+        });
+    }
+}
+
+fn bound_slots<'a>(
+    program: &Program,
+    target: FnId,
+    binding: &'a BoundCallable,
+) -> impl Iterator<Item = BoundArg> + 'a {
+    binding
+        .receiver
+        .or_else(|| {
+            program
+                .symbols
+                .has_this_param(target)
+                .then_some(BoundArg::Opaque)
+        })
+        .into_iter()
+        .chain(binding.args.iter().copied())
 }
 
 fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
@@ -2837,10 +3039,132 @@ struct Invoked<'m> {
 /// The `invoke` effects of one modelled callee.
 type Invocations<'m> = Vec<Invoked<'m>>;
 
+/// The arguments a model sees, together with the original source site.
+/// Composed arguments are shared by propagation and the callback edge pass.
+#[derive(Clone)]
+struct InvocationSite<'m> {
+    source: &'m CallSite,
+    composed: Option<Arc<ComposedArguments>>,
+}
+
+struct ComposedArguments {
+    /// Solver-local copy. Its identity still names the original call site.
+    call: CallSite,
+    /// Positions to report at the source site when the model forwards values.
+    source_positions: Vec<u32>,
+}
+
+impl<'m> InvocationSite<'m> {
+    fn source(source: &'m CallSite) -> Self {
+        Self {
+            source,
+            composed: None,
+        }
+    }
+
+    fn arguments(&self) -> &CallSite {
+        self.composed
+            .as_ref()
+            .map_or(self.source, |args| &args.call)
+    }
+
+    fn same_call(&self, other: &Self) -> bool {
+        self.source.id == other.source.id
+            && match (&self.composed, &other.composed) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
+fn compose_bound_site<'m>(
+    program: &Program,
+    source: &'m CallSite,
+    target: FnId,
+    binding: &BoundCallable,
+) -> InvocationSite<'m> {
+    let mut call = source.clone();
+    call.var_args.clear();
+    let mut fn_args = Vec::new();
+    let mut addr_of_args = Vec::new();
+    let mut addr_of_member_args = Vec::new();
+    let mut source_positions = Vec::new();
+    for (index, arg) in bound_slots(program, target, binding).enumerate() {
+        let index = index as u32;
+        let mut position = index;
+        match arg {
+            BoundArg::Stored(var) => call.var_args.push((index, var)),
+            BoundArg::Function(f) => fn_args.push((index, f)),
+            BoundArg::Placeholder(n) => {
+                if let Some(at) = n
+                    .checked_sub(1)
+                    .and_then(|i| invoke_site_index(source, i))
+                    .and_then(|i| recorded_position(program, source, i))
+                {
+                    position = at;
+                    call.var_args
+                        .extend(args_at(&source.var_args, at).map(|v| (index, v)));
+                    fn_args.extend(args_at(source.fn_args(), at).map(|f| (index, f)));
+                    if source.addr_of_args().contains(&at) {
+                        addr_of_args.push(index);
+                    }
+                    if source.addr_of_member_args().contains(&at) {
+                        addr_of_member_args.push(index);
+                    }
+                }
+            }
+            BoundArg::Opaque => {}
+        }
+        source_positions.push(position);
+    }
+    call.args_bound_past_this =
+        binding.receiver.is_some() || program.symbols.has_this_param(target);
+    call.receiver = binding
+        .receiver
+        .and_then(|_| args_at(&call.var_args, 0).next());
+    call.details = CallSiteDetails::boxed(fn_args, addr_of_member_args, addr_of_args, None);
+    InvocationSite {
+        source,
+        composed: Some(Arc::new(ComposedArguments {
+            call,
+            source_positions,
+        })),
+    }
+}
+
+fn record_model_forwarded(
+    program: &Program,
+    pag: &Pag,
+    st: &mut SolverState,
+    site: &InvocationSite<'_>,
+    callee: FnId,
+    formal: u32,
+    arg: u32,
+) {
+    if let Some(composed) = &site.composed {
+        // These positions name the composed argument list. Export its actual
+        // value at the source site instead of reading that site's raw args.
+        append_argument_rows(
+            pag,
+            &composed.call,
+            arg,
+            composed.source_positions[arg as usize],
+            program.symbols.function(callee).params[formal as usize],
+            &mut st.bound_arg_flow,
+        );
+    } else {
+        record_forwarded(st, site.source.id, callee, (formal, arg));
+    }
+}
+
 /// Callback variables handed to a modelled callee that forwards arguments,
 /// by PAG node, with the call sites that hand them over: a function reaching
 /// such a variable is wired like an indirect call's target.
-type InvokeWatch<'m> = FxHashMap<PagNodeId, Vec<(&'m trace_ir::CallSite, Invoked<'m>)>>;
+type InvokeWatch<'m> = FxHashMap<PagNodeId, Vec<(InvocationSite<'m>, Invoked<'m>)>>;
+type BoundModelSites<'m> = FxHashMap<(CallSiteId, FnId), Vec<InvocationSite<'m>>>;
+/// Each target and whether an ordinary function value also reaches it.
+type IndirectTargets = FxHashMap<CallSiteId, Vec<(FnId, bool)>>;
 
 /// The callees a model says may invoke a callback argument, with the argument
 /// positions it names (`docs/MODELS.md`, "Function models"). Read off the
@@ -2959,18 +3283,19 @@ fn args_at<T: Copy>(args: &[(u32, T)], index: u32) -> impl Iterator<Item = T> + 
         .map(|(_, v)| *v)
 }
 
-/// The functions variable `var` may hold, in its points-to set's order.
-fn held_functions<'a>(
+/// The callable values a variable may hold, in its points-to set's order.
+fn held_callables<'a>(
     pag: &'a Pag,
     st: &'a SolverState,
     var: VarId,
-) -> impl Iterator<Item = FnId> + 'a {
+) -> impl Iterator<Item = LocId> + 'a {
     pag.var_node
         .get(&var)
         .and_then(|node| st.pts.get(node))
         .into_iter()
         .flatten()
-        .filter_map(|loc| fn_for_loc(pag, *loc))
+        .copied()
+        .filter(|&loc| fn_for_loc(pag, loc).is_some())
 }
 
 /// Whether this call site hands one of the caller's own modelled callback
@@ -3006,6 +3331,14 @@ fn forwards_own_callback(
 const RECEIVER_SKIPS: usize = 2;
 /// The supplied values that may lead forwarded arguments: none or one.
 const LEADS: usize = 2;
+
+/// A known type selects the applicable lead. An unknown type admits both.
+fn supplied_leads(supplied: Option<bool>) -> [Option<u32>; LEADS] {
+    [
+        (supplied != Some(true)).then_some(0),
+        (supplied != Some(false)).then_some(1),
+    ]
+}
 
 /// The ways a callback can take forwarded arguments ([`invoke_alignments`]),
 /// in the order first found, each once: one per receiver skip and supplied
@@ -3066,10 +3399,7 @@ fn invoke_alignments(
                 var_is_value_of(program, formal, class)
             })
         });
-        [
-            (supplied != Some(true)).then_some(0),
-            (supplied != Some(false)).then_some(1),
-        ]
+        supplied_leads(supplied)
     };
     // The ways among `typed` that `fits` has room for. A callable that takes
     // the supplied value but has no room for it ahead of the arguments is
@@ -3143,6 +3473,30 @@ fn invoke_alignments(
     Alignments::from_grid(grid)
 }
 
+/// The supplied value, if present, reaches the formals fed by `_1`.
+/// Its slot shifts every later placeholder even though it has no IR value.
+fn bound_invoke_alignments(
+    program: &Program,
+    target: FnId,
+    binding: &BoundCallable,
+    invoked: &Invoked,
+) -> Alignments {
+    let supplied = invoked.supplies.map_or(Some(false), |name| {
+        let class = class_type(name);
+        let mut consumers = program
+            .symbols
+            .function(target)
+            .params
+            .iter()
+            .zip(bound_slots(program, target, binding))
+            .filter(|(_, arg)| *arg == BoundArg::Placeholder(1))
+            .map(|(&formal, _)| var_is_value_of(program, formal, &class));
+        let first = consumers.next().flatten()?;
+        consumers.all(|value| value == Some(first)).then_some(first)
+    });
+    Alignments::from_grid([supplied_leads(supplied), [None; LEADS]])
+}
+
 /// The definitions a callback handed over as `callback` runs when a model
 /// invokes it with `args` at `cs`: those an indirect call from the caller
 /// reaches ([`reached_definitions`]) that can take the arguments, each with
@@ -3151,15 +3505,23 @@ fn invoke_targets<'a>(
     program: &'a Program,
     cs: &'a trace_ir::CallSite,
     callback: FnId,
+    bound: Option<&'a BoundCallable>,
     invoked: &'a Invoked<'a>,
 ) -> impl Iterator<Item = (FnId, Alignments)> + 'a {
     let caller_target = program.symbols.function(cs.caller).target;
-    reached_definitions(program, callback, caller_target)
-        .into_iter()
-        .filter_map(move |target| {
-            let alignments = invoke_alignments(program, cs, target, invoked);
-            (alignments.len > 0).then_some((target, alignments))
-        })
+    let targets = if bound.is_some() && invoked.model == "std::packaged_task::packaged_task" {
+        Vec::new()
+    } else {
+        reached_definitions(program, callback, caller_target)
+    };
+    targets.into_iter().filter_map(move |target| {
+        let alignments = if let Some(binding) = bound {
+            bound_invoke_alignments(program, target, binding, invoked)
+        } else {
+            invoke_alignments(program, cs, target, invoked)
+        };
+        (alignments.len > 0).then_some((target, alignments))
+    })
 }
 
 /// Parameter wiring for the callbacks handed to a modelled callee at `cs`
@@ -3174,35 +3536,43 @@ fn wire_invocations<'m>(
     program: &Program,
     st: &mut SolverState,
     scratch: &mut Scratch,
-    cs: &'m trace_ir::CallSite,
+    site: &InvocationSite<'m>,
     invocations: Option<&Invocations<'m>>,
     watch: &mut InvokeWatch<'m>,
 ) {
+    let cs = site.arguments();
     for &invoked in invocations.into_iter().flatten() {
-        if invoked.args.is_empty() || !invocation_applies(program, cs, &invoked) {
+        if (invoked.args.is_empty() && pag.bound_callables.is_empty())
+            || !invocation_applies(program, cs, &invoked)
+        {
             continue;
         }
         let Some(index) = invoke_site_index(cs, invoked.param) else {
             continue;
         };
         for callback in args_at(cs.fn_args(), index) {
-            wire_callback(pag, program, st, scratch, cs, callback, &invoked);
+            if let Some(&loc) = pag.fn_locations.get(&callback) {
+                wire_callback(pag, program, st, scratch, site, loc, &invoked);
+            }
         }
         for var in args_at(&cs.var_args, index) {
             let Some(&node) = pag.var_node.get(&var) else {
                 continue;
             };
             let watchers = watch.entry(node).or_default();
-            if watchers.iter().any(|&(c, w)| c.id == cs.id && w == invoked) {
+            if watchers
+                .iter()
+                .any(|(other, w)| *w == invoked && site.same_call(other))
+            {
                 continue;
             }
-            watchers.push((cs, invoked));
+            watchers.push((site.clone(), invoked));
             // A settled variable never pops again: wire what it holds now,
             // in an order its hash set does not decide.
-            let mut held: Vec<FnId> = held_functions(pag, st, var).collect();
-            held.sort_unstable();
-            for callback in held {
-                wire_callback(pag, program, st, scratch, cs, callback, &invoked);
+            let mut held: Vec<_> = held_callables(pag, st, var).collect();
+            held.sort_unstable_by_key(|&loc| (fn_for_loc(pag, loc), loc));
+            for loc in held {
+                wire_callback(pag, program, st, scratch, site, loc, &invoked);
             }
         }
     }
@@ -3216,15 +3586,28 @@ fn wire_callback(
     program: &Program,
     st: &mut SolverState,
     scratch: &mut Scratch,
-    cs: &trace_ir::CallSite,
-    callback: FnId,
+    site: &InvocationSite<'_>,
+    callable: LocId,
     invoked: &Invoked,
 ) {
+    let cs = site.arguments();
+    let Some(callback) = fn_for_loc(pag, callable) else {
+        return;
+    };
     let args = invoked.args;
-    for (target, alignments) in invoke_targets(program, cs, callback, invoked) {
+    let bound = (pag.locations[callable.0 as usize].kind == LocKind::Bound)
+        .then(|| pag.bound_callables[&callable].clone());
+    if args.is_empty() && bound.is_none() {
+        return;
+    }
+    for (target, alignments) in invoke_targets(program, cs, callback, bound.as_ref(), invoked) {
         for &skip in alignments.as_slice() {
             let actual_of =
                 |formal: u32| invoke_site_index(cs, args.actual_for(formal.checked_sub(skip)?)?);
+            if let Some(binding) = &bound {
+                wire_bound_callable(pag, program, st, scratch, site, target, binding, actual_of);
+                continue;
+            }
             wire_actuals(
                 pag,
                 program,
@@ -3233,7 +3616,9 @@ fn wire_callback(
                 st,
                 scratch,
                 actual_of,
-                |st, formal, arg| record_forwarded(st, cs.id, target, (formal, arg)),
+                |pag, st, formal, arg| {
+                    record_model_forwarded(program, pag, st, site, target, formal, arg);
+                },
             );
         }
     }
@@ -3253,6 +3638,8 @@ fn callback_edges<'m>(
     st: &SolverState,
     invoked: &FxHashMap<FnId, Invocations<'m>>,
     call_edges: &[CallGraphEdge],
+    resolved_indirect: &IndirectTargets,
+    bound_model_sites: &BoundModelSites<'_>,
 ) -> (Vec<CallGraphEdge>, Vec<contexts::Invocation<'m>>) {
     let mut edges = Vec::new();
     let mut invocations = Vec::new();
@@ -3273,52 +3660,72 @@ fn callback_edges<'m>(
         let Some(cs) = program.symbols.call_site_by_id(edge.call_site) else {
             continue;
         };
-        for effect in params {
-            if !invocation_applies(program, cs, effect) {
-                continue;
-            }
-            let Invoked {
-                param,
-                context,
-                model,
-                ..
-            } = *effect;
-            let Some(index) = invoke_site_index(cs, param) else {
-                continue;
-            };
-            // A modelled API forwarding its own callback parameter to
-            // another modelled API (`SubmitTask(task, name)` calling
-            // `SubmitTask(task, attr)`) would rebroadcast the parameter's
-            // whole points-to set — every callback handed to the API
-            // anywhere — as an edge from the API body. The outer submission
-            // site already resolves the concrete callback; skipping the
-            // forward keeps the graph from carrying that union once per
-            // forwarding overload. Only a context-less inner effect is
-            // skipped: one that starts a context keeps its edge and context,
-            // so no execution context is lost.
-            if context.is_none() && forwards_own_callback(program, cs, index, invoked) {
-                continue;
-            }
-            let start = ContextStart {
-                call_site: cs.id,
-                api: edge.callee,
-                param,
-                receiver: cs.receiver,
-            };
-            let named = args_at(cs.fn_args(), index);
-            let pointed = args_at(&cs.var_args, index).flat_map(|var| held_functions(pag, st, var));
-            for callee in named.chain(pointed) {
-                for (target, _) in invoke_targets(program, cs, callee, effect) {
-                    if let Some(context) = context {
-                        invocations.push((start, target, context, model));
-                    }
-                    if seen.insert((cs.id, target)) {
-                        edges.push(CallGraphEdge {
-                            call_site: cs.id,
-                            caller: cs.caller,
-                            callee: target,
-                            resolution: ResolutionKind::Indirect,
-                        });
+        let composed = bound_model_sites.get(&(edge.call_site, edge.callee));
+        let ordinary = composed.is_none()
+            || resolved_indirect
+                .get(&edge.call_site)
+                .is_some_and(|targets| targets.contains(&(edge.callee, true)));
+        let source = InvocationSite::source(cs);
+        for site in ordinary
+            .then_some(&source)
+            .into_iter()
+            .chain(composed.into_iter().flatten())
+        {
+            let cs = site.arguments();
+            for effect in params {
+                if !invocation_applies(program, cs, effect) {
+                    continue;
+                }
+                let Invoked {
+                    param,
+                    context,
+                    model,
+                    ..
+                } = *effect;
+                let Some(index) = invoke_site_index(cs, param) else {
+                    continue;
+                };
+                // A modelled API forwarding its own callback parameter to
+                // another modelled API (`SubmitTask(task, name)` calling
+                // `SubmitTask(task, attr)`) would rebroadcast the parameter's
+                // whole points-to set — every callback handed to the API
+                // anywhere — as an edge from the API body. The outer submission
+                // site already resolves the concrete callback; skipping the
+                // forward keeps the graph from carrying that union once per
+                // forwarding overload. Only a context-less inner effect is
+                // skipped: one that starts a context keeps its edge and context,
+                // so no execution context is lost.
+                if context.is_none() && forwards_own_callback(program, cs, index, invoked) {
+                    continue;
+                }
+                let start = ContextStart {
+                    call_site: cs.id,
+                    api: edge.callee,
+                    param,
+                    receiver: cs.receiver,
+                };
+                let named =
+                    args_at(cs.fn_args(), index).filter_map(|f| pag.fn_locations.get(&f).copied());
+                let pointed =
+                    args_at(&cs.var_args, index).flat_map(|var| held_callables(pag, st, var));
+                for loc in named.chain(pointed) {
+                    let location = &pag.locations[loc.0 as usize];
+                    let Some(callback) = location.fn_id else {
+                        continue;
+                    };
+                    let bound = pag.bound_callables.get(&loc);
+                    for (target, _) in invoke_targets(program, cs, callback, bound, effect) {
+                        if let Some(context) = context {
+                            invocations.push((start, target, context, model));
+                        }
+                        if seen.insert((cs.id, target)) {
+                            edges.push(CallGraphEdge {
+                                call_site: cs.id,
+                                caller: cs.caller,
+                                callee: target,
+                                resolution: ResolutionKind::Indirect,
+                            });
+                        }
                     }
                 }
             }
@@ -3446,12 +3853,51 @@ fn member_pointer_targets(
     targets
 }
 
+/// The function a location names as a value: an ordinary function's own
+/// location, or the one a bound callable wraps (docs/IR.md, "Bound
+/// callables"), which every rule that moves a function value treats the
+/// same. Its bound receiver and arguments are in [`Pag::bound_callables`].
 fn fn_for_loc(pag: &Pag, loc: LocId) -> Option<FnId> {
     let abstract_loc = &pag.locations[loc.0 as usize];
-    if abstract_loc.kind == LocKind::Function {
+    if matches!(abstract_loc.kind, LocKind::Function | LocKind::Bound) {
         abstract_loc.fn_id
     } else {
         None
+    }
+}
+
+fn append_argument_rows(
+    pag: &Pag,
+    cs: &CallSite,
+    recorded: u32,
+    arg_index: u32,
+    formal: VarId,
+    arg_flow_edges: &mut Vec<ArgFlowEdge>,
+) {
+    if let Some(actual) = pag.argument_var(cs, recorded) {
+        arg_flow_edges.push(ArgFlowEdge {
+            call_site: cs.id,
+            arg_index,
+            actual_var: Some(actual),
+            actual_address: cs
+                .addr_of_args()
+                .contains(&recorded)
+                .then(|| args_at(&cs.var_args, recorded).next())
+                .flatten(),
+            actual_fn: None,
+            formal,
+        });
+    } else {
+        for &(_, fn_id) in cs.fn_args().iter().filter(|(j, _)| *j == recorded) {
+            arg_flow_edges.push(ArgFlowEdge {
+                call_site: cs.id,
+                arg_index,
+                actual_var: None,
+                actual_address: None,
+                actual_fn: Some(fn_id),
+                formal,
+            });
+        }
     }
 }
 
@@ -3476,27 +3922,8 @@ fn extract_arg_flow(
             .filter(|c| c.id == edge.call_site)
             .expect("call site for edge");
         let callee = program.symbols.function(edge.callee);
-        // One row per variable or function passed at `arg_index`.
         let mut push_rows = |arg_index: u32, formal: VarId| {
-            if let Some(actual) = pag.argument_var(cs, arg_index) {
-                arg_flow_edges.push(ArgFlowEdge {
-                    call_site: edge.call_site,
-                    arg_index,
-                    actual_var: Some(actual),
-                    actual_fn: None,
-                    formal,
-                });
-            } else {
-                for &(_, fn_id) in cs.fn_args().iter().filter(|(j, _)| *j == arg_index) {
-                    arg_flow_edges.push(ArgFlowEdge {
-                        call_site: edge.call_site,
-                        arg_index,
-                        actual_var: None,
-                        actual_fn: Some(fn_id),
-                        formal,
-                    });
-                }
-            }
+            append_argument_rows(pag, cs, arg_index, arg_index, formal, arg_flow_edges);
         };
         for (i, formal) in callee.params.iter().enumerate() {
             let idx = i as u32;

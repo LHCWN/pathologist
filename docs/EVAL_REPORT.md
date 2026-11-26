@@ -1,5 +1,46 @@
 # Evaluation Report
 
+## Deferred std::bind callables
+
+On the pinned OpenHarmony revisions, moving bound callbacks from
+construction to invocation changed the raw indirect graph as follows.
+Both profiles used the embedded models. The canonical checks used
+MSYS2 MinGW GCC 15.2.0.
+
+| Corpus | Default indirect edges | Canonical indirect edges | Indirect edges removed / added |
+|---|---:|---:|---|
+| HDF | 5,226 ? 5,212 | 5,226 ? 5,212 | 14 / 0 in both profiles |
+| HiView | 266 ? 264 | 349 ? 347 | 16 / 14 in both profiles |
+| Camera | 475 ? 463 | 500 ? 487 | 16 / 4 default, 17 / 4 canonical |
+| Ability Runtime | 2,533 ? 2,537 | 2,536 ? 2,540 | 1 / 5 in both profiles |
+
+- HDF loses the 14 construction-site edges in the HDI method registries.
+  The registry invocation remains unresolved.
+- HiView gains 11 targets at `EventLoop::ProcessEvent`'s `event.task()`,
+  including `Plugin::OnEventProxy` with the receiver and event from
+  `Plugin::DelayProcessEvent`. The filename parser's stored callback reaches
+  both implementations. The `ffrt::submit` in `InitAndRunTasks` starts
+  `InitAndRunTask`. The `handler.get()` receiver in the separate
+  `EventLoop::AddEventForResult` example still reaches a packaged-task
+  constructor. Dispatch through that wrapper needs storage and invocation
+  modeling.
+- Camera gains the death, common-event and control-center callbacks at
+  their stored-value calls. The `std::thread` in `MuxerFilter::OnBufferFilled`
+  starts `EventCompleteStopAsync`. The rotate plugin's external
+  `openCameraDeviceFunc` needs SDK dispatch or a matching invoke model.
+  The pool's seven former construction-site edges need support for the
+  forwarded callable, its pack, and packaged-task dispatch.
+- Ability Runtime gains four `SubmitTask` submission edges and one
+  `task()` edge in its lambda, all to
+  `AppMgrServiceInner::AttachedToStatusBar`. The canonical total moves from
+  420,591 to 420,595 call edges and from 457,970 to 458,002 argument-flow
+  rows.
+
+The default checks passed 198/198 and the canonical checks passed 90/90.
+Canonical debug HiView and Camera passed 50/50. The one-job and eight-job
+exports matched across the analysis tables after excluding build and run
+metadata.
+
 ## Container range-for reads and canonical budget - 2026-11-24
 
 A `range-for` over a named modeled sequence or set container now reads the same

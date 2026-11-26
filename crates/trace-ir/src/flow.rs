@@ -24,6 +24,22 @@ pub enum ReturnFlow {
     LvalueAddress(Box<ReturnFlow>),
 }
 
+/// One argument a `std::bind` holds for the callable it wraps
+/// ([`FlowConstraint::BindCallable`]; docs/IR.md, "Bound callables").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BoundArg {
+    /// A value the binder keeps, passed to the callable as it was written.
+    Stored(VarId),
+    /// A named function passed as a stored argument.
+    Function(FnId),
+    /// `std::placeholders::_n`, which the invocation's argument `n` fills
+    /// (`n` is 1-based, as it is spelled).
+    Placeholder(u32),
+    /// An argument the site records no value for (a literal): it holds its
+    /// position in the callable's parameters but supplies no value.
+    Opaque,
+}
+
 /// Storage identity for a container with index-insensitive element flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContainerOwner {
@@ -100,6 +116,17 @@ pub enum FlowConstraint {
     /// raw pointer, whose pointee type filters the admitted locations. See
     /// `docs/IR.md`, "Smart-pointer unwrap".
     UnwrapPointer { dst: VarId, src: VarId },
+    /// `dst` holds the callable `std::bind` built: `callee`, called on
+    /// `receiver` (a member's implicit `this`; `None` for a free or static
+    /// function) with `args` bound to its parameters in order. The bind
+    /// itself runs nothing; the callable runs where `dst` is invoked. See
+    /// `docs/IR.md`, "Bound callables".
+    BindCallable {
+        dst: VarId,
+        callee: FnId,
+        receiver: Option<BoundArg>,
+        args: Vec<BoundArg>,
+    },
 }
 
 impl FlowConstraint {
@@ -123,6 +150,7 @@ impl FlowConstraint {
             | FlowConstraint::CallReturnResolved { dst, .. }
             | FlowConstraint::CallReferenceReturn { dst, .. }
             | FlowConstraint::CallReferenceReturnDeclared { dst, .. }
+            | FlowConstraint::BindCallable { dst, .. }
             | FlowConstraint::NewHeap { dst }
             | FlowConstraint::StringConst { dst, .. }
             | FlowConstraint::NullPointer { dst } => (dst, None),
@@ -134,6 +162,28 @@ impl FlowConstraint {
         std::iter::once(first)
             .chain(second)
             .chain(arguments.iter().map(|(_, var)| *var))
+            .chain(self.held_vars())
+    }
+
+    /// The variables this constraint holds besides its operands: a bound
+    /// callable's receiver and stored arguments, which are values of the
+    /// function the bind is written in. Empty for every other kind.
+    pub fn held_vars(&self) -> impl Iterator<Item = VarId> + '_ {
+        let receiver = match self {
+            FlowConstraint::BindCallable { receiver, .. } => *receiver,
+            _ => None,
+        };
+        let args: &[BoundArg] = match self {
+            FlowConstraint::BindCallable { args, .. } => args,
+            _ => &[],
+        };
+        receiver
+            .into_iter()
+            .chain(args.iter().copied())
+            .filter_map(|arg| match arg {
+                BoundArg::Stored(var) => Some(var),
+                BoundArg::Function(_) | BoundArg::Placeholder(_) | BoundArg::Opaque => None,
+            })
     }
 }
 

@@ -55,3 +55,4 @@ mod cpp_review_257_invocations;
 mod cpp_review_257_opaque;
 mod cpp_review_257_postfix;
 mod cpp_review_257_templates;
+mod std_bind;

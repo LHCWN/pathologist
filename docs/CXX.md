@@ -989,8 +989,9 @@ Known C++ imprecision (in addition to the [general list](FAQ.md#known-imprecisio
 - An out-of-line member definition under `using namespace N;` at global
   scope registers under the bare class name, apart from `N::`'s in-class
   prototypes; a call reaching the prototype stays external.
-- `std::bind` / generic functors without a visible `operator()` stay
-  unresolved-indirect unless a function address flows into them.
+- [Bound callables](IR.md#bound-callables) carry their target and bindings
+  through ordinary callable slots. Generic functors need a visible
+  `operator()` or a function value that flows into the slot.
 - Default construction without parens (`Cls o;`) emits no ctor site.
 - **No call site resolves to a conversion operator**: `Cls::operator T` is
   indexed, but neither the compiler-inserted call of an implicit conversion

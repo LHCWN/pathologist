@@ -4,9 +4,20 @@ use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{
-    CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow,
-    StorageClass, TargetId, TypeDesc, TypeId, VarId,
+    BoundArg, CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program,
+    ReturnFlow, StorageClass, TargetId, TypeDesc, TypeId, VarId,
 };
+
+/// What a `Bound` location binds ([`Pag::bound_callables`]): the callable
+/// `std::bind` built, as lowering read it off the bind expression
+/// (docs/IR.md, "Bound callables").
+#[derive(Debug, Clone)]
+pub struct BoundCallable {
+    /// The object bound as a member function's implicit `this`.
+    pub receiver: Option<BoundArg>,
+    /// One entry per bound argument, in the order written.
+    pub args: Vec<BoundArg>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PagNodeKind {
@@ -127,6 +138,10 @@ pub struct Pag {
     pub indices: SolverIndices,
     /// Call results produced by `return_field`, for transitive return expansion.
     return_field_values: FxHashSet<VarId>,
+    /// Each `Bound` location's binding, by location: the function it wraps,
+    /// with the receiver and arguments `std::bind` holds for it
+    /// (docs/IR.md, "Bound callables"). Empty unless the program binds.
+    pub bound_callables: FxHashMap<LocId, BoundCallable>,
 }
 
 impl Pag {
@@ -1026,6 +1041,34 @@ impl Pag {
                     let src_n = self.var_node_id(*src);
                     self.add_unwrap(dst_n, src_n);
                 }
+                FlowConstraint::BindCallable {
+                    dst,
+                    callee,
+                    receiver,
+                    args,
+                } => {
+                    let function = program.symbols.function(*callee);
+                    let loc = LocId(self.locations.len() as u32);
+                    self.alloc_loc(AbstractLocation {
+                        id: loc,
+                        kind: LocKind::Bound,
+                        var: None,
+                        fn_id: Some(*callee),
+                        field: None,
+                        type_id: program.types.unknown(),
+                        desc: function.name.clone(),
+                    });
+                    self.set_location_target(loc, program.symbols.variable(*dst).target);
+                    self.bound_callables.insert(
+                        loc,
+                        BoundCallable {
+                            receiver: *receiver,
+                            args: args.clone(),
+                        },
+                    );
+                    let dst = self.var_node_id(*dst);
+                    self.add_addr_of(dst, self.loc_node[&loc]);
+                }
             }
         }
         self.expand_call_site_returns(program, models);
@@ -1528,6 +1571,32 @@ impl Pag {
             })
             .flatten();
         Some(addressed.unwrap_or(actual))
+    }
+
+    /// The location that represents this binding fact. Configuration
+    /// alternatives can feed different bindings into the same variable.
+    pub fn bound_location(&self, fact: &FlowConstraint) -> Option<PagNodeId> {
+        let FlowConstraint::BindCallable {
+            dst,
+            callee,
+            receiver,
+            args,
+        } = fact
+        else {
+            return None;
+        };
+        let dst = self.var_node.get(dst)?;
+        self.indices.addr_of_dst.get(dst)?.iter().find_map(|&i| {
+            let src = self.constraints[i].src;
+            let PagNodeKind::Loc(loc) = self.nodes[src.0 as usize].kind else {
+                return None;
+            };
+            let bound = self.bound_callables.get(&loc)?;
+            (self.locations[loc.0 as usize].fn_id == Some(*callee)
+                && bound.receiver == *receiver
+                && bound.args == *args)
+                .then_some(src)
+        })
     }
 
     pub fn call_target_node(&mut self, cs: trace_ir::CallSiteId) -> PagNodeId {

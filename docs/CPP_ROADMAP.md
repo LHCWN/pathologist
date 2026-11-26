@@ -127,10 +127,10 @@ Eval **H7**. Three stacked gaps; fixing only intern-as-`FnPtr` is not enough.
 
 ## C4 — Deferred callables (`std::bind`, `packaged_task`, `ffrt::submit`)
 
-Hiview’s second dispatch axis: **do this later on a work loop / ffrt
-queue**. Lambdas exist as `$lambda` but creators have **0 incoming
-edges**; `std::bind` reaches its callable at the bind site (#250), but the
-later call through the stored task is not tied back to it.
+The analyzer carries [bound callables](IR.md#bound-callables) through
+ordinary callable storage to visible indirect calls and modeled task
+submissions. Framework and SDK entry points still need visible dispatch
+or a corresponding invocation model.
 
 | Site | Pattern |
 |------|---------|
@@ -142,42 +142,12 @@ later call through the stored task is not tied back to it.
 | `uc_telemetry_callback.cpp:187` | `[callback = shared_from_this()] { callback->RunTraceOnTimeTask(); }` |
 | `platform_monitor.cpp:451` | `std::bind(&PlatformMonitor::CollectPerfProfiler, this)` |
 
-**Design sketch:**
-
-- `std::bind(&Cls::m, recv, args…)` → `AddrOfFn(Cls::m)` into the
-  destination callable (ignore bound args for v1; may over-approx).
-- `ffrt::submit(F)` / `std::thread(F)` summaries: if `F` is a `$lambda`
-  or `FnPtr` slot, emit a **direct/indirect** edge from the submit site
-  to that function (async, same as a call).
-- Lambda **captures**: `[this]`, `[callback = shared_from_this()]` copy
-  the receiver into the lambda’s implicit `this` / first synthetic
-  field so body member calls type.
-- `std::packaged_task<Sig>` intern as `FnPtr` like `std::function`.
-
-**Done so far:** thread entry points (`std::thread`, `pthread_create`,
-#187) and the OpenHarmony task primitives (#203, `ffrt::submit` among them)
-are `invoke` models; the list and its imprecision are in
-`docs/MODELS.md`, "Built-in models" and "Documented imprecision". A
-submitted lambda (`FaultLogDatabase::SaveFaultLogInfo`, the
-`PassthroughMonitor` handlers) now has an edge **from the submitter**
-([EVAL_REPORT.md](EVAL_REPORT.md#task-and-thread-primitives-203--2026-10-09)).
-Lambda captures bind the enclosing scope (`docs/CXX.md`, "C++ support
-(first step)"), and `[callback = shared_from_this()]` captures the object
-itself, typed as its `shared_ptr` (`docs/IR.md`, "`shared_from_this`"),
-so `uc_telemetry_callback.cpp:187` reaches `RunTraceOnTimeTask`.
-`std::bind` and `std::packaged_task` (#250) keep the wrapped callable's edge
-from the wrapping site (`base/plugin.cpp:93`, `base/event_loop.cpp:191`), as
-`docs/MODELS.md`, "Callable wrappers", states; calling the stored task
-(`event.packagedTask->operator()()`) is not tied back to it. Arguments
-through a variadic parameter pack are followed since #282
-(`docs/POINTERS.md`, "Variadic parameter packs").
-
-**Eval when done:** `Plugin::DelayProcessEvent` reaches `OnEventProxy` (met by
-#250); `EventLoop::ProcessEvent` packaged path reaches
-`EventHandler::OnEventProxy` (`EventLoop::AddEventForResult`, which builds the
-task, reaches it; the call in `ProcessEvent` is not tied to the task).
-
----
+The timer fixture in `tests/fixtures/std_bind` covers registration with
+an explicit invocation model, including the stored event and receiver.
+HiView's `EventLoop` path through `handler.get()` and
+`std::packaged_task<bool()>` also needs storage and invocation of the
+wrapper, as described under [Callable wrappers](MODELS.md#callable-wrappers).
+External Camera registration requires an appropriate SDK invocation model.
 
 ## C5 — Named plugin lookup (`pluginMap_["XPower"]`)
 
@@ -618,7 +588,7 @@ plugins without `dlsym` is C3 (static `REGISTER` ctors).
 | C1 | `auto p = wp.lock(); p->OnEventProxy();` + `auto l = p->GetWorkLoop(); l->AddEvent(...)` — done, see `tests/fixtures/cpp_auto_return` |
 | C2 | `Event::DownCastTo<SysEvent>(e); sys->SetEventValue(...)` |
 | C3 | `REGISTER`-like static `PluginRegistInfo(MakeFoo)` + `info->getPluginObject()` |
-| C4 | `std::bind(&Plugin::OnEventProxy, this, e)` stored and invoked; `ffrt::submit` summary done, see `tests/fixtures/task_primitives`; `std::bind` / `packaged_task` edge from the wrapping site done (#250, `tests/fixtures/cpp_bind_packaged_task`), the call through the stored task not |
+| C4 | Concrete `std::bind` values flow to their invocation. See `tests/fixtures/std_bind`. Packaged-task dispatch remains pending. |
 | C5 | `map<string, shared_ptr<Plugin>>` + `find("Foo")->second->OnEventProxy()` |
 | C6 | Proxy field filled by factory, then `proxy->OnEvent()` |
 | C7 | `map<int, int(*)(Msg*)>` + `parser(msg)` |

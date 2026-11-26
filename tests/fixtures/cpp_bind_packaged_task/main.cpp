@@ -1,7 +1,6 @@
-// Callables wrapped by `std::bind` and `std::packaged_task` keep their call
-// edge from the code that wraps them. As in the corpora, the standard headers
-// are not in the tree: `std::bind`, `std::packaged_task`, `std::function` and
-// `std::make_shared` are names the unit never sees declared.
+// As in the corpora, standard callable wrappers are used without
+// indexing their declarations. The packaged-task constructor retains
+// ordinary function reachability. Bind construction runs no callback.
 #include <functional>
 #include <future>
 #include <memory>
@@ -11,7 +10,7 @@ typedef void (*Callback)();
 
 // A minimal `Submit`-style thread pool: the task is a `packaged_task` over a
 // `std::bind` of the submitted callable and its arguments, run later through
-// a queued lambda. The callable is only ever named inside `std::bind`.
+// a queued lambda.
 void Hit() {}
 int Work(Callback cb, int n) {
     cb();
@@ -29,9 +28,8 @@ auto Submit(F &&f, Args &&...args) {
 }
 void Enqueue() { Submit(Work, Hit, 1); }
 
-// The same pool with the bound argument declared by name rather than in a
-// parameter pack, which the analysis does not follow: the argument reaches
-// the callable's formal.
+// The same pool with a named forwarded argument. The packaged task's
+// later invocation is outside the constructor model.
 void FixedHit() {}
 int FixedWork(Callback cb, int n) {
     cb();
@@ -45,10 +43,7 @@ auto SubmitFixed(F &&f, A &&a) {
 }
 void EnqueueFixed() { SubmitFixed(FixedWork, FixedHit); }
 
-// A parameter pack is not a formal, so `Hit` does not reach `Work`'s `cb`
-// through `Submit`'s `args`; the edge from `Submit` to `Work` is still there.
-
-// `std::bind` on its own: the callable and its bound arguments.
+// Construct and discard the binding.
 void BoundHit() {}
 void BoundWork(Callback cb, int n) { cb(); }
 void Bind() { auto bound = std::bind(BoundWork, BoundHit, 3); }

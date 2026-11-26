@@ -857,6 +857,10 @@ Matching, body/override precedence and disabling rules are specified in
 
 ## SQLite database schema
 
+A callable constructed by `std::bind` can appear as a `Bound` location in
+debug exports. Its argument-flow rows are attached to the call site that
+invokes it. See [Bound callables](docs/IR.md#bound-callables).
+
 Minimal and full databases record indirect callee and return-destination
 variable IDs in `call_sites.callee_var` and `call_sites.return_dst`. Export uses
 indexed SQLite joins for indirect-return provenance, building the required

@@ -96,7 +96,10 @@ fn collect_cells<'a>(
     let mut unfoldable = 0usize;
     for &loc in targets {
         let loc_kind = pag.locations[loc.0 as usize].kind;
-        if matches!(loc_kind, LocKind::Function | LocKind::StringLit) {
+        if matches!(
+            loc_kind,
+            LocKind::Function | LocKind::Bound | LocKind::StringLit
+        ) {
             continue;
         }
         cells.push(loc);

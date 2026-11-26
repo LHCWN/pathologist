@@ -1691,18 +1691,31 @@ fn merges_body(program: &Program, mode: MergeMode, function: &Function) -> bool 
             || (function.linkage == trace_ir::Linkage::Internal && function.is_cpp))
 }
 
-fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
-    match flow {
+fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> + '_ {
+    let (receiver, args) = match flow {
+        FlowConstraint::BindCallable { receiver, args, .. } => (*receiver, args.as_slice()),
+        _ => (None, &[][..]),
+    };
+    let callee = match flow {
         FlowConstraint::AddrOfFn { callee, .. }
         | FlowConstraint::ArrayFnMember { callee, .. }
         | FlowConstraint::CallReturnResolved { callee, .. }
-        | FlowConstraint::CallReferenceReturnDeclared { callee, .. } => Some(*callee),
+        | FlowConstraint::CallReferenceReturnDeclared { callee, .. }
+        | FlowConstraint::BindCallable { callee, .. } => Some(*callee),
         // A call follows the function it is written in: dropped with it in
         // `valid_flow`, replayed with it in `MergeMode::SymbolsOnly`.
         FlowConstraint::CallReturn { caller, .. } => *caller,
         _ => None,
-    }
-    .into_iter()
+    };
+    callee.into_iter().chain(
+        receiver
+            .into_iter()
+            .chain(args.iter().copied())
+            .filter_map(|arg| match arg {
+                trace_ir::BoundArg::Function(function) => Some(function),
+                _ => None,
+            }),
+    )
 }
 
 fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> {
@@ -2050,6 +2063,26 @@ fn remap_flow(
             dst: rv(*dst),
             src: rv(*src),
         },
+        FlowConstraint::BindCallable {
+            dst,
+            callee,
+            receiver,
+            args,
+        } => {
+            let remap_arg = |arg| match arg {
+                trace_ir::BoundArg::Stored(var) => trace_ir::BoundArg::Stored(rv(var)),
+                trace_ir::BoundArg::Function(function) => {
+                    trace_ir::BoundArg::Function(rf(function))
+                }
+                trace_ir::BoundArg::Placeholder(_) | trace_ir::BoundArg::Opaque => arg,
+            };
+            FlowConstraint::BindCallable {
+                dst: rv(*dst),
+                callee: rf(*callee),
+                receiver: receiver.map(&remap_arg),
+                args: args.iter().copied().map(remap_arg).collect(),
+            }
+        }
     }
 }
 

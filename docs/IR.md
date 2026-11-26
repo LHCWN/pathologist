@@ -132,6 +132,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `StringConst { dst, value }` | `dst` points at a string literal | `p = "target"`; `dlsym(h, "target")` |
 | `NullPointer { dst }` | explicit null pointer value with no points-to target | C++ `nullptr`, including a call argument |
 | `UnwrapPointer { dst, src }` | cross a smart-pointer wrapper into its pointee (see [Smart-pointer unwrap](#smart-pointer-unwrap)) | C++ `sp->field`, `(*sp).field`, `sp.get()` |
+| `BindCallable { dst, callee, receiver, args }` | `dst` holds the callable `std::bind` built: `callee` with `receiver` as its object and `args` bound to its parameters (see [Bound callables](#bound-callables)) | C++ `f = std::bind(&C::m, this, _1, x)` |
 
 `NullPointer` copies from an interned immutable PAG value node into `dst`.
 That source is not an abstract location and always has an empty points-to set:
@@ -965,6 +966,51 @@ This is a may-alias relation. Expiry, a null result, and ownership counts are no
 The call site itself is recorded as before, so the call edge to the external `shared_from_this`/`weak_from_this` remains.
 
 This is a may-alias relation. It does not check that a `shared_ptr` owns the object: on an unowned object `shared_from_this()` throws `std::bad_weak_ptr` (C++17 and later) and `weak_from_this()` returns an empty `weak_ptr`, and neither outcome is modeled; the result still aliases the object. Expiry, ownership counts, the held class's constness and the C++17 availability of `weak_from_this` are not modeled.
+
+### Bound callables
+
+A standard `std::bind(f, args...)` in a function body with a uniquely
+identified function or member-function address produces a deferred
+callable. Lowering records one `BindCallable { dst, callee, receiver, args }`
+fact for the result. Name lookup and overload resolution identify the
+standard function, including through imports. Explicit callable casts can
+select a named overload. A single braced bind initializer supplies the
+callable slot the same way as a copy initializer. The receiver of a
+nonstatic member occupies the first binding slot. Each slot holds a
+stored variable, a named function value, a one-based
+`std::placeholders::_n` index, or an opaque value.
+
+The PAG gives each binding its own `Bound` points-to location. Copies,
+field stores and loads, returns, and parameter passing preserve that
+location. Indirect calls and modeled invocations resolve its target
+through the ordinary link-image-aware function lookup. Each binding
+wires its arguments independently, even if other bindings at the same
+invocation reach the same function. Persistent argument copies propagate
+the stored values and the invocation values selected by placeholders.
+At an indirect call, argument and callback models on the bound target
+read these same composed actuals. A value supplied by a model, such as
+a stop token, occupies an invocation slot
+even when it contributes no points-to information.
+Repeated placeholders can feed several formals. Extra invocation
+arguments are ignored. An argument supplied by the invocation is
+reported at its position in that call, while a stored argument is
+reported at the invoking site with its destination formal's position.
+Identical argument-flow rows from multiple bindings are exported once.
+The invocation also receives ordinary indirect return flow. An execution
+context comes from the model that invokes the callable, when applicable.
+
+The model tracks ordinary variable, pointer, and named function
+arguments using the analysis's existing flow-insensitive value model.
+An opaque slot or a missing placeholder argument contributes no value.
+A bind with a runtime or ambiguous target, a pack-expanded binding list,
+or a target with variadic template parameters has an opaque result.
+File-scope bind initializers remain opaque. The receiver mapping supports
+object pointers, including explicit address expressions and placeholders.
+Nested bind arguments, custom placeholders, reference wrappers, by-value
+receiver object identity, and virtual member dispatch remain outside this
+model. The wrapping site retains its ordinary call to `std::bind` and
+starts no callable execution. See [Callable wrappers](MODELS.md#callable-wrappers)
+for packaged tasks and task APIs.
 
 ### `dlsym` / `GetProcAddress`
 

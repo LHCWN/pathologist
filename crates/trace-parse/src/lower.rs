@@ -32,9 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use trace_ir::{
-    is_anonymous_tag, CallOccurrence, CallSite, CallSiteDetails, ContainerModels, Diagnostic,
-    DiagnosticSeverity, FieldId, FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow,
-    ScalarKind, Span, StorageClass, TempKind, TypeDesc, VarId, Variable,
+    is_anonymous_tag, BoundArg, CallOccurrence, CallSite, CallSiteDetails, ContainerModels,
+    Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId, Function, Linkage, Program,
+    ReturnFlow, ScalarKind, Span, StorageClass, TempKind, TypeDesc, VarId, Variable,
 };
 use trace_ir::{is_template_literal, split_pointer_suffix, strip_trailing_cv};
 use trace_preproc::{Language, PreprocessOptions};
@@ -9169,6 +9169,12 @@ fn call_result_shape(
     }
     let raw = normalize_spacing(node_text(source, &func));
     let name = strip_template_args(&raw);
+    if ctx.is_cpp && std_bind_result(program, ctx, source, value, func, &name) {
+        return Some(CallResult::Decided(Some(TypeDesc::FnPtr {
+            ret: Box::new(TypeDesc::Unknown),
+            params: vec![TypeDesc::Unknown],
+        })));
+    }
     if let Some(&SmartPtrFactory { wrapper, .. }) = smart_ptr_factory(program, ctx, value, &name) {
         return Some(CallResult::Decided(smart_ptr_type(
             program,
@@ -10294,6 +10300,190 @@ fn bare_names_std(
         .unwrap_or_else(|| ctx.directive_namespaces().any(|ns| ns == "std"));
     ctx.bare_std_calls.borrow_mut().insert(key, is_std);
     is_std
+}
+
+/// Whether the call `node` spells the standard `std::bind`, by the shared
+/// lookup: written `std::bind` or `::std::bind`, or bare and brought into
+/// scope by `using std::bind;` or `using namespace std;`
+/// ([`bare_names_std`]). A `bind` of the user's own, or of another
+/// namespace, is not it (docs/IR.md, "Bound callables").
+fn is_std_bind(program: &Program, ctx: &LowerContext, node: Node, name: &str) -> bool {
+    match name {
+        "::std::bind" => true,
+        "std::bind" => resolve_function_named(program, ctx, name)
+            .is_none_or(|id| program.symbols.function(id).name == "std::bind"),
+        "bind" => bare_names_std(program, ctx, node, name, "std::bind"),
+        _ => false,
+    }
+}
+
+fn bind_candidates_are_standard(program: &Program, candidates: &[FnId]) -> bool {
+    candidates
+        .iter()
+        .all(|&id| program.symbols.function(id).name == "std::bind")
+}
+
+/// Before overload resolution, a bind result can be treated as callable
+/// when ordinary lookup admits the standard name and ADL offers no other
+/// candidates. The indexed call uses its ranked candidates instead.
+fn std_bind_result(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    call: Node,
+    func: Node,
+    name: &str,
+) -> bool {
+    if !is_std_bind(program, ctx, call, name)
+        || lookup_var_node(program, ctx, source, func).is_some()
+    {
+        return false;
+    }
+    if name != "bind" {
+        return true;
+    }
+    let types: Vec<_> = call_arg_nodes(call)
+        .into_iter()
+        .map(|arg| known_arg_type(program, ctx, source, arg))
+        .collect();
+    bind_candidates_are_standard(
+        program,
+        &resolve_cpp_name_candidates(program, ctx, name, &types),
+    )
+}
+
+/// Record the callable built by a bind whose function target is known.
+fn lower_std_bind(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    args: &CallArgs,
+    dst: VarId,
+) {
+    let Some(list) = node.cached_field("arguments") else {
+        return;
+    };
+    let mut cursor = list.walk();
+    let mut arguments = list
+        .named_children(&mut cursor)
+        .filter(|arg| !arg.is_extra());
+    let Some(target) = arguments.next().and_then(|operand| {
+        let mut named = args.fn_args.iter().filter(|(at, _)| *at == 0);
+        if let Some(&(_, callee)) = named.next() {
+            named.all(|&(_, other)| other == callee).then_some(callee)
+        } else {
+            static_bind_cast_target(program, ctx, source, operand)
+        }
+    }) else {
+        return;
+    };
+    let function = program.symbols.function(target);
+    if !function.pack_positions.is_empty() {
+        return;
+    }
+    let mut bindings = Vec::new();
+    for (index, arg) in arguments.enumerate() {
+        if arg.cached_kind() == "parameter_pack_expansion" {
+            return;
+        }
+        let position = index as u32 + 1;
+        let spelled = node_text(source, &peel_casts(source, arg));
+        let binding = if let Some(n) = bind_placeholder(program, ctx, spelled) {
+            BoundArg::Placeholder(n)
+        } else if let Some(&(_, var)) = args.var_args.iter().find(|(at, _)| *at == position) {
+            BoundArg::Stored(var)
+        } else {
+            let mut named = args.fn_args.iter().filter(|(at, _)| *at == position);
+            match (named.next(), named.next()) {
+                (Some(&(_, function)), None) => BoundArg::Function(function),
+                _ => BoundArg::Opaque,
+            }
+        };
+        bindings.push(binding);
+    }
+    let member = is_member_function(program, target) && !function.is_static_member;
+    let mut bindings = bindings.into_iter();
+    let receiver = member.then(|| bindings.next().unwrap_or(BoundArg::Opaque));
+    // One producer per expression, including separate assignments to the
+    // same variable and branches that share an expression destination.
+    let value = alloc_ret_temp(program, ctx, node);
+    program.flow.push(FlowConstraint::BindCallable {
+        dst: value,
+        callee: target,
+        receiver,
+        args: bindings.collect(),
+    });
+    program.flow.push(FlowConstraint::Copy { dst, src: value });
+}
+
+/// A callable cast is collected as a variable argument. Recover a static
+/// binding only when the cast actually names a single matching function.
+fn static_bind_cast_target(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    operand: Node,
+) -> Option<FnId> {
+    let signature = callable_cast_type(program, ctx, source, operand)?;
+    let callee = resolve_call_fn_arg(program, ctx, source, operand)?;
+    let function = program.symbols.function(callee);
+    let candidates = if is_member_function(program, callee) || function.is_static_member {
+        function_value_candidates(program, ctx, source, operand, callee, None)
+    } else {
+        program
+            .symbols
+            .resolve_function_candidates(&function.name, Some(ctx.current_file))
+            .into_iter()
+            .filter(|candidate| {
+                program.symbols.function_pointer_signature_admits(
+                    *candidate,
+                    &signature,
+                    &program.types,
+                    ctx.reference_returns.contains(candidate),
+                )
+            })
+            .collect()
+    };
+    match candidates.as_slice() {
+        [callee] => Some(*callee),
+        _ => None,
+    }
+}
+
+fn bind_placeholder(program: &Program, ctx: &LowerContext, spelled: &str) -> Option<u32> {
+    let spelled = normalize_qualified(spelled.trim());
+    let (scope, leaf) = spelled.rsplit_once("::").unwrap_or(("", &spelled));
+    let number = leaf.strip_prefix('_')?;
+    if !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = number.parse().ok()?;
+    let placeholder_ns = |ns: &str| {
+        matches!(
+            ns,
+            "std::placeholders" | "std::__1::placeholders" | "std::__cxx11::placeholders"
+        )
+    };
+    let name_is_placeholder = |name: &str| {
+        name.rsplit_once("::")
+            .is_some_and(|(ns, _)| placeholder_ns(ns))
+    };
+    let admitted = if let Some(resolved) = lookup_var_unless_hidden(ctx, program, &spelled) {
+        resolved.is_some_and(|v| name_is_placeholder(program.symbols.variable(v).lookup_name()))
+    } else if !spelled.contains("::") {
+        ctx.using_name_imports.iter().any(|import| {
+            import.base == leaf
+                && import
+                    .candidates
+                    .iter()
+                    .any(|name| name_is_placeholder(name))
+        }) || ctx.directive_namespaces().any(placeholder_ns)
+    } else {
+        placeholder_ns(global_lookup_name(scope))
+            || scope == "placeholders" && ctx.directive_namespaces().any(|ns| ns == "std")
+    };
+    (admitted && n > 0).then_some(n)
 }
 
 /// Weak pointers, by their last name segment, and the method that yields the
@@ -15199,6 +15389,33 @@ fn lower_var_initializer(
     {
         return;
     }
+    // `std::function` is represented as a callable slot. A single braced
+    // bind initializer supplies its value directly, like copy initialization.
+    if ctx.is_cpp
+        && init.cached_kind() == "initializer_list"
+        && matches!(
+            program.types.get(type_id).desc.as_ref(),
+            TypeDesc::FnPtr { .. }
+        )
+    {
+        let mut cursor = init.walk();
+        let mut values = init
+            .named_children(&mut cursor)
+            .filter(|node| !node.is_extra());
+        if let (Some(value), None) = (values.next(), values.next()) {
+            let value = peel_expression(value);
+            if value.cached_kind() == "call_expression"
+                && value.cached_field("function").is_some_and(|func| {
+                    resolve_direct_call_name_from_func(source, func).is_some_and(|name| {
+                        std_bind_result(program, ctx, source, value, func, &name)
+                    })
+                })
+            {
+                extract_flow_from_expr(program, ctx, source, value, Some(var_id));
+                return;
+            }
+        }
+    }
     // This is the common boundary for file-scope value, address, array and
     // aggregate initializers. No function body walk follows these operands.
     lower_file_expression_effects(program, ctx, source, init);
@@ -17073,6 +17290,16 @@ fn collect_call_at_node_inner(
     } else {
         Vec::new()
     };
+
+    if let Some(dst) = return_dst.filter(|_| {
+        ctx.is_cpp
+            && callee_var.is_none()
+            && !is_field_or_element_call
+            && is_std_bind(program, ctx, node, &callee_name)
+            && bind_candidates_are_standard(program, &chosen)
+    }) {
+        lower_std_bind(program, ctx, source, node, &args, dst);
+    }
 
     if chosen.is_empty() {
         let args = args.for_callee(program, ctx, None, false);
@@ -27968,7 +28195,17 @@ fn return_flow_from_expr(
                 }
                 ResolvedCallReturn::PromotedReceiver(src) => Some(ReturnFlow::Copy { src }),
                 ResolvedCallReturn::Direct(callee_name) => {
-                    if call_may_return_reference(program, ctx, source, node) {
+                    if ctx.is_cpp
+                        && node.cached_field("function").is_some_and(|func| {
+                            std_bind_result(program, ctx, source, node, func, &callee_name)
+                        })
+                    {
+                        // The returned value belongs to this bind expression.
+                        // Its function body does not supply the binding.
+                        let src = alloc_ret_temp(program, ctx, node);
+                        ctx.call_return_dst.borrow_mut().insert(node.id(), src);
+                        Some(ReturnFlow::Copy { src })
+                    } else if call_may_return_reference(program, ctx, source, node) {
                         // Read the original cell supplied by this selected
                         // call, rather than re-resolving the overload by name.
                         let ReturnFlow::Copy { src } =
@@ -30595,6 +30832,16 @@ fn resolve_callee_with_loads(
         return result;
     }
     let node = peel_value_derefs(program, ctx, source, node);
+    if ctx.is_cpp
+        && node.cached_kind() == "call_expression"
+        && node.cached_field("function").is_some_and(|func| {
+            resolve_direct_call_name_from_func(source, func)
+                .is_some_and(|name| std_bind_result(program, ctx, source, node, func, &name))
+        })
+    {
+        let var = lower_nested_call_arg(program, ctx, source, node);
+        return (node_text(source, &node).to_string(), false, var);
+    }
     if materialized_expression(program, ctx, source, node) {
         let var = expression_value(program, ctx, source, node);
         return (node_text(source, &node).to_string(), false, var);

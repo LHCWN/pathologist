@@ -99,6 +99,7 @@ typedef enum trace_loc_kind {
     TRACE_LOC_ARRAY_SUMMARY = 7, /**< Array summary location for unknown index access. */
     TRACE_LOC_FUNCTION = 8,      /**< Function entry point location. */
     TRACE_LOC_STRING_LIT = 9,    /**< String literal constant interned abstract location. */
+    TRACE_LOC_BOUND = 10,        /**< Callable built by `std::bind`: names the function it wraps. */
     TRACE_LOC_UNKNOWN = -1,      /**< Not a loc node or unrecognized location kind. */
 } trace_loc_kind;
 

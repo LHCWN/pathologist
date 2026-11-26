@@ -1,6 +1,4 @@
-//! Callables wrapped by `std::bind` and `std::packaged_task` keep the call
-//! edge from the code that wraps them (docs/MODELS.md, "Callable
-//! wrappers").
+//! Legacy packaged-task reachability and context-less callable models.
 
 use crate::common;
 
@@ -14,57 +12,31 @@ fn indirect(program: &Program, analysis: &AnalysisResult, caller: &str, callee: 
     has_edge(program, analysis, caller, callee, ResolutionKind::Indirect)
 }
 
-/// Whether `Worker::Step`'s `this` receives the variable `actual` of `caller`.
-fn receives(program: &Program, analysis: &AnalysisResult, caller: &str, actual: &str) -> bool {
-    let this = local_variable(program, "Worker::Step", "this");
-    let actual = local_variable(program, caller, actual);
-    analysis
-        .arg_flow_edges
-        .iter()
-        .any(|row| row.formal == this && row.actual_var == Some(actual))
-}
-
 #[test]
-fn submit_reaches_the_callable_it_binds() {
+fn a_bind_without_an_invocation_creates_no_callback_edge() {
     let (p, a) = cpp_bind_packaged_task();
-    assert!(
-        indirect(p, a, "Submit", "Work"),
-        "`Work` is only named inside `std::bind(std::forward<F>(f), ...)`"
-    );
-}
-
-/// A parameter pack is followed (docs/POINTERS.md, "Variadic parameter
-/// packs"): `Hit` goes into `Submit`'s `Args&&... args`, out through
-/// `std::forward<Args>(args)...` into the bind, and so to `Work`'s `cb`.
-#[test]
-fn a_parameter_pack_carries_a_bound_argument_to_the_callable() {
-    let (p, a) = cpp_bind_packaged_task();
-    assert!(indirect(p, a, "Submit", "Work"));
-    assert!(
-        must_not_have_edge(p, a, "Submit", "Hit"),
-        "`Hit` is only an argument; `Submit` never calls it"
-    );
-    assert!(
-        indirect(p, a, "Work", "Hit"),
-        "`Hit` is passed to `Submit` through `Args&&... args` and bound to `Work`'s `cb`"
-    );
-}
-
-#[test]
-fn a_pool_forwards_a_named_bound_argument_to_the_callable() {
-    let (p, a) = cpp_bind_packaged_task();
-    assert!(indirect(p, a, "SubmitFixed", "FixedWork"));
-    assert!(
-        indirect(p, a, "FixedWork", "FixedHit"),
-        "`FixedHit` is the bound argument that reaches `FixedWork`'s `cb`"
-    );
-}
-
-#[test]
-fn a_plain_bind_reaches_the_callable_and_forwards_its_arguments() {
-    let (p, a) = cpp_bind_packaged_task();
-    assert!(indirect(p, a, "Bind", "BoundWork"));
-    assert!(indirect(p, a, "BoundWork", "BoundHit"));
+    for (caller, target) in [
+        ("Submit", "Work"),
+        ("SubmitFixed", "FixedWork"),
+        ("Bind", "BoundWork"),
+        ("Worker::Start", "Worker::Step"),
+        ("StartOn", "Worker::Step"),
+    ] {
+        assert!(
+            must_not_have_edge(p, a, caller, target),
+            "{caller} -> {target}"
+        );
+    }
+    for (caller, target) in [
+        ("Work", "Hit"),
+        ("FixedWork", "FixedHit"),
+        ("BoundWork", "BoundHit"),
+    ] {
+        assert!(
+            must_not_have_edge(p, a, caller, target),
+            "{caller} -> {target}"
+        );
+    }
 }
 
 #[test]
@@ -79,26 +51,6 @@ fn a_packaged_task_built_from_a_callable_with_parameters_reaches_it() {
     assert!(
         indirect(p, a, "RunTyped", "Typed"),
         "`std::packaged_task<int(int, double)>` stores a callable that takes arguments"
-    );
-}
-
-#[test]
-fn a_bind_of_a_member_function_reaches_it_from_the_binding_member() {
-    let (p, a) = cpp_bind_packaged_task();
-    assert!(indirect(p, a, "Worker::Start", "Worker::Step"));
-    assert!(
-        receives(p, a, "Worker::Start", "this"),
-        "the bound `this` reaches `Worker::Step`'s `this`"
-    );
-}
-
-#[test]
-fn a_bind_of_a_member_function_on_a_named_receiver_reaches_it() {
-    let (p, a) = cpp_bind_packaged_task();
-    assert!(indirect(p, a, "StartOn", "Worker::Step"));
-    assert!(
-        receives(p, a, "StartOn", "worker"),
-        "the bound `&worker` reaches `Worker::Step`'s `this`"
     );
 }
 

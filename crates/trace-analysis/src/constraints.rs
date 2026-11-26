@@ -72,11 +72,14 @@ pub struct CallGraphEdge {
     pub resolution: ResolutionKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ArgFlowEdge {
     pub call_site: trace_ir::CallSiteId,
     pub arg_index: u32,
     pub actual_var: Option<VarId>,
+    /// The address temporary passed for a source argument such as `&x`.
+    /// The row still names `x` as its actual variable.
+    pub actual_address: Option<VarId>,
     pub actual_fn: Option<trace_ir::FnId>,
     pub formal: VarId,
 }
@@ -95,6 +98,10 @@ pub enum LocKind {
     Function,
     /// Interned C string literal (value in `AbstractLocation.desc`).
     StringLit,
+    /// A callable `std::bind` built: a function value naming the function it
+    /// wraps (`Pag::bound_callables` holds its receiver and bound
+    /// arguments). See docs/IR.md, "Bound callables".
+    Bound,
 }
 
 #[derive(Debug, Clone)]

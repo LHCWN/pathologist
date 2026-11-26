@@ -331,7 +331,10 @@ impl NodeRow {
             _ if self.static_var() => Sharing::Shared,
             _ if self.constant => Sharing::Constant,
             Some(FlowNodeKind::Loc)
-                if matches!(self.loc_kind, Some(LocKind::Function | LocKind::StringLit)) =>
+                if matches!(
+                    self.loc_kind,
+                    Some(LocKind::Function | LocKind::Bound | LocKind::StringLit)
+                ) =>
             {
                 Sharing::Constant
             }
@@ -377,7 +380,7 @@ impl NodeRow {
     fn origin(&self) -> &'static str {
         match self.loc_kind {
             Some(LocKind::Heap) => "allocation",
-            Some(LocKind::Function) => "function",
+            Some(LocKind::Function | LocKind::Bound) => "function",
             Some(LocKind::StringLit) => "string",
             _ => "address",
         }
