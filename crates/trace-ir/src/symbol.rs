@@ -308,18 +308,35 @@ impl Function {
         implicit_params: u32,
     ) -> impl Iterator<Item = (VarId, u32, bool)> + '_ {
         self.debug_assert_pack_positions(implicit_params as usize);
+        self.params
+            .iter()
+            .copied()
+            .zip(self.actual_starts(self.params.len(), implicit_params))
+            .map(|(formal, (first, is_pack))| (formal, first, is_pack))
+    }
+
+    /// First possible actual slots for explicit parameters, including on
+    /// prototypes whose formal variables have yet to be merged.
+    pub fn explicit_parameter_actual_starts(&self) -> impl Iterator<Item = (u32, bool)> + '_ {
+        self.actual_starts(self.reference_params.len(), 0)
+    }
+
+    fn actual_starts(
+        &self,
+        slots: usize,
+        implicit_params: u32,
+    ) -> impl Iterator<Item = (u32, bool)> + '_ {
         let mut packs = self
             .pack_positions
             .iter()
             .map(move |at| at + implicit_params)
             .peekable();
         let mut packs_before = 0;
-        self.params.iter().enumerate().map(move |(index, &formal)| {
-            let index = index as u32;
+        (0..slots as u32).map(move |index| {
             let is_pack = packs.next_if_eq(&index).is_some();
             let first = index - packs_before;
             packs_before += u32::from(is_pack);
-            (formal, first, is_pack)
+            (first, is_pack)
         })
     }
 
@@ -3138,8 +3155,8 @@ impl SymbolTable {
         })
     }
 
-    /// Explicit initializer arguments bound to a selected definition's
-    /// parameter variables, past a member's implicit receiver.
+    /// Initializer arguments already aligned to explicit formal slots by
+    /// lowering, mapped to the selected definition's parameter variables.
     pub fn initializer_argument_bindings<'a>(
         &'a self,
         callee: FnId,
@@ -3147,37 +3164,12 @@ impl SymbolTable {
     ) -> impl Iterator<Item = (VarId, VarId)> + 'a {
         let function = self.function(callee);
         let first = usize::from(self.has_this_param(callee));
-        let (fixed_args, packed_formals) = if function.pack_positions.is_empty() {
-            (args, None)
-        } else {
-            (
-                &[][..],
-                Some(
-                    function
-                        .parameter_actual_starts(first as u32)
-                        .enumerate()
-                        .skip(first),
-                ),
-            )
-        };
-        fixed_args
-            .iter()
-            .filter_map(move |&(index, actual)| {
-                function
-                    .params
-                    .get(first + index as usize)
-                    .map(|&formal| (formal, actual))
-            })
-            .chain(packed_formals.into_iter().flatten().flat_map(
-                move |(index, (formal, start, is_pack))| {
-                    let takes_suffix = is_pack || start < index as u32;
-                    let start = start - first as u32;
-                    args.iter().filter_map(move |&(index, actual)| {
-                        (index == start || takes_suffix && index > start)
-                            .then_some((formal, actual))
-                    })
-                },
-            ))
+        args.iter().filter_map(move |&(slot, actual)| {
+            function
+                .params
+                .get(first + slot as usize)
+                .map(|&formal| (formal, actual))
+        })
     }
 
     /// The shared resolution policy behind return and initializer lookup: per

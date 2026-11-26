@@ -42,6 +42,7 @@ pub enum CallReturnBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InitializerCall {
     pub callee: FnId,
+    /// Values keyed by explicit formal slot, including synthetic pack slots.
     pub args: Vec<(u32, VarId)>,
 }
 
@@ -94,7 +95,7 @@ pub enum FlowConstraint {
     CallReferenceReturn { dst: VarId, callee_name: String },
     /// Address returned by a selected free/member declaration at file scope.
     /// Match definitions by signature and destination scope after merge,
-    /// then bind the retained explicit arguments to their parameters.
+    /// then bind the retained values by explicit formal slot.
     CallReferenceReturnDeclared {
         dst: VarId,
         callee: FnId,

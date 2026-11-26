@@ -26711,8 +26711,6 @@ fn initializer_allocation_binding(
         return None;
     }
     let mut actuals = collect_call_arg_nodes(program, ctx, source, nodes.iter().copied());
-    let origin = node_expansion_span(program, ctx, call)
-        .unwrap_or_else(|| node_call_span(program, ctx, call));
     let last = selected.len() - 1;
     let calls = selected
         .into_iter()
@@ -26725,7 +26723,7 @@ fn initializer_allocation_binding(
                 &nodes,
                 callee,
                 actuals.take_for(index == last),
-                origin,
+                call,
             );
             trace_ir::InitializerCall { callee, args }
         })
@@ -28496,7 +28494,7 @@ fn settle_default_call_arguments(program: &mut Program, ctx: &mut LowerContext) 
             program,
             ctx,
             source,
-            written as usize,
+            |slot| slot < written,
             origin,
             local_defaults.as_deref(),
             &mut defaults,
@@ -28572,20 +28570,67 @@ fn initializer_call_arguments(
     nodes: &[Node],
     callee: FnId,
     actuals: CallArgs,
-    origin: Span,
+    call: Node,
 ) -> Vec<(u32, VarId)> {
+    let function = program.symbols.function(callee);
+    let packed = !function.pack_positions.is_empty();
+    let starts: Vec<_> = if packed {
+        function.explicit_parameter_actual_starts().collect()
+    } else {
+        Vec::new()
+    };
+    let mut actuals = actuals;
+    // A dereferenced actual may need a different representation for each
+    // formal after a pack. Keep the original address until slots are aligned.
+    let derefs = if packed {
+        std::mem::take(&mut actuals.deref_args)
+    } else {
+        Vec::new()
+    };
     let actuals = actuals.for_callee(program, ctx, Some(callee), false);
-    let mut args = actuals.var_args;
-    for (index, actual) in &mut args {
-        let node = nodes[*index as usize];
-        if program
+    let mut recorded = actuals.var_args;
+    for (index, function) in actuals.fn_args {
+        let argument = nodes[index as usize];
+        let value = alloc_ret_temp(program, ctx, argument);
+        program.flow.push(FlowConstraint::AddrOfFn {
+            dst: value,
+            callee: function,
+        });
+        recorded.push((index, value));
+    }
+
+    let alignments: Vec<_> = if packed {
+        starts
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(|(slot, (first, is_pack))| {
+                let slot = slot as u32;
+                let takes_suffix = is_pack || first < slot;
+                recorded.iter().filter_map(move |&(index, actual)| {
+                    (index == first || takes_suffix && index > first)
+                        .then_some((slot, index, actual))
+                })
+            })
+            .collect()
+    } else {
+        recorded
+            .into_iter()
+            .map(|(index, actual)| (index, index, actual))
+            .collect()
+    };
+    let mut args = Vec::new();
+    for (slot, index, mut actual) in alignments {
+        let node = nodes[index as usize];
+        let reference = program
             .symbols
             .function(callee)
             .reference_params
-            .get(*index as usize)
-            == Some(&true)
-            && expression_is_lvalue(program, ctx, source, node)
-        {
+            .get(slot as usize)
+            .copied();
+        if let Some(deref) = derefs.iter().find(|deref| deref.index == index) {
+            actual = deref.passed(program, actual, reference);
+        } else if reference == Some(true) && expression_is_lvalue(program, ctx, source, node) {
             let type_id = program
                 .types
                 .ptr_to(expression_desc(program, ctx, source, node));
@@ -28598,42 +28643,53 @@ fn initializer_call_arguments(
                 address_flow(program, ctx, source, node, &address)
             });
             if let Some(value) = address.allocated() {
-                *actual = value;
+                actual = value;
             }
         }
+        args.push((slot, actual));
     }
-    for (index, function) in actuals.fn_args {
-        let argument = nodes[index as usize];
-        let value = alloc_ret_temp(program, ctx, argument);
-        program.flow.push(FlowConstraint::AddrOfFn {
-            dst: value,
-            callee: function,
-        });
-        args.push((index, value));
-    }
+    let uncertain_pack_width = packed
+        && (call
+            .cached_field("function")
+            .is_some_and(callee_spells_template_args)
+            || nodes
+                .iter()
+                .any(|node| node.cached_kind() == "parameter_pack_expansion"));
+    // With an empty pack, a written argument can supply the first slot
+    // after it. An explicit template-id or argument expansion can move
+    // that slot, so keep the default where the pack width is unresolved.
+    let supplied = |slot: u32| {
+        let first = starts.get(slot as usize).map_or(slot, |&(first, _)| first);
+        if uncertain_pack_width && first < slot {
+            return false;
+        }
+        (first as usize) < nodes.len()
+    };
+    let origin = node_expansion_span(program, ctx, call)
+        .unwrap_or_else(|| node_call_span(program, ctx, call));
     args.extend(
         lower_default_arguments(
             program,
             ctx,
             callee,
-            nodes.len(),
+            supplied,
             origin,
             None,
             &mut HashMap::default(),
         )
         .values,
     );
-    args.sort_by_key(|(index, _)| *index);
+    args.sort_by_key(|(slot, _)| *slot);
     args
 }
 
 /// Instantiate omitted arguments in declaration scope. Returned indices
-/// name explicit argument positions, excluding an implicit `this` parameter.
+/// name explicit formal slots, excluding an implicit `this` parameter.
 fn lower_default_arguments(
     program: &mut Program,
     ctx: &mut LowerContext,
     callee: FnId,
-    written: usize,
+    supplied: impl Fn(u32) -> bool,
     origin: Span,
     local_defaults: Option<&DefaultArgumentList>,
     cache: &mut HashMap<(FnId, FnId, usize), DefaultArgumentValue>,
@@ -28649,7 +28705,7 @@ fn lower_default_arguments(
     let mut values = DefaultArgumentValues::default();
     for (position, expression) in defaults {
         let index = position;
-        if (index as usize) < written {
+        if supplied(index) {
             continue;
         }
         let key = ctx
@@ -28900,8 +28956,6 @@ fn address_flow_inner(
                     let dst = dst.var(program, ctx);
                     let mut actuals =
                         collect_call_arg_nodes(program, ctx, source, nodes.iter().copied());
-                    let origin = node_expansion_span(program, ctx, node)
-                        .unwrap_or_else(|| node_call_span(program, ctx, node));
                     let last = selected.len() - 1;
                     for (index, callee) in selected.into_iter().enumerate() {
                         let args = initializer_call_arguments(
@@ -28911,7 +28965,7 @@ fn address_flow_inner(
                             &nodes,
                             callee,
                             actuals.take_for(index == last),
-                            origin,
+                            node,
                         );
                         program
                             .flow

@@ -1341,3 +1341,68 @@ void* prefixed_result = malloc(&prefixed::prefix_tag, &prefixed::tail_tag);
         assert_eq!(pointees, [expected], "{dst}");
     }
 }
+
+#[test]
+fn file_scope_allocator_formals_after_packs_get_addresses_and_only_omitted_defaults() {
+    let dir = scratch(&[
+        (
+            "main.cpp",
+            r#"
+namespace reference {
+struct Tag {};
+Tag referent;
+template<class... P> Tag* malloc(P... ignored, Tag& value);
+}
+namespace supplied_default {
+struct Tag {};
+Tag supplied, unused_fallback;
+template<class... P>
+Tag* malloc(P... ignored, Tag* value = &unused_fallback) { return value; }
+}
+namespace omitted_default {
+struct Tag {};
+Tag fallback;
+template<class... P>
+Tag* malloc(P... ignored, Tag* value = &fallback) { return value; }
+}
+void* address = reference::malloc(reference::referent);
+void* supplied_result = supplied_default::malloc(&supplied_default::supplied);
+void* omitted = omitted_default::malloc();
+"#,
+        ),
+        (
+            "definition.cpp",
+            r#"
+namespace reference {
+struct Tag {};
+template<class... P> Tag* malloc(P... ignored, Tag& value) { return &value; }
+template Tag* malloc<>(Tag&);
+}
+"#,
+        ),
+    ]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("address", "referent"),
+        ("supplied_result", "supplied"),
+        ("omitted", "fallback"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}
