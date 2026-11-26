@@ -1341,8 +1341,8 @@ Map models read the mapped slot from braced key/value entries, direct
 `std::make_pair` arguments, and named `std::pair` values initialized from two
 arguments or braced clauses. Named pair reads use the ordinary field summaries
 for their concrete specialization. Copy initialization and assignment between
-named pair specializations propagate pointer and callable values between
-matching fields. Explicit pair specializations use their indexed constructor
+named pair specializations propagate pointer, callable, and modeled container
+element values between matching fields. Explicit pair specializations use their indexed constructor
 declarations, while ordinary instantiations use the primary template's
 declarations. Braced `insert` calls can store each
 element of a sequence or set list, or the mapped slot from each braced map
@@ -1385,15 +1385,76 @@ types `h` as `T const*` and `h->run()` selects `T::run() const`. An ignored
 macro that spells any field on the range's receiver chain
 (`for (T x : outer.SELECT_NESTED.entries)`) suppresses the read.
 
-Follow-ups include container copies, iterator arithmetic and reference
-parameters, write-back through reference loop variables, map iteration (which
-yields a pair), access via pointers or references to the container itself,
-nested containers, structured bindings, and element models for the set-like,
-array, span and initializer-list spellings. Planned stores
+A modeled container whose element is another modeled container stores inner
+values in a nested cell keyed by the outer owner and the inner specialization.
+Storing a named inner container copies its element cell and matching descendant
+cells. A named pair contributes the mapped member's cells. By-value range
+variables get their own seeded cells. Reference variables, including reference
+aliases, bind the source cell. These copies and reads are flow-insensitive.
+Named containers stay isolated by variable, and field-owned containers share
+cells by declaring member and element type.
+
+Nested cells and copies compare canonical specializations. Aliases, inline
+standard-library namespaces, and explicit spellings of default arguments
+resolve to the same identity. Defaults come from the indexed declaration or
+the canonical prelude. Alias storage keeps defaults implicit. Long type
+arguments use a stable identity before they can be duplicated by an enclosing
+specialization, including in an explicit allocator. Top-level cv-qualification
+on a container or on a callback's by-value parameter leaves the specialization's
+identity intact. Pointee qualification can distinguish specializations, such as
+`std::vector<const Handler *>` and `std::vector<Handler *>`.
+
+Braced inner values use the inner container's constructor rules. The model
+must opt into initializer lists, including for a typed `std::initializer_list`
+temporary. Default construction via an empty brace and ordinary constructors
+use their own rules. Named and typed copies, including allocator-extended
+copies using the specialization's bound allocator, preserve the source's
+element summary. `std::move` and `std::forward` use the operand's cell. A
+derived or convertible inner value can keep a list viable even when analysis
+has no cell for that value. A call with a declared return type can identify a
+viable inner value, and propagating the return value's element summary requires
+separate modeling.
+
+Map initializer lists and inserts can mix braced entries, typed pair literals,
+named pairs, and `std::make_pair` expressions. Both list recognition and
+mapped-value extraction check key compatibility for non-braced pairs.
+Arithmetic, qualification, and possible class-key conversions are allowed.
+An integer key expression can reach a converting constructor through a
+standard numeric conversion.
+For a pair-shaped key, the first member of a candidate entry has to initialize
+the entire key. Converting pairs are checked component by component. An indexed
+class key supplied as a single expression needs a compatible type, a possible
+conversion operator, or a viable constructor.
+A compatible pair-returning call can count as an entry while contributing no
+stored value. Empty entry braces contribute no store and require a viable
+default construction. Standard map layouts identify their key in template
+argument zero.
+Custom models use their configured entry position.
+
+A map initializer requires a list of entries. An insert also accepts a single
+`{key, mapped}` pair when the key fits and the clauses do not all form
+entries. The mapped value keeps its braces for inner-container construction.
+For position inserts into nested sequences, the entire brace can initialize
+one inner container, or its clauses can supply a list of inner containers.
+
+Each bracket in a subscript chain needs its own configured access operation.
+Modeled accessors such as `at`, `front`, and `back` also descend to the
+receiver's nested cell. Brackets have distinct source sites, including in
+unevaluated chains. Lowering reuses the resolved owners of access prefixes.
+Ignored macro provenance on a receiver, bracket, or member access, including
+an explicit `operator[]` token, stops its modeled flow. Chained accesses and
+nested ranges can read the same stored values in `std::vector<std::vector<T>>`,
+`std::map<K, std::vector<T>>`, and `std::vector<std::map<K, T>>`.
+
+Follow-ups include container copies, element summaries returned from calls,
+iterator arithmetic and reference parameters, write-back through reference loop
+variables, map iteration (which yields a pair) and structured bindings, access
+via pointers or references to the container itself, chained lookups through
+`find(...)->second`, and element
+models for the set-like, array, span and initializer-list spellings. Planned stores
 include fill construction, initializer-list assignment and `assign`, and
-`try_emplace`. Pair projections currently cover named standard pairs and direct
-`std::make_pair` calls. Other pair-producing expressions and lists of typed
-pair expressions are follow-ups.
+`try_emplace`. Extracting mapped values from other pair-producing expressions,
+such as calls returning pairs, remains a follow-up.
 
 ### Factory construction
 

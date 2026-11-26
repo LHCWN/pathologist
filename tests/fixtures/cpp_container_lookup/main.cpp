@@ -294,12 +294,14 @@ void iterator_write() {
     callbacks.at(0)();
 }
 
+enum DispatchKey : unsigned char { Captured, Forwarded };
+
 void unordered_dispatch(Callback captured, Callback forwarded) {
-    std::unordered_map<int, std::function<Callback(Callback)>> callbacks = {
-        {0, [captured](Callback value) { value(); return captured; }},
-        {1, [](Callback value) { value(); return beta; }},
+    std::unordered_map<DispatchKey, std::function<Callback(Callback)>> callbacks = {
+        {DispatchKey::Captured, [captured](Callback value) { value(); return captured; }},
+        {DispatchKey::Forwarded, [](Callback value) { value(); return beta; }},
     };
-    auto iter = callbacks.find(0);
+    auto iter = callbacks.find(DispatchKey::Captured);
     Callback result = iter->second(forwarded);
     result();
 }

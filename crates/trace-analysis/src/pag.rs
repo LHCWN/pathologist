@@ -3,6 +3,7 @@ use crate::ipc::detect_ipc_pairs_with_models;
 use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use std::sync::Arc;
 use trace_ir::{
     CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow,
     StorageClass, TargetId, TypeDesc, TypeId, VarId,
@@ -768,18 +769,30 @@ impl Pag {
         element: TypeId,
         target: Option<TargetId>,
     ) -> LocId {
-        let (var, name) = match owner {
-            ContainerOwner::Variable(var) => {
-                (Some(*var), program.symbols.variable(*var).name.clone())
+        fn owner_var(owner: &ContainerOwner) -> Option<VarId> {
+            match owner {
+                ContainerOwner::Variable(var) => Some(*var),
+                ContainerOwner::Field { .. } => None,
+                ContainerOwner::Nested { parent, .. } => owner_var(parent),
             }
-            ContainerOwner::Field { class, name } => {
-                let class = match program.types.get(*class).desc.as_ref() {
-                    TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => name,
-                    _ => unreachable!("container member has an aggregate owner"),
-                };
-                (None, format!("{class}.{name}"))
+        }
+        fn owner_name(program: &Program, owner: &ContainerOwner) -> String {
+            match owner {
+                ContainerOwner::Variable(var) => program.symbols.variable(*var).name.clone(),
+                ContainerOwner::Field { class, name } => {
+                    let class = match program.types.get(*class).desc.as_ref() {
+                        TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => name,
+                        _ => unreachable!("container member has an aggregate owner"),
+                    };
+                    format!("{class}.{name}")
+                }
+                ContainerOwner::Nested { parent, instance } => {
+                    format!("{}[{instance}]", owner_name(program, parent))
+                }
             }
-        };
+        }
+        let var = owner_var(owner);
+        let name = owner_name(program, owner);
         let fn_id = var.and_then(|var| program.symbols.variable(var).fn_id);
         let desc = if let Some(owner) = fn_id {
             format!("elements:{}::{name}", program.symbols.function(owner).name)
@@ -856,20 +869,39 @@ impl Pag {
                     owner,
                     element,
                 } => {
-                    let (owner, target) = match owner {
-                        ContainerOwner::Variable(var) => {
-                            (owner.clone(), program.symbols.variable(*var).target)
-                        }
-                        ContainerOwner::Field { class, name } => {
-                            let owner = ContainerOwner::Field {
+                    fn canonical_owner(
+                        program: &Program,
+                        owner: &ContainerOwner,
+                    ) -> ContainerOwner {
+                        match owner {
+                            ContainerOwner::Variable(var) => ContainerOwner::Variable(*var),
+                            ContainerOwner::Field { class, name } => ContainerOwner::Field {
                                 class: program.types.tag_identity(*class),
                                 name: name.clone(),
-                            };
+                            },
+                            ContainerOwner::Nested { parent, instance } => ContainerOwner::Nested {
+                                parent: Arc::new(canonical_owner(program, parent)),
+                                instance: instance.clone(),
+                            },
+                        }
+                    }
+                    fn owner_target(
+                        program: &Program,
+                        owner: &ContainerOwner,
+                        dst: VarId,
+                    ) -> Option<TargetId> {
+                        match owner {
+                            ContainerOwner::Variable(var) => program.symbols.variable(*var).target,
                             // Target merging scopes all retained variables,
                             // including the temporary holding this cell's address.
-                            (owner, program.symbols.variable(*dst).target)
+                            ContainerOwner::Field { .. } => program.symbols.variable(dst).target,
+                            ContainerOwner::Nested { parent, .. } => {
+                                owner_target(program, parent, dst)
+                            }
                         }
-                    };
+                    }
+                    let owner = canonical_owner(program, owner);
+                    let target = owner_target(program, &owner, *dst);
                     let loc = *container_elements
                         .entry((target, owner.clone(), *element))
                         .or_insert_with(|| {

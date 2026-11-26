@@ -240,6 +240,10 @@ struct LowerContext {
     /// Typedefs and `using` aliases declared in the blocks of the function
     /// being lowered, innermost last; each block drops its own on exit.
     local_aliases: Vec<trace_ir::InitializerAlias>,
+    /// Locals that receive a nested container's elements: a range-for
+    /// variable over a container of containers, so its own subscripts and
+    /// ranges read the nested cell rather than the variable's element cell.
+    nested_container_owners: HashMap<VarId, trace_ir::ContainerOwner>,
     /// Block declarations shadow outer defaults independently of FnId interning.
     default_scopes: Vec<DefaultScope>,
     call_default_bindings: HashMap<trace_ir::CallSiteId, Arc<DefaultArgumentList>>,
@@ -278,6 +282,8 @@ struct LowerContext {
     /// A call node has one lexical scope and static return type. Reuse
     /// receiver probes across outer-chain lookup and the body's later walk.
     call_receiver_cache: RefCell<HashMap<usize, TypeDesc>>,
+    /// Successful nested owners of access expressions, shared by chain prefixes.
+    container_access_owners: RefCell<HashMap<usize, container_elements::Elements>>,
     /// `call_expression` node id → `CallReturn` destination, so the matching
     /// `CallSite` can carry `return_dst` for `dlsym` models.
     call_return_dst: RefCell<HashMap<usize, VarId>>,
@@ -4472,6 +4478,7 @@ fn lower_prepared_source(
         friend_classes: Vec::new(),
         type_scope: RefCell::new(Vec::new()),
         local_aliases: Vec::new(),
+        nested_container_owners: HashMap::default(),
         default_scopes: Vec::new(),
         call_default_bindings: HashMap::default(),
         initializer_default_scopes: RefCell::default(),
@@ -4485,6 +4492,7 @@ fn lower_prepared_source(
         macro_lambda_text: HashMap::default(),
         callee_load_cache: RefCell::new(HashMap::default()),
         call_receiver_cache: RefCell::new(HashMap::default()),
+        container_access_owners: RefCell::new(HashMap::default()),
         call_return_dst: RefCell::new(HashMap::default()),
         call_address_dst: RefCell::new(HashMap::default()),
         expression_values: RefCell::new(HashMap::default()),
@@ -4551,6 +4559,7 @@ fn lower_prepared_source(
     ctx.handled_constructor_exprs.borrow_mut().clear();
     ctx.callee_load_cache.borrow_mut().clear();
     ctx.call_receiver_cache.borrow_mut().clear();
+    ctx.container_access_owners.borrow_mut().clear();
     ctx.call_return_dst.borrow_mut().clear();
     ctx.call_address_dst.borrow_mut().clear();
     ctx.expression_values.borrow_mut().clear();
@@ -4969,11 +4978,14 @@ fn declared_alias(
         )
     };
     let type_spelling = (ctx.is_cpp
-        && !matches!(
-            desc,
-            TypeDesc::Struct { .. } | TypeDesc::Union { .. } | TypeDesc::Unknown
-        ))
-    .then(|| container_elements::type_spelling(program, ctx, source, declaration))
+        && match &desc {
+            TypeDesc::Unknown => false,
+            // A specialization alias (`using Items = std::vector<T>`) keeps
+            // its arguments; a plain class alias needs no separate spelling.
+            TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => name.contains('<'),
+            _ => true,
+        })
+    .then(|| container_elements::type_spelling_implicit_defaults(program, ctx, source, declaration))
     .flatten()
     .map(Arc::from);
     Some(trace_ir::InitializerAlias {
@@ -14709,6 +14721,13 @@ fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: 
     // element source now so `for (Callback callbacks : callbacks)` still
     // names the outer container rather than the variable being declared.
     let range_source = range.and_then(|range| range_source(program, ctx, source, range));
+    // A range over a container of containers binds the loop variable to the
+    // inner elements carried by the outer element cell, so its own subscripts
+    // and nested ranges read callbacks stored through the outer container.
+    let nested_container = match &range_source {
+        Some(RangeSource::Container(elements)) => elements.nested(program, ctx),
+        _ => None,
+    };
     // Prefer the resolved element descriptor for `auto`, which carries a
     // function-pointer alias the spelling walk leaves unknown; fall back to
     // the spelling lookup for unmodeled ranges and arrays.
@@ -14725,7 +14744,6 @@ fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: 
         Some(RangeSource::Container(elements)) => Some(elements.cv(program)),
         _ => None,
     };
-    let binds_reference = decl.cached_kind() == "reference_declarator";
     let ty = deduced_local_type(program, type_id, decl, element);
     let var = lower_one_declarator(
         program,
@@ -14740,7 +14758,26 @@ fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: 
         Lifecycle::DestroyOnly,
     );
     forget_placeholder_alias(ctx, type_node, var);
+    let binds_reference = decl.cached_kind() == "reference_declarator"
+        || var.is_some_and(|var| ctx.reference_bindings.contains(&var));
     if let Some(var) = var {
+        if let Some(nested) = &nested_container {
+            if binds_reference {
+                ctx.nested_container_owners
+                    .insert(var, nested.owner().clone());
+            } else {
+                let span = range.unwrap_or(node);
+                lower_operation(program, ctx, source, span, |program, ctx| {
+                    container_elements::copy_into_range_var(
+                        program,
+                        ctx,
+                        span,
+                        nested.clone(),
+                        var,
+                    );
+                });
+            }
+        }
         if let (Some(range), Some(range_source)) = (range, range_source) {
             flow_range_element(program, ctx, source, range, range_source, var);
         }
@@ -14778,32 +14815,6 @@ enum RangeSource {
     Container(container_elements::Elements),
 }
 
-/// Whether a range expression is spelled through an ignored macro. A field
-/// range (`holder.RANGE_MEMBER`, `outer.SELECT_NESTED.entries`) starts at the
-/// object, so every field token on the receiver chain has its own provenance
-/// checked, as member-call lowering does.
-fn range_is_from_ignored_macro(ctx: &LowerContext, range: Node) -> bool {
-    let mut node = range;
-    loop {
-        if node_is_from_ignored_macro(ctx, node) {
-            return true;
-        }
-        if node.cached_kind() != "field_expression" {
-            return false;
-        }
-        if node
-            .cached_field("field")
-            .is_some_and(|field| node_is_from_ignored_macro(ctx, field))
-        {
-            return true;
-        }
-        let Some(argument) = node.cached_field("argument") else {
-            return false;
-        };
-        node = peel_expression(argument);
-    }
-}
-
 /// Resolve an array summary or an iterable modeled container's element
 /// summary for `range`. The caller must run this before declaring the loop
 /// variable so a shadowing name still names the outer range.
@@ -14816,7 +14827,7 @@ fn range_source(
     // The `for` statement may start outside a macro while the range itself is
     // spelled inside one (`for (T x : RANGE)`); an ignored range macro
     // suppresses the read the same way an ignored subscript bracket does.
-    if range_is_from_ignored_macro(ctx, range) {
+    if container_elements::receiver_chain_ignored(ctx, source, range) {
         return None;
     }
     if receiver_desc(program, ctx, source, range)
@@ -20987,6 +20998,7 @@ fn with_initializer_expression<R>(
     let saved_scope = ctx.type_scope.replace(initializer.type_scope.clone());
     let saved_loads = ctx.callee_load_cache.take();
     let saved_receivers = ctx.call_receiver_cache.take();
+    let saved_container_owners = ctx.container_access_owners.take();
     // A reparsed initializer brings its own syntax tree, whose node ids may
     // repeat those of the tree being lowered. A decided result is only valid
     // while its call's node is alive.
@@ -21005,6 +21017,7 @@ fn with_initializer_expression<R>(
     let result = lower(program, ctx, &source, value);
     ctx.callee_load_cache.replace(saved_loads);
     ctx.call_receiver_cache.replace(saved_receivers);
+    ctx.container_access_owners.replace(saved_container_owners);
     ctx.from_this_results.replace(saved_from_this);
     ctx.call_return_dst.replace(saved_returns);
     ctx.call_address_dst.replace(saved_addresses);
@@ -22840,6 +22853,13 @@ fn receiver_desc(
                 {
                     return Some(program.types.get(field.type_id).desc.as_ref().clone());
                 }
+                // A named standard pair's specialized second member names the
+                // mapped container, which the primary template does not.
+                if let Some(var) = lookup_var_node(program, ctx, source, base) {
+                    if let Some((_, ty)) = container_elements::pair_field(program, var, member) {
+                        return Some(program.types.get(ty).desc.as_ref().clone());
+                    }
+                }
             }
             let cls = if let Some((receiver, member)) =
                 container_elements::iterator_member_operand(ctx, source, node)
@@ -23031,6 +23051,22 @@ fn receiver_desc(
             let ty = node.cached_field("type")?;
             if ty.cached_field("declarator").is_some() {
                 return None;
+            }
+            // A specialization's arguments live only in the type node; the
+            // raw-text class probe drops them.
+            if let Some(spelling) = container_elements::type_spelling_node(program, ctx, source, ty)
+                .filter(|spelling| spelling.contains('<'))
+            {
+                return if container_elements::has_top_level(&spelling, '*')
+                    || container_elements::has_top_level(&spelling, '&')
+                {
+                    Some(TypeDesc::Unknown)
+                } else {
+                    Some(TypeDesc::Struct {
+                        name: spelling,
+                        fields: Vec::new(),
+                    })
+                };
             }
             let name = normalize_qualified(node_text(source, &ty));
             declared_class_in_scope(program, ctx, &name).map(|name| TypeDesc::Struct {
@@ -35590,6 +35626,7 @@ mod qualified_variable_lookup_tests {
             friend_classes: Vec::new(),
             type_scope: RefCell::new(Vec::new()),
             local_aliases: Vec::new(),
+            nested_container_owners: HashMap::default(),
             default_scopes: Vec::new(),
             call_default_bindings: HashMap::default(),
             initializer_default_scopes: RefCell::default(),
@@ -35603,6 +35640,7 @@ mod qualified_variable_lookup_tests {
             macro_lambda_text: HashMap::default(),
             callee_load_cache: RefCell::new(HashMap::default()),
             call_receiver_cache: RefCell::new(HashMap::default()),
+            container_access_owners: RefCell::new(HashMap::default()),
             call_return_dst: RefCell::new(HashMap::default()),
             call_address_dst: RefCell::new(HashMap::default()),
             expression_values: RefCell::new(HashMap::default()),

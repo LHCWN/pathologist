@@ -1,5 +1,37 @@
 # Evaluation Report
 
+## Nested container cells - 2026-11-26
+
+Containers whose element type is itself a modeled container now get the outer
+cell and the nested cell their inner values need. The canonical debug checks on
+the pinned corpora show four new HiView cells and two new Camera cells:
+
+| Corpus | Measurement | Before | After |
+|---|---|---:|---:|
+| HiView | modeled element cells | 35 | 39 |
+| Camera | modeled element cells | 8 | 10 |
+
+The HiView additions are the outer and nested cells for
+`BaseContext.monitors` and `XperfMonitorManager.dispatchers`, both containers of
+`std::vector<...*>`. The Camera additions are the outer and nested cells for
+`HCameraService.delayCbtaskMap_`, a map of maps.
+
+The review fix also restores callback flow through unscoped enum map keys.
+Fresh debug exports of the pinned HiView checkout before and after the fix
+show 333 to 349 indirect edges. All 16 restored edges are local lambda
+targets, four each at `decoded_event.cpp:162`, `decoded_event.cpp:201`,
+`raw_data_builder.cpp:378`, and `raw_data_builder.cpp:425`. The two
+`DecodedEvent` sites again forward `param` to all eight lambda formals.
+Both corpora pass all 44 canonical checks at `--jobs 1` and `--jobs 8`, with
+identical analysis rows at both job counts.
+
+The subsequent review fixes preserve the canonical HiView and Camera analysis
+rows from `bf57e6a`. In a separate `--full-export` probe, each alias in a
+15-level chain names the previous type in both `std::vector` arguments, once
+directly and once through `std::allocator`. The longest exported type name
+falls from 1,703,906 characters to 158. A 27-level run peaks at 5,986 characters
+and still resolves the innermost callback through the full subscript chain.
+
 ## Container range-for reads and canonical budget - 2026-11-24
 
 A `range-for` over a named modeled sequence or set container now reads the same

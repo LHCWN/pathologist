@@ -28,7 +28,28 @@ pub enum ReturnFlow {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContainerOwner {
     Variable(VarId),
-    Field { class: TypeId, name: Arc<str> },
+    Field {
+        class: TypeId,
+        name: Arc<str>,
+    },
+    /// The elements carried by containers stored in another container's
+    /// element cell. `instance` is the inner container specialization, so
+    /// nested containers of distinct types keep distinct cells.
+    Nested {
+        parent: Arc<ContainerOwner>,
+        instance: Arc<str>,
+    },
+}
+
+/// The variable that owns a container cell, if the owner is rooted in one.
+/// A field-owned cell has no variable; a nested cell follows its parent so
+/// TU-local header storage replays the initializer with the root variable.
+fn container_owner_var(owner: &ContainerOwner) -> Option<VarId> {
+    match owner {
+        ContainerOwner::Variable(var) => Some(*var),
+        ContainerOwner::Field { .. } => None,
+        ContainerOwner::Nested { parent, .. } => container_owner_var(parent),
+    }
 }
 
 /// Statement-level flow facts extracted during IR lowering.
@@ -112,10 +133,9 @@ impl FlowConstraint {
             | FlowConstraint::AddrOfVar { dst, src }
             | FlowConstraint::UnwrapPointer { dst, src } => (dst, Some(src)),
             FlowConstraint::GepField { dst, base, .. } => (dst, Some(base)),
-            FlowConstraint::ContainerElement { dst, ref owner, .. } => match owner {
-                ContainerOwner::Variable(var) => (dst, Some(*var)),
-                ContainerOwner::Field { .. } => (dst, None),
-            },
+            FlowConstraint::ContainerElement { dst, ref owner, .. } => {
+                (dst, container_owner_var(owner))
+            }
             FlowConstraint::CallReturnIndirect { dst, callee_var } => (dst, Some(callee_var)),
             FlowConstraint::ArrayFnMember { array, .. } => (array, None),
             FlowConstraint::AddrOfFn { dst, .. }
