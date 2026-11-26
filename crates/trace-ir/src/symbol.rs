@@ -300,6 +300,29 @@ impl Function {
         );
     }
 
+    /// Each stored formal, its first possible actual slot, and whether it
+    /// is a pack. Slots include the implicit receiver when one is stored.
+    /// A pack or a formal shifted by earlier packs can take later slots too.
+    pub fn parameter_actual_starts(
+        &self,
+        implicit_params: u32,
+    ) -> impl Iterator<Item = (VarId, u32, bool)> + '_ {
+        self.debug_assert_pack_positions(implicit_params as usize);
+        let mut packs = self
+            .pack_positions
+            .iter()
+            .map(move |at| at + implicit_params)
+            .peekable();
+        let mut packs_before = 0;
+        self.params.iter().enumerate().map(move |(index, &formal)| {
+            let index = index as u32;
+            let is_pack = packs.next_if_eq(&index).is_some();
+            let first = index - packs_before;
+            packs_before += u32::from(is_pack);
+            (formal, first, is_pack)
+        })
+    }
+
     /// Whether this declaration accepts the explicit argument count.
     pub fn takes_argument_count(&self, declared: u32, count: u32) -> bool {
         count >= declared.saturating_sub(self.default_args) && (self.variadic || count <= declared)
@@ -3124,12 +3147,37 @@ impl SymbolTable {
     ) -> impl Iterator<Item = (VarId, VarId)> + 'a {
         let function = self.function(callee);
         let first = usize::from(self.has_this_param(callee));
-        args.iter().filter_map(move |&(index, actual)| {
-            function
-                .params
-                .get(first + index as usize)
-                .map(|&formal| (formal, actual))
-        })
+        let (fixed_args, packed_formals) = if function.pack_positions.is_empty() {
+            (args, None)
+        } else {
+            (
+                &[][..],
+                Some(
+                    function
+                        .parameter_actual_starts(first as u32)
+                        .enumerate()
+                        .skip(first),
+                ),
+            )
+        };
+        fixed_args
+            .iter()
+            .filter_map(move |&(index, actual)| {
+                function
+                    .params
+                    .get(first + index as usize)
+                    .map(|&formal| (formal, actual))
+            })
+            .chain(packed_formals.into_iter().flatten().flat_map(
+                move |(index, (formal, start, is_pack))| {
+                    let takes_suffix = is_pack || start < index as u32;
+                    let start = start - first as u32;
+                    args.iter().filter_map(move |&(index, actual)| {
+                        (index == start || takes_suffix && index > start)
+                            .then_some((formal, actual))
+                    })
+                },
+            ))
     }
 
     /// The shared resolution policy behind return and initializer lookup: per

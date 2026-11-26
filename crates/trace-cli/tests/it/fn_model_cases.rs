@@ -1294,3 +1294,50 @@ namespace identity { struct Tag {}; Tag* malloc(Tag* value) { return value; } }
         );
     }
 }
+
+#[test]
+fn file_scope_allocator_returns_bind_formals_after_packs() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+extern "C" void* malloc(unsigned long);
+namespace leading {
+struct Tag {};
+Tag leading_tag;
+template<class... P> Tag* malloc(P... ignored, Tag* value) { return value; }
+}
+namespace prefixed {
+struct Tag {};
+Tag prefix_tag;
+Tag tail_tag;
+template<class... P>
+Tag* malloc(Tag* prefix, P... ignored, Tag* value) { return value; }
+}
+void* leading_result = malloc(&leading::leading_tag);
+void* prefixed_result = malloc(&prefixed::prefix_tag, &prefixed::tail_tag);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("leading_result", "leading_tag"),
+        ("prefixed_result", "tail_tag"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}

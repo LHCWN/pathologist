@@ -2664,23 +2664,15 @@ fn wire_actuals(
 ) {
     let callee_fn = program.symbols.function(callee);
     let this = u32::from(program.symbols.has_this_param(callee));
-    callee_fn.debug_assert_pack_positions(this as usize);
-    let mut packs = callee_fn
-        .pack_positions
-        .iter()
-        .map(|at| at + this)
-        .peekable();
-    let mut packs_before = 0;
-    for (i, formal) in callee_fn.params.iter().enumerate() {
+    for (i, (formal, first, is_pack)) in callee_fn.parameter_actual_starts(this).enumerate() {
         let formal_idx = i as u32;
-        let is_pack = packs.next_if_eq(&formal_idx).is_some();
         debug_assert_eq!(
             is_pack,
-            program.pack_vars.contains(formal),
+            program.pack_vars.contains(&formal),
             "{}: parameter pack metadata disagrees with formal {formal_idx}",
             callee_fn.name
         );
-        if is_pack || packs_before > 0 {
+        if is_pack || first < formal_idx {
             // A pack formal takes every argument from its position on: the
             // positions the site passes, mapped as the callee takes them,
             // each wired once however many positions an expansion covers.
@@ -2689,9 +2681,6 @@ fn wire_actuals(
                 .max()
                 .map_or(1, |last| last + 1);
             let mut taken: Vec<u32> = Vec::new();
-            // Earlier packs may all be empty. Omit each of their synthetic
-            // slots to find this formal's first possible actual position.
-            let first = formal_idx - packs_before;
             for slot in first..first.saturating_add(reach) {
                 let Some(idx) = actual_of(slot) else {
                     continue;
@@ -2713,7 +2702,7 @@ fn wire_actuals(
                     cs,
                     st,
                     scratch,
-                    *formal,
+                    formal,
                     formal_idx,
                     at,
                     &mut on_wired,
@@ -2728,13 +2717,12 @@ fn wire_actuals(
                 cs,
                 st,
                 scratch,
-                *formal,
+                formal,
                 formal_idx,
                 at,
                 &mut on_wired,
             );
         }
-        packs_before += u32::from(is_pack);
     }
 }
 
