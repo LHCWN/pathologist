@@ -2729,6 +2729,7 @@ fn finalize_extern_callees(program: &mut Program) {
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
             is_explicit_constructor: false,
             defaulted_in_class: false,
             is_deleted: false,
@@ -2856,6 +2857,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
             is_explicit_constructor: false,
             defaulted_in_class: false,
             is_deleted: false,
@@ -7738,6 +7740,10 @@ fn continues_previous_member(node: Node) -> bool {
 
 /// A nonempty template parameter list immediately enclosing a declaration.
 fn has_function_template_parameters(node: Node) -> bool {
+    function_template_parameters(node).is_some()
+}
+
+fn function_template_parameters(node: Node) -> Option<Node> {
     node.parent()
         .and_then(|parent| {
             if parent.cached_kind() == "friend_declaration" {
@@ -7748,7 +7754,7 @@ fn has_function_template_parameters(node: Node) -> bool {
         })
         .filter(|parent| parent.cached_kind() == "template_declaration")
         .and_then(|parent| parent.cached_field("parameters"))
-        .is_some_and(|params| params.named_child_count() > 0)
+        .filter(|params| params.named_child_count() > 0)
 }
 
 /// Whether the member declaration or definition `node` is written as a
@@ -8119,6 +8125,7 @@ fn register_member_prototype(
             parameter_references: shape.reference_forms,
             owner_unresolved: false,
             variadic: shape.variadic,
+            non_deduced_pack: false,
             pack_positions: shape.pack_positions,
             is_explicit_constructor: short == last_segment_of(cls_qual)
                 && explicitly_declared_constructor(program, ctx, source, node),
@@ -8488,6 +8495,8 @@ fn lower_function_signature(
                     as u32,
             ),
             default_args: shape.defaults,
+            non_deduced_pack: eff_class.is_none()
+                && free_function_pack_is_non_deduced(ctx, source, node, decl, &shape),
             reference_params: shape.references,
             parameter_references: shape.reference_forms,
             owner_unresolved,
@@ -8916,6 +8925,50 @@ fn lower_parameters(
         }
     }
     shape
+}
+
+/// A non-terminal function parameter pack is a non-deduced context. It
+/// cannot acquire elements through deduction when every fixed parameter
+/// is independent of the enclosing template parameters.
+fn free_function_pack_is_non_deduced(
+    ctx: &LowerContext,
+    source: &str,
+    declaration: Node,
+    declarator: Node,
+    shape: &ParamListShape,
+) -> bool {
+    let [pack] = shape.pack_positions.as_slice() else {
+        return false;
+    };
+    let Some(template) = function_template_parameters(declaration) else {
+        return false;
+    };
+    *pack + 1 < shape.references.len() as u32
+        && find_params(declarator).is_some_and(|params| {
+            params.named_children(&mut params.walk()).all(|param| {
+                let spelling = node_text(source, &param);
+                match param.cached_kind() {
+                    "variadic_parameter_declaration" => template
+                        .named_children(&mut template.walk())
+                        .filter(|param| {
+                            matches!(
+                                param.cached_kind(),
+                                "variadic_type_parameter_declaration"
+                                    | "variadic_parameter_declaration"
+                            )
+                        })
+                        .filter_map(template_parameter_name)
+                        .any(|name| {
+                            spelling_mentions(spelling, Spelling::Source, node_text(source, &name))
+                        }),
+                    "parameter_declaration" | "optional_parameter_declaration" => {
+                        !spelling_is_dependent(ctx, source, param, spelling, Spelling::Source)
+                    }
+                    "comment" => true,
+                    _ => false,
+                }
+            })
+        })
 }
 
 /// Retain declaration defaults by explicit source position. Synthetic IR
@@ -9931,8 +9984,7 @@ fn call_result_among(
     }))
 }
 
-fn callee_spells_template_args(func: Node) -> bool {
-    let mut target = func;
+fn callee_template_leaf(mut target: Node) -> Node {
     while target.cached_kind() == "parenthesized_expression" {
         if let Some(inner) = target.named_child(0) {
             target = inner;
@@ -9952,12 +10004,37 @@ fn callee_spells_template_args(func: Node) -> bool {
             break;
         }
     }
+    target
+}
+
+fn callee_spells_template_args(func: Node) -> bool {
+    let target = callee_template_leaf(func);
     matches!(
         target.cached_kind(),
         "template_function" | "template_method"
-    ) || target
-        .children(&mut target.walk())
-        .any(|child| child.cached_kind() == "template_argument_list")
+    ) || callee_template_argument_list(target).is_some()
+}
+
+fn callee_template_argument_list(leaf: Node) -> Option<Node> {
+    leaf.children(&mut leaf.walk())
+        .find(|child| child.cached_kind() == "template_argument_list")
+}
+
+fn callee_supplies_template_arguments(func: Node) -> bool {
+    let mut leaf = callee_template_leaf(func);
+    while leaf.cached_kind() == "qualified_identifier" {
+        let Some(name) = leaf.cached_field("name") else {
+            return true;
+        };
+        leaf = name;
+    }
+    callee_template_argument_list(leaf).map_or_else(
+        || matches!(leaf.cached_kind(), "template_function" | "template_method"),
+        |list| {
+            list.named_children(&mut list.walk())
+                .any(|arg| arg.cached_kind() != "comment")
+        },
+    )
 }
 
 /// A qualified member of the current class or one of its bases uses `*this`.
@@ -16399,6 +16476,9 @@ fn lower_function_decl(
         param_type_ids: Vec::new(),
         explicit_arity,
         default_args: shape.defaults,
+        non_deduced_pack: object_declaration(decl).is_some_and(|declaration| {
+            free_function_pack_is_non_deduced(ctx, source, declaration, decl, &shape)
+        }),
         reference_params: shape.references,
         parameter_references: shape.reference_forms,
         owner_unresolved: false,
@@ -22976,6 +23056,7 @@ fn lower_lambda_expression(
         owner_unresolved: false,
         variadic: shape.variadic,
         pack_positions: Vec::new(),
+        non_deduced_pack: false,
         is_explicit_constructor: false,
         defaulted_in_class: false,
         is_deleted: false,
@@ -28574,6 +28655,17 @@ fn initializer_call_arguments(
 ) -> Vec<(u32, VarId)> {
     let function = program.symbols.function(callee);
     let packed = !function.pack_positions.is_empty();
+    let empty_pack = packed
+        && function.non_deduced_pack
+        && function
+            .explicit_arity
+            .is_some_and(|arity| nodes.len() <= arity as usize)
+        && !call
+            .cached_field("function")
+            .is_some_and(callee_supplies_template_arguments)
+        && !nodes
+            .iter()
+            .any(|node| node.cached_kind() == "parameter_pack_expansion");
     let starts: Vec<_> = if packed {
         function.explicit_parameter_actual_starts().collect()
     } else {
@@ -28606,9 +28698,9 @@ fn initializer_call_arguments(
             .enumerate()
             .flat_map(|(slot, (first, is_pack))| {
                 let slot = slot as u32;
-                let takes_suffix = is_pack || first < slot;
+                let takes_suffix = !empty_pack && (is_pack || first < slot);
                 recorded.iter().filter_map(move |&(index, actual)| {
-                    (index == first || takes_suffix && index > first)
+                    ((!is_pack || !empty_pack) && (index == first || takes_suffix && index > first))
                         .then_some((slot, index, actual))
                 })
             })
@@ -28648,19 +28740,11 @@ fn initializer_call_arguments(
         }
         args.push((slot, actual));
     }
-    let uncertain_pack_width = packed
-        && (call
-            .cached_field("function")
-            .is_some_and(callee_spells_template_args)
-            || nodes
-                .iter()
-                .any(|node| node.cached_kind() == "parameter_pack_expansion"));
-    // With an empty pack, a written argument can supply the first slot
-    // after it. An explicit template-id or argument expansion can move
-    // that slot, so keep the default where the pack width is unresolved.
+    // A proven empty pack gives each fixed formal one written position.
+    // For unresolved widths, a later formal may still need its default.
     let supplied = |slot: u32| {
         let first = starts.get(slot as usize).map_or(slot, |&(first, _)| first);
-        if uncertain_pack_width && first < slot {
+        if packed && !empty_pack && first < slot {
             return false;
         }
         (first as usize) < nodes.len()

@@ -1406,3 +1406,67 @@ template Tag* malloc<>(Tag&);
         assert_eq!(pointees, [expected], "{dst}");
     }
 }
+
+#[test]
+fn file_scope_allocator_empty_packs_align_each_fixed_argument() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace ordered {
+struct Tag {};
+Tag a, b;
+template<class... P>
+Tag* malloc(P... ignored, Tag* first, Tag* second) { return first; }
+}
+namespace empty {
+struct Tag {};
+Tag supplied, unused_fallback;
+template<class... P>
+Tag* malloc(P... ignored, Tag* value = &unused_fallback) { return value; }
+}
+namespace explicit_pack {
+struct Tag {};
+Tag fallback;
+template<class... P>
+Tag* malloc(P... ignored, Tag* value = &fallback) { return value; }
+}
+namespace deduced_pack {
+struct Tag {};
+Tag deduced_fallback;
+template<class... P> struct Types {};
+Types<int> types;
+template<class... P>
+Tag* malloc(Types<P...>, P... ignored, Tag* value = &deduced_fallback) { return value; }
+}
+void* deduced_result = deduced_pack::malloc(deduced_pack::types, 42);
+void* first_result = ordered::malloc(&ordered::a, &ordered::b);
+void* supplied_result = empty::malloc<>(&empty::supplied);
+void* explicit_result = explicit_pack::malloc<int>(42);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("first_result", "a"),
+        ("supplied_result", "supplied"),
+        ("explicit_result", "fallback"),
+        ("deduced_result", "deduced_fallback"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}

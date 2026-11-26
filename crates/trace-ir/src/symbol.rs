@@ -202,6 +202,9 @@ pub struct Function {
     /// have uncertain actual positions because each pack may be empty
     /// (docs/POINTERS.md, "Variadic parameter packs").
     pub pack_positions: Vec<u32>,
+    /// A single non-terminal pack of a free function template whose fixed
+    /// parameter spellings cannot deduce its length.
+    pub non_deduced_pack: bool,
     /// A constructor declared `= default` or `= delete` in its class body. It
     /// is not user-provided, so the class is still an aggregate (C++17) and
     /// braces initialize its fields rather than call it.
@@ -738,6 +741,7 @@ fn absorb_redeclaration(
     if existing.pack_positions.is_empty() {
         existing.pack_positions.clone_from(&func.pack_positions);
     }
+    existing.non_deduced_pack |= func.non_deduced_pack;
     // User-provided once any declaration of it is.
     existing.defaulted_in_class &= func.defaulted_in_class;
     existing.is_deleted |= func.is_deleted;
@@ -5052,6 +5056,7 @@ mod tests {
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
             is_explicit_constructor: false,
             defaulted_in_class: false,
             is_deleted: false,

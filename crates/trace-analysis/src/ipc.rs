@@ -1118,6 +1118,7 @@ mod tests {
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
             is_explicit_constructor: false,
             defaulted_in_class: false,
             is_deleted: false,
