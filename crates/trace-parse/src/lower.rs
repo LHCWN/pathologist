@@ -2735,6 +2735,7 @@ fn finalize_extern_callees(program: &mut Program) {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
+            is_explicit_function_specialization: false,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -2863,6 +2864,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
+            is_explicit_function_specialization: false,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -7744,6 +7746,10 @@ fn has_function_template_parameters(node: Node) -> bool {
 }
 
 fn function_template_parameters(node: Node) -> Option<Node> {
+    enclosing_function_template_parameters(node).filter(|params| params.named_child_count() > 0)
+}
+
+fn enclosing_function_template_parameters(node: Node) -> Option<Node> {
     node.parent()
         .and_then(|parent| {
             if parent.cached_kind() == "friend_declaration" {
@@ -7754,7 +7760,14 @@ fn function_template_parameters(node: Node) -> Option<Node> {
         })
         .filter(|parent| parent.cached_kind() == "template_declaration")
         .and_then(|parent| parent.cached_field("parameters"))
-        .filter(|params| params.named_child_count() > 0)
+}
+
+fn is_explicit_function_specialization(node: Node) -> bool {
+    enclosing_function_template_parameters(node).is_some_and(|params| {
+        !params
+            .named_children(&mut params.walk())
+            .any(|param| param.cached_kind() != "comment")
+    })
 }
 
 /// Whether the member declaration or definition `node` is written as a
@@ -8133,6 +8146,7 @@ fn register_member_prototype(
             is_deleted: false,
             declared_in_class: true,
             is_free_function_template: false,
+            is_explicit_function_specialization: false,
             is_member_template: is_member_function_template(source, node),
             is_const_member: function_is_const_qualified(source, node),
             ref_qualifier: function_ref_qualifier(source, node),
@@ -8519,6 +8533,10 @@ fn lower_function_signature(
                 .any(|c| c.cached_kind() == "delete_method_clause"),
             declared_in_class: ctx.class_ctx.is_some(),
             is_free_function_template,
+            is_explicit_function_specialization: ctx.is_cpp
+                && eff_class.is_none()
+                && is_allocator_name(&name)
+                && is_explicit_function_specialization(node),
             is_member_template: ctx.is_cpp
                 && eff_class.is_some()
                 && is_member_function_template(source, node),
@@ -16437,6 +16455,9 @@ fn lower_function_decl(
         return;
     }
     let name = ctx.qualify_decl(&raw_name);
+    let is_explicit_function_specialization = ctx.is_cpp
+        && is_allocator_name(&name)
+        && object_declaration(decl).is_some_and(is_explicit_function_specialization);
     let ret_type = if return_is_dependent(ctx, source, decl) {
         program.types.unknown()
     } else {
@@ -16495,6 +16516,7 @@ fn lower_function_decl(
         declared_in_class: false,
         is_free_function_template: ctx.is_cpp
             && object_declaration(decl).is_some_and(has_function_template_parameters),
+        is_explicit_function_specialization,
         is_member_template: false,
         is_const_member: ctx.is_cpp && function_is_const_qualified(source, decl),
         ref_qualifier: ctx
@@ -18014,6 +18036,11 @@ fn collect_call_at_node_inner(
                 .resolve_function_candidates(cast.name(), Some(ctx.current_file))
         } else {
             cpp_callee_candidates(program, ctx, source, func, &callee_name, &arg_desc)
+        };
+        let candidates = if is_allocator_name(&callee_name) {
+            allocator_template_candidates(program, func, candidates)
+        } else {
+            candidates
         };
         // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
         // too: its `this` is not one of the arguments.
@@ -23067,6 +23094,7 @@ fn lower_lambda_expression(
         is_deleted: false,
         declared_in_class: false,
         is_free_function_template: false,
+        is_explicit_function_specialization: false,
         is_member_template: false,
         is_const_member: false,
         ref_qualifier: None,
@@ -26770,6 +26798,37 @@ fn emit_call_return(
     ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
 }
 
+fn allocator_template_candidates(
+    program: &Program,
+    func: Node,
+    mut candidates: Vec<FnId>,
+) -> Vec<FnId> {
+    if initializer_callee_template_leaf(func).is_some_and(is_callee_template_id) {
+        candidates.retain(|&id| program.symbols.function(id).can_bind_template_id());
+    } else if candidates.iter().any(|&id| {
+        program
+            .symbols
+            .function(id)
+            .is_explicit_function_specialization
+    }) {
+        let ordinary: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|&id| !program.symbols.function(id).can_bind_template_id())
+            .collect();
+        candidates.retain(|&id| {
+            !program
+                .symbols
+                .function(id)
+                .is_explicit_function_specialization
+                || !ordinary
+                    .iter()
+                    .any(|&other| has_same_signature(program, id, other))
+        });
+    }
+    candidates
+}
+
 fn initializer_allocation_binding(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -26784,10 +26843,8 @@ fn initializer_allocation_binding(
         .map(|&arg| arg_expr_type(program, ctx, source, arg))
         .collect();
     let template_id = initializer_callee_template_leaf(func).is_some_and(is_callee_template_id);
-    let mut candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
-    if template_id {
-        candidates.retain(|&id| program.symbols.function(id).is_function_template());
-    }
+    let candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
+    let candidates = allocator_template_candidates(program, func, candidates);
     let selected = rank_free_call_overloads(
         program,
         candidates,

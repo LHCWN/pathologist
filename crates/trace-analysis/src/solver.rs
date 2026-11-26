@@ -4288,6 +4288,7 @@ mod tests {
                 is_deleted: false,
                 declared_in_class: false,
                 is_free_function_template: false,
+                is_explicit_function_specialization: false,
                 is_member_template: false,
                 is_const_member: false,
                 ref_qualifier: None,

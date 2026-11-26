@@ -1513,3 +1513,94 @@ void* bare_name = app::malloc(7);
         assert_eq!(pointees, [expected], "{dst}");
     }
 }
+
+#[test]
+fn body_allocator_template_id_excludes_the_ordinary_overload() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag wrong, expected;
+Tag* malloc(int) { return &wrong; }
+template<class... P>
+Tag* malloc(P... ignored, int value) { return &expected; }
+}
+auto* use_template() {
+    auto* p = app::malloc<>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let caller = only_function(&program, "use_template");
+    let targets: Vec<_> = result
+        .call_edges
+        .iter()
+        .filter(|edge| edge.caller == caller)
+        .map(|edge| program.symbols.function(edge.callee))
+        .collect();
+    assert_eq!(targets.len(), 1, "{targets:?}");
+    assert!(targets[0].is_free_function_template, "{targets:?}");
+    let var = local_variable(&program, "use_template", "p");
+    let expected = pag.var_location[&only_variable(&program, "expected")];
+    let pointees: Vec<_> = result
+        .points_to
+        .get(&pag.var_node[&var])
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(pointees, [expected]);
+}
+
+#[test]
+fn file_scope_allocator_template_id_retains_the_explicit_specialization() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag ordinary, primary, specialized;
+Tag* malloc(int) { return &ordinary; }
+template<class... P>
+Tag* malloc(P... ignored, int value) { return &primary; }
+template<> Tag* malloc(int value) { return &specialized; }
+}
+auto* empty_id = app::malloc<>(7);
+auto* nonempty_id = app::malloc<int>(6, 7);
+auto* bare_name = app::malloc(7);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("empty_id", "specialized"),
+        ("nonempty_id", "primary"),
+        ("bare_name", "ordinary"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}

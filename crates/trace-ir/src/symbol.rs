@@ -225,6 +225,8 @@ pub struct Function {
     pub is_member_template: bool,
     /// A namespace-scope function template eligible for a template-id call.
     pub is_free_function_template: bool,
+    /// A free allocator declared with an empty template parameter list.
+    pub is_explicit_function_specialization: bool,
     /// Declared `static` in its class body: a member with no receiver. Its
     /// entry still takes a `this` slot ([`SymbolTable::has_this_param`]), as
     /// every member's does; this is what tells a static member's unused one
@@ -283,6 +285,11 @@ pub struct Function {
 impl Function {
     pub fn is_function_template(&self) -> bool {
         self.is_free_function_template || self.is_member_template
+    }
+
+    /// Whether a written template-id can denote this declaration.
+    pub fn can_bind_template_id(&self) -> bool {
+        self.is_function_template() || self.is_explicit_function_specialization
     }
 
     /// Check the declaration-order pack slots shared by type lookup and wiring.
@@ -2112,6 +2119,8 @@ impl SymbolTable {
                         || existing.ref_qualifier != func.ref_qualifier
                         || !Self::reference_forms_alike(existing, func)
                         || existing.is_member_template != func.is_member_template
+                        || existing.is_explicit_function_specialization
+                            != func.is_explicit_function_specialization
                     {
                         return false;
                     }
@@ -3125,6 +3134,8 @@ impl SymbolTable {
             |id| {
                 let candidate = self.function(id);
                 selected.variadic == candidate.variadic
+                    && selected.is_explicit_function_specialization
+                        == candidate.is_explicit_function_specialization
                     && selected
                         .explicit_arity
                         .zip(candidate.explicit_arity)
@@ -3373,7 +3384,9 @@ impl SymbolTable {
                         && (f.is_const_member != cand.is_const_member
                             || f.ref_qualifier != cand.ref_qualifier
                             || !Self::reference_forms_alike(f, cand)
-                            || f.is_member_template != cand.is_member_template)
+                            || f.is_member_template != cand.is_member_template
+                            || f.is_explicit_function_specialization
+                                != cand.is_explicit_function_specialization)
                     {
                         return false;
                     }
@@ -3589,6 +3602,8 @@ impl SymbolTable {
                             && a.is_const_member == b.is_const_member
                             && a.ref_qualifier == b.ref_qualifier
                             && a.is_member_template == b.is_member_template
+                            && a.is_explicit_function_specialization
+                                == b.is_explicit_function_specialization
                             && Self::references_alike(a, b)
                             && self.explicit_params_alike(
                                 a,
@@ -5066,6 +5081,7 @@ mod tests {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
+            is_explicit_function_specialization: false,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
