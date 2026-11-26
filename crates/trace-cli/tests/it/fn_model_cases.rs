@@ -1604,3 +1604,58 @@ auto* bare_name = app::malloc(7);
         assert_eq!(pointees, [expected], "{dst}");
     }
 }
+
+#[test]
+fn allocator_template_ids_respect_specializations_written_arguments() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag primary, int_result, short_result;
+template<class U, class... P>
+Tag* malloc(P... ignored, int value) { return &primary; }
+template<> Tag* malloc<int>(int value);
+template<> Tag* malloc<short>(int value) { return &short_result; }
+}
+template<> app::Tag* app::malloc<int>(int value) { return &int_result; }
+auto* global_long = app::malloc<long>(7);
+auto* global_int = app::malloc<signed int>(7);
+auto* global_short = app::malloc<short>(7);
+auto* local_long() {
+    auto* p = app::malloc<long>(7);
+    return p;
+}
+auto* local_alias() {
+    using Selected = int;
+    auto* p = app::malloc<Selected>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (var, tag) in [
+        (only_variable(&program, "global_long"), "primary"),
+        (only_variable(&program, "global_int"), "int_result"),
+        (only_variable(&program, "global_short"), "short_result"),
+        (local_variable(&program, "local_long", "p"), "primary"),
+        (local_variable(&program, "local_alias", "p"), "int_result"),
+    ] {
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "expected {tag}");
+    }
+}

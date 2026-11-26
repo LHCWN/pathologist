@@ -225,8 +225,10 @@ pub struct Function {
     pub is_member_template: bool,
     /// A namespace-scope function template eligible for a template-id call.
     pub is_free_function_template: bool,
-    /// A free allocator declared with an empty template parameter list.
-    pub is_explicit_function_specialization: bool,
+    /// A free allocator specialization's written template arguments. The
+    /// list is empty when the declaration relies on deduction. Unresolved
+    /// argument types occupy their own slots without excluding matches.
+    pub allocator_specialization_args: Option<Box<[Option<String>]>>,
     /// Declared `static` in its class body: a member with no receiver. Its
     /// entry still takes a `this` slot ([`SymbolTable::has_this_param`]), as
     /// every member's does; this is what tells a static member's unused one
@@ -282,6 +284,12 @@ pub struct Function {
     pub tu: Option<crate::FileId>,
 }
 
+fn specialization_arguments_agree(a: &[Option<String>], b: &[Option<String>]) -> bool {
+    a.iter()
+        .zip(b)
+        .all(|(a, b)| a.as_ref().zip(b.as_ref()).is_none_or(|(a, b)| a == b))
+}
+
 impl Function {
     pub fn is_function_template(&self) -> bool {
         self.is_free_function_template || self.is_member_template
@@ -289,7 +297,25 @@ impl Function {
 
     /// Whether a written template-id can denote this declaration.
     pub fn can_bind_template_id(&self) -> bool {
-        self.is_function_template() || self.is_explicit_function_specialization
+        self.is_function_template() || self.allocator_specialization_args.is_some()
+    }
+
+    /// A call can supply a prefix of a specialization's deduced/defaulted args.
+    pub fn specialization_accepts_template_args(&self, written: &[Option<String>]) -> bool {
+        self.allocator_specialization_args
+            .as_deref()
+            .is_none_or(|args| specialization_arguments_agree(args, written))
+    }
+
+    fn same_allocator_specialization(&self, other: &Self) -> bool {
+        match (
+            &self.allocator_specialization_args,
+            &other.allocator_specialization_args,
+        ) {
+            (Some(a), Some(b)) => specialization_arguments_agree(a, b),
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     /// Check the declaration-order pack slots shared by type lookup and wiring.
@@ -768,6 +794,21 @@ fn absorb_redeclaration(
     }
     existing.is_member_template |= func.is_member_template;
     existing.is_free_function_template |= func.is_free_function_template;
+    if let Some(new) = &func.allocator_specialization_args {
+        match &mut existing.allocator_specialization_args {
+            Some(known) => {
+                let mut combined = known.to_vec();
+                combined.resize(combined.len().max(new.len()), None);
+                for (known, new) in combined.iter_mut().zip(new.iter()) {
+                    if known.is_none() {
+                        known.clone_from(new);
+                    }
+                }
+                *known = combined.into_boxed_slice();
+            }
+            None => existing.allocator_specialization_args = Some(new.clone()),
+        }
+    }
     existing.default_args = existing.default_args.max(func.default_args);
     existing.is_virtual |= func.is_virtual;
     existing.is_final |= func.is_final;
@@ -2119,8 +2160,7 @@ impl SymbolTable {
                         || existing.ref_qualifier != func.ref_qualifier
                         || !Self::reference_forms_alike(existing, func)
                         || existing.is_member_template != func.is_member_template
-                        || existing.is_explicit_function_specialization
-                            != func.is_explicit_function_specialization
+                        || !existing.same_allocator_specialization(func)
                     {
                         return false;
                     }
@@ -3134,8 +3174,7 @@ impl SymbolTable {
             |id| {
                 let candidate = self.function(id);
                 selected.variadic == candidate.variadic
-                    && selected.is_explicit_function_specialization
-                        == candidate.is_explicit_function_specialization
+                    && selected.same_allocator_specialization(candidate)
                     && selected
                         .explicit_arity
                         .zip(candidate.explicit_arity)
@@ -3385,8 +3424,7 @@ impl SymbolTable {
                             || f.ref_qualifier != cand.ref_qualifier
                             || !Self::reference_forms_alike(f, cand)
                             || f.is_member_template != cand.is_member_template
-                            || f.is_explicit_function_specialization
-                                != cand.is_explicit_function_specialization)
+                            || !f.same_allocator_specialization(cand))
                     {
                         return false;
                     }
@@ -3602,8 +3640,7 @@ impl SymbolTable {
                             && a.is_const_member == b.is_const_member
                             && a.ref_qualifier == b.ref_qualifier
                             && a.is_member_template == b.is_member_template
-                            && a.is_explicit_function_specialization
-                                == b.is_explicit_function_specialization
+                            && a.same_allocator_specialization(b)
                             && Self::references_alike(a, b)
                             && self.explicit_params_alike(
                                 a,
@@ -5081,7 +5118,7 @@ mod tests {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
-            is_explicit_function_specialization: false,
+            allocator_specialization_args: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,

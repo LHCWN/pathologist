@@ -2735,7 +2735,7 @@ fn finalize_extern_callees(program: &mut Program) {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
-            is_explicit_function_specialization: false,
+            allocator_specialization_args: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -2864,7 +2864,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
-            is_explicit_function_specialization: false,
+            allocator_specialization_args: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -7770,6 +7770,20 @@ fn is_explicit_function_specialization(node: Node) -> bool {
     })
 }
 
+/// Index an explicitly spelled allocator specialization under the overload
+/// name. Its own template arguments identify it separately from that name.
+fn allocator_specialization_name(name: String, declaration: Option<Node>) -> String {
+    if name.trim_end().ends_with('>')
+        && declaration.is_some_and(is_explicit_function_specialization)
+    {
+        let base = strip_template_args(&name);
+        if is_allocator_name(&base) {
+            return base;
+        }
+    }
+    name
+}
+
 /// Whether the member declaration or definition `node` is written as a
 /// function template (`template <class U> R f();`, or out-of-class
 /// `template <class U> R C::f()` / `template <class T> template <class U>
@@ -8146,7 +8160,7 @@ fn register_member_prototype(
             is_deleted: false,
             declared_in_class: true,
             is_free_function_template: false,
-            is_explicit_function_specialization: false,
+            allocator_specialization_args: None,
             is_member_template: is_member_function_template(source, node),
             is_const_member: function_is_const_qualified(source, node),
             ref_qualifier: function_ref_qualifier(source, node),
@@ -8368,6 +8382,7 @@ fn lower_function_signature(
     if raw_name.is_empty() {
         return None;
     }
+    let raw_name = allocator_specialization_name(raw_name, Some(node));
     let mut name = ctx.qualify_decl(&raw_name);
     if ctx.class_ctx.is_none() && node_text(source, &decl).contains('<') {
         if let Some((owner, member)) = name.rsplit_once("::") {
@@ -8533,10 +8548,9 @@ fn lower_function_signature(
                 .any(|c| c.cached_kind() == "delete_method_clause"),
             declared_in_class: ctx.class_ctx.is_some(),
             is_free_function_template,
-            is_explicit_function_specialization: ctx.is_cpp
-                && eff_class.is_none()
-                && is_allocator_name(&name)
-                && is_explicit_function_specialization(node),
+            allocator_specialization_args: (eff_class.is_none() && is_allocator_name(&name))
+                .then(|| allocator_specialization_arguments(program, ctx, source, node, decl))
+                .flatten(),
             is_member_template: ctx.is_cpp
                 && eff_class.is_some()
                 && is_member_function_template(source, node),
@@ -16454,10 +16468,14 @@ fn lower_function_decl(
     if raw_name.is_empty() {
         return;
     }
+    let raw_name = allocator_specialization_name(raw_name, object_declaration(decl));
     let name = ctx.qualify_decl(&raw_name);
-    let is_explicit_function_specialization = ctx.is_cpp
-        && is_allocator_name(&name)
-        && object_declaration(decl).is_some_and(is_explicit_function_specialization);
+    let allocator_specialization_args = if is_allocator_name(&name) {
+        object_declaration(decl)
+            .and_then(|node| allocator_specialization_arguments(program, ctx, source, node, decl))
+    } else {
+        None
+    };
     let ret_type = if return_is_dependent(ctx, source, decl) {
         program.types.unknown()
     } else {
@@ -16516,7 +16534,7 @@ fn lower_function_decl(
         declared_in_class: false,
         is_free_function_template: ctx.is_cpp
             && object_declaration(decl).is_some_and(has_function_template_parameters),
-        is_explicit_function_specialization,
+        allocator_specialization_args,
         is_member_template: false,
         is_const_member: ctx.is_cpp && function_is_const_qualified(source, decl),
         ref_qualifier: ctx
@@ -18038,7 +18056,7 @@ fn collect_call_at_node_inner(
             cpp_callee_candidates(program, ctx, source, func, &callee_name, &arg_desc)
         };
         let candidates = if is_allocator_name(&callee_name) {
-            allocator_template_candidates(program, func, candidates)
+            allocator_template_candidates(program, ctx, source, func, candidates)
         } else {
             candidates
         };
@@ -23094,7 +23112,7 @@ fn lower_lambda_expression(
         is_deleted: false,
         declared_in_class: false,
         is_free_function_template: false,
-        is_explicit_function_specialization: false,
+        allocator_specialization_args: None,
         is_member_template: false,
         is_const_member: false,
         ref_qualifier: None,
@@ -26798,18 +26816,79 @@ fn emit_call_return(
     ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
 }
 
+fn allocator_specialization_arguments(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    decl: Node,
+) -> Option<Box<[Option<String>]>> {
+    if !ctx.is_cpp || !is_explicit_function_specialization(node) {
+        return None;
+    }
+    let arguments = find_function_declarator(decl)
+        .and_then(|function| function.cached_field("declarator"))
+        .and_then(initializer_callee_template_leaf)
+        .and_then(callee_template_argument_list);
+    Some(allocator_template_argument_types(program, ctx, source, arguments).into_boxed_slice())
+}
+
+fn allocator_template_argument_types(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    arguments: Option<Node>,
+) -> Vec<Option<String>> {
+    let Some(list) = arguments else {
+        return Vec::new();
+    };
+    list.named_children(&mut list.walk())
+        .filter(|arg| arg.cached_kind() != "comment")
+        .map(|arg| {
+            if spelling_is_dependent(ctx, source, arg, node_text(source, &arg), Spelling::Source) {
+                return None;
+            }
+            // Use the alias-aware type spelling for concrete types.
+            // The coarse flow type cannot distinguish unsigned, cv,
+            // or distinct reference types.
+            let spelling = container_elements::type_spelling(program, ctx, source, arg)?;
+            let (base, _) = split_pointer_suffix(&spelling);
+            let base = strip_cv(base);
+            let concrete = is_fundamental_type_name(base)
+                && !matches!(base, "auto" | "nullptr_t")
+                && !trace_ir::is_standard_integer_type_name(base)
+                || program.types.declares_class(base) && !base.contains('<');
+            concrete.then_some(spelling)
+        })
+        .collect()
+}
+
 fn allocator_template_candidates(
     program: &Program,
+    ctx: &LowerContext,
+    source: &str,
     func: Node,
     mut candidates: Vec<FnId>,
 ) -> Vec<FnId> {
-    if initializer_callee_template_leaf(func).is_some_and(is_callee_template_id) {
-        candidates.retain(|&id| program.symbols.function(id).can_bind_template_id());
+    if let Some(leaf) =
+        initializer_callee_template_leaf(func).filter(|&leaf| is_callee_template_id(leaf))
+    {
+        let written = allocator_template_argument_types(
+            program,
+            ctx,
+            source,
+            callee_template_argument_list(leaf),
+        );
+        candidates.retain(|&id| {
+            let f = program.symbols.function(id);
+            f.can_bind_template_id() && f.specialization_accepts_template_args(&written)
+        });
     } else if candidates.iter().any(|&id| {
         program
             .symbols
             .function(id)
-            .is_explicit_function_specialization
+            .allocator_specialization_args
+            .is_some()
     }) {
         let ordinary: Vec<_> = candidates
             .iter()
@@ -26817,10 +26896,11 @@ fn allocator_template_candidates(
             .filter(|&id| !program.symbols.function(id).can_bind_template_id())
             .collect();
         candidates.retain(|&id| {
-            !program
+            program
                 .symbols
                 .function(id)
-                .is_explicit_function_specialization
+                .allocator_specialization_args
+                .is_none()
                 || !ordinary
                     .iter()
                     .any(|&other| has_same_signature(program, id, other))
@@ -26844,7 +26924,7 @@ fn initializer_allocation_binding(
         .collect();
     let template_id = initializer_callee_template_leaf(func).is_some_and(is_callee_template_id);
     let candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
-    let candidates = allocator_template_candidates(program, func, candidates);
+    let candidates = allocator_template_candidates(program, ctx, source, func, candidates);
     let selected = rank_free_call_overloads(
         program,
         candidates,
