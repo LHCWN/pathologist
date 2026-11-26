@@ -10008,11 +10008,12 @@ fn callee_template_leaf(mut target: Node) -> Node {
 }
 
 fn callee_spells_template_args(func: Node) -> bool {
-    let target = callee_template_leaf(func);
-    matches!(
-        target.cached_kind(),
-        "template_function" | "template_method"
-    ) || callee_template_argument_list(target).is_some()
+    is_callee_template_id(callee_template_leaf(func))
+}
+
+fn is_callee_template_id(leaf: Node) -> bool {
+    matches!(leaf.cached_kind(), "template_function" | "template_method")
+        || callee_template_argument_list(leaf).is_some()
 }
 
 fn callee_template_argument_list(leaf: Node) -> Option<Node> {
@@ -10020,16 +10021,20 @@ fn callee_template_argument_list(leaf: Node) -> Option<Node> {
         .find(|child| child.cached_kind() == "template_argument_list")
 }
 
-fn callee_supplies_template_arguments(func: Node) -> bool {
+fn initializer_callee_template_leaf(func: Node) -> Option<Node> {
     let mut leaf = callee_template_leaf(func);
     while leaf.cached_kind() == "qualified_identifier" {
-        let Some(name) = leaf.cached_field("name") else {
-            return true;
-        };
-        leaf = name;
+        leaf = leaf.cached_field("name")?;
     }
+    Some(leaf)
+}
+
+fn callee_supplies_template_arguments(func: Node) -> bool {
+    let Some(leaf) = initializer_callee_template_leaf(func) else {
+        return true;
+    };
     callee_template_argument_list(leaf).map_or_else(
-        || matches!(leaf.cached_kind(), "template_function" | "template_method"),
+        || is_callee_template_id(leaf),
         |list| {
             list.named_children(&mut list.walk())
                 .any(|arg| arg.cached_kind() != "comment")
@@ -26586,7 +26591,7 @@ fn incompatible_move_argument(
         .flatten()
         .is_some_and(|reference| {
             (reference.rvalue || reference.is_const == Some(false))
-                && !(function.is_free_function_template || function.is_member_template)
+                && !function.is_function_template()
                 && !matches!(argument.innermost().0, TypeDesc::Unknown)
                 && same(argument, parameter)
                 && category().is_some_and(|rvalue| {
@@ -26679,8 +26684,7 @@ fn std_move_forward<'t>(
         let explicit_template = leaf.cached_field("arguments").is_some();
         let competes = |id| {
             let f = program.symbols.function(id);
-            f.name != standard
-                && (!explicit_template || f.is_free_function_template || f.is_member_template)
+            f.name != standard && (!explicit_template || f.is_function_template())
         };
         let mut category = None;
         if candidates.iter().copied().any(competes)
@@ -26779,7 +26783,11 @@ fn initializer_allocation_binding(
         .iter()
         .map(|&arg| arg_expr_type(program, ctx, source, arg))
         .collect();
-    let candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
+    let template_id = initializer_callee_template_leaf(func).is_some_and(is_callee_template_id);
+    let mut candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
+    if template_id {
+        candidates.retain(|&id| program.symbols.function(id).is_function_template());
+    }
     let selected = rank_free_call_overloads(
         program,
         candidates,
@@ -26789,7 +26797,9 @@ fn initializer_allocation_binding(
         nodes.len(),
     );
     if selected.is_empty() {
-        return None;
+        // A name-only fallback would bring back non-templates, including
+        // an unrelated C allocator, for this template-id.
+        return template_id.then_some(CallReturnBinding::InitializerDeclarations(Vec::new()));
     }
     let mut actuals = collect_call_arg_nodes(program, ctx, source, nodes.iter().copied());
     let last = selected.len() - 1;

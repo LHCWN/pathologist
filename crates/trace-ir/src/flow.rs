@@ -35,6 +35,8 @@ pub enum ContainerOwner {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CallReturnBinding {
     Occurrence(crate::CallOccurrence),
+    /// An empty list suppresses ordinary name lookup for a template-id whose
+    /// template declaration was unavailable.
     InitializerDeclarations(Vec<InitializerCall>),
 }
 

@@ -1470,3 +1470,46 @@ void* explicit_result = explicit_pack::malloc<int>(42);
         assert_eq!(pointees, [expected], "{dst}");
     }
 }
+
+#[test]
+fn file_scope_allocator_template_id_excludes_non_templates_before_ranking() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag ordinary, expected;
+Tag* malloc(int) { return &ordinary; }
+template<class... P>
+Tag* malloc(P... ignored, int value) { return &expected; }
+}
+void* empty_id = app::malloc<>(7);
+void* explicit_id = app::malloc<int>(6, 7);
+void* bare_name = app::malloc(7);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("empty_id", "expected"),
+        ("explicit_id", "expected"),
+        ("bare_name", "ordinary"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}

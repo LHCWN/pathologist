@@ -281,6 +281,10 @@ pub struct Function {
 }
 
 impl Function {
+    pub fn is_function_template(&self) -> bool {
+        self.is_free_function_template || self.is_member_template
+    }
+
     /// Check the declaration-order pack slots shared by type lookup and wiring.
     pub fn debug_assert_pack_positions(&self, implicit_params: usize) {
         debug_assert!(
