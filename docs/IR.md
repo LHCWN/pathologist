@@ -155,7 +155,8 @@ before ranking at file scope and in function bodies. A function with a
 placeholder parameter type is an abbreviated template and can bind a
 template-id without a written template parameter list. Known differences in
 explicit template argument types or integral literal values rule out a
-specialization before arity ranking. Integral literals also retain their
+specialization before arity ranking, including for static member templates.
+Integral literals also retain their
 deduced type for `auto` template parameters. Each uncertain specialization
 is ranked independently alongside the ordinary candidates. A separate pass
 with no uncertain specializations preserves the primary when those matches

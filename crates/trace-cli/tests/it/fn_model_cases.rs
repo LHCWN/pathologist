@@ -1935,6 +1935,51 @@ Tag* DeferredAlloc::malloc(auto value) { return &expected; }
     assert_allocator_return_candidates(dir.path(), &["expected"]);
 }
 
+#[test]
+fn allocator_template_ids_select_static_member_specializations() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {};
+Tag primary, specialized;
+struct Alloc {
+    template<class... P>
+    static Tag* malloc(P... args, int value) { return &primary; }
+};
+template<> Tag* Alloc::malloc(int value) { return &specialized; }
+auto* empty_id = Alloc::malloc<>(7);
+auto* nonempty_id = Alloc::malloc<long>(6L, 7);
+auto* local() {
+    auto* p = Alloc::malloc<>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (var, tag) in [
+        (only_variable(&program, "empty_id"), "specialized"),
+        (only_variable(&program, "nonempty_id"), "primary"),
+        (local_variable(&program, "local", "p"), "specialized"),
+    ] {
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "expected {tag}");
+    }
+}
+
 fn assert_allocator_return_candidates(root: &std::path::Path, tags: &[&str]) {
     let program = build_program(root, &default_opts(root)).unwrap();
     let (pag, result) = analyze_with_options(

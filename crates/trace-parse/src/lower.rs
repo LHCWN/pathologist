@@ -8091,6 +8091,24 @@ fn register_member_prototype(
     let shape = find_params(node).map_or_else(ParamListShape::default, |p| {
         param_list_shape(program, ctx, source, p)
     });
+    let is_member_template =
+        is_member_function_template(source, node, shape.has_placeholder_parameter);
+    let allocator_primary = is_member_template && is_allocator_name(&full_name);
+    let non_deduced_pack =
+        allocator_primary && function_pack_is_non_deduced(ctx, source, node, node, &shape);
+    let allocator_template = (allocator_primary && !shape.has_placeholder_parameter)
+        .then(|| {
+            allocator_template_metadata(
+                program,
+                ctx,
+                source,
+                node,
+                node,
+                &full_name,
+                non_deduced_pack,
+            )
+        })
+        .flatten();
     let explicit_arity = shape.declared();
     let span = node_span(program, ctx, node);
     let ret_type = node
@@ -8155,7 +8173,7 @@ fn register_member_prototype(
             parameter_references: shape.reference_forms,
             owner_unresolved: false,
             variadic: shape.variadic,
-            non_deduced_pack: false,
+            non_deduced_pack,
             pack_positions: shape.pack_positions,
             is_explicit_constructor: short == last_segment_of(cls_qual)
                 && explicitly_declared_constructor(program, ctx, source, node),
@@ -8163,12 +8181,8 @@ fn register_member_prototype(
             is_deleted: false,
             declared_in_class: true,
             is_free_function_template: false,
-            allocator_template: None,
-            is_member_template: is_member_function_template(
-                source,
-                node,
-                shape.has_placeholder_parameter,
-            ),
+            allocator_template,
+            is_member_template,
             is_const_member: function_is_const_qualified(source, node),
             ref_qualifier: function_ref_qualifier(source, node),
             return_cv: function_return_cv(program, ctx, source, node, None, &return_kind),
@@ -8472,11 +8486,17 @@ fn lower_function_signature(
             || lookup_scope
                 .as_ref()
                 .is_some_and(|scope| program.namespaces.contains(scope)));
-    let non_deduced_pack =
-        eff_class.is_none() && free_function_pack_is_non_deduced(ctx, source, node, decl, &shape);
-    let allocator_template = (eff_class.is_none()
+    let is_member_template = ctx.is_cpp
+        && eff_class.is_some()
+        && is_member_function_template(source, node, shape.has_placeholder_parameter);
+    let allocator = is_allocator_name(&name);
+    let non_deduced_pack = (eff_class.is_none() || allocator && is_member_template)
+        && function_pack_is_non_deduced(ctx, source, node, decl, &shape);
+    let allocator_template = (allocator
         && !shape.has_placeholder_parameter
-        && is_allocator_name(&name))
+        && (eff_class.is_none()
+            || is_member_template
+            || is_explicit_function_specialization(node)))
     .then(|| allocator_template_metadata(program, ctx, source, node, decl, &name, non_deduced_pack))
     .flatten();
     // Only a member meets an in-class prototype, the one kind of declaration
@@ -8562,9 +8582,7 @@ fn lower_function_signature(
             declared_in_class: ctx.class_ctx.is_some(),
             is_free_function_template,
             allocator_template,
-            is_member_template: ctx.is_cpp
-                && eff_class.is_some()
-                && is_member_function_template(source, node, shape.has_placeholder_parameter),
+            is_member_template,
             is_const_member: ctx.is_cpp && function_is_const_qualified(source, node),
             ref_qualifier: ctx
                 .is_cpp
@@ -8982,7 +9000,7 @@ fn lower_parameters(
 /// A non-terminal function parameter pack is a non-deduced context. It
 /// cannot acquire elements through deduction when every fixed parameter
 /// is independent of the enclosing template parameters.
-fn free_function_pack_is_non_deduced(
+fn function_pack_is_non_deduced(
     ctx: &LowerContext,
     source: &str,
     declaration: Node,
@@ -16509,7 +16527,7 @@ fn lower_function_decl(
     let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
     let declaration = object_declaration(decl);
     let non_deduced_pack = declaration
-        .is_some_and(|node| free_function_pack_is_non_deduced(ctx, source, node, decl, &shape));
+        .is_some_and(|node| function_pack_is_non_deduced(ctx, source, node, decl, &shape));
     let allocator_template = declaration
         .filter(|_| !shape.has_placeholder_parameter && is_allocator_name(&name))
         .and_then(|node| {
@@ -26887,10 +26905,20 @@ fn allocator_template_metadata(
         return None;
     }
     if is_explicit_function_specialization(node) {
-        let arguments = find_function_declarator(decl)
-            .and_then(|function| function.cached_field("declarator"))
-            .and_then(initializer_callee_template_leaf)
-            .and_then(callee_template_argument_list);
+        let declarator = find_function_declarator(decl)?.cached_field("declarator")?;
+        let leaf = initializer_callee_template_leaf(declarator)?;
+        let scope = &source[declarator.start_byte()..leaf.start_byte()];
+        let owner_templates = count_template_lists(scope);
+        // A template prefix for each owner can specialize an ordinary
+        // member. A function-template specialization has its own prefix.
+        let template_prefixes = std::iter::successors(node.parent(), |parent| parent.parent())
+            .take_while(|parent| parent.cached_kind() == "template_declaration")
+            .take(owner_templates + 1)
+            .count();
+        if template_prefixes <= owner_templates {
+            return None;
+        }
+        let arguments = callee_template_argument_list(leaf);
         let candidates = program
             .symbols
             .resolve_function_candidates(name, Some(ctx.current_file));
