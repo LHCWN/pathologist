@@ -1980,6 +1980,95 @@ auto* local() {
     }
 }
 
+#[test]
+fn allocator_specialization_can_belong_to_an_explicit_class_specialization() {
+    let dir = scratch(&[(
+        "owner.cpp",
+        r#"
+struct Tag {};
+Tag primary, specialized;
+namespace app {
+template<class T> struct Alloc;
+template<class T> struct OtherAlloc {
+    static Tag* malloc(int value);
+};
+template<> struct OtherAlloc<int> {};
+template<> Tag* OtherAlloc<const int>::malloc(int value) { return &primary; }
+}
+template<> struct app::Alloc<int> {
+    template<class... P>
+    static Tag* malloc(P... args, int value) { return &primary; }
+};
+template<> Tag* app::Alloc<int>::malloc(int value) { return &specialized; }
+Tag* result = app::Alloc<int>::malloc<>(7);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let ordinary = only_function(&program, "app::OtherAlloc::malloc");
+    assert!(program
+        .symbols
+        .function(ordinary)
+        .allocator_specialization_args()
+        .is_none());
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let dst = only_variable(&program, "result");
+    let expected = pag.var_location[&only_variable(&program, "specialized")];
+    assert_eq!(result.points_to[&pag.var_node[&dst]].len(), 1);
+    assert!(result.points_to[&pag.var_node[&dst]].contains(&expected));
+}
+
+#[test]
+fn in_class_allocator_specialization_declaration_guides_cross_tu_return() {
+    let dir = scratch(&[
+        (
+            "alloc.hpp",
+            r#"
+#pragma once
+struct Tag {};
+inline Tag primary;
+struct Alloc {
+    template<class... P>
+    static Tag* malloc(P... args, int value) { return &primary; }
+    template<> Tag* malloc<>(int);
+};
+"#,
+        ),
+        (
+            "caller.cpp",
+            r#"
+#include "alloc.hpp"
+Tag* result = Alloc::malloc<>(7);
+"#,
+        ),
+        (
+            "impl.cpp",
+            r#"
+#include "alloc.hpp"
+Tag specialized;
+template<> Tag* Alloc::malloc<>(int value) { return &specialized; }
+"#,
+        ),
+    ]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let dst = only_variable(&program, "result");
+    let expected = pag.var_location[&only_variable(&program, "specialized")];
+    assert_eq!(result.points_to[&pag.var_node[&dst]].len(), 1);
+    assert!(result.points_to[&pag.var_node[&dst]].contains(&expected));
+}
+
 fn assert_allocator_return_candidates(root: &std::path::Path, tags: &[&str]) {
     let program = build_program(root, &default_opts(root)).unwrap();
     let (pag, result) = analyze_with_options(

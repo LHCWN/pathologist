@@ -731,6 +731,8 @@ pub struct TypeTable {
     /// specifier carried a body: a forward declaration says a name is a
     /// class, a definition says what its members are.
     defined_structs: FxHashSet<std::sync::Arc<str>>,
+    /// Exact spellings of explicitly specialized C++ class owners.
+    explicit_class_specializations: FxHashSet<Arc<str>>,
     /// Class names lowering guessed for a type it could not resolve
     /// ([`note_guessed_class`](Self::note_guessed_class)): while no unit
     /// declares such a name, a descriptor of it registers no tag.
@@ -828,6 +830,7 @@ impl TypeTable {
         let mut table = Self {
             declared_structs: FxHashSet::default(),
             defined_structs: FxHashSet::default(),
+            explicit_class_specializations: FxHashSet::default(),
             guessed_tags: FxHashSet::default(),
             untagged: FxHashMap::default(),
             descriptors: descriptor_pool(),
@@ -1947,6 +1950,14 @@ impl TypeTable {
         self.defined_structs.contains(name)
     }
 
+    pub fn note_explicit_class_specialization(&mut self, owner: String) {
+        self.explicit_class_specializations.insert(owner.into());
+    }
+
+    pub fn has_explicit_class_specialization(&self, owner: &str) -> bool {
+        self.explicit_class_specializations.contains(owner)
+    }
+
     pub fn merge_struct_declarations(&mut self, other: &Self) {
         self.constructor_epoch += 1;
         for name in &other.declared_structs {
@@ -1956,6 +1967,10 @@ impl TypeTable {
             }
         }
         extend_missing(&mut self.defined_structs, &other.defined_structs);
+        extend_missing(
+            &mut self.explicit_class_specializations,
+            &other.explicit_class_specializations,
+        );
         extend_missing(&mut self.guessed_tags, &other.guessed_tags);
         for (specialization, element) in &other.template_element_types {
             if !self.template_element_types.contains_key(specialization) {

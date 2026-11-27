@@ -5802,6 +5802,7 @@ fn member_decl_is_function(node: Node) -> bool {
                             | "identifier"
                             | "qualified_identifier"
                             | "operator_name"
+                            | "template_function"
                             // `MACRO operator Vec<int>() const;` — recovery
                             // leaves the target's argument list attached to
                             // the declarator, which is then a template
@@ -5932,6 +5933,26 @@ fn lower_struct_specifier(
         }
         _ => ctx.qualify(&name),
     };
+    if let Some(name) = name_node.filter(|&name| {
+        is_cpp_class
+            && initializer_callee_template_leaf(name)
+                .is_some_and(|leaf| leaf.cached_kind() == "template_type")
+            && has_empty_template_prefix(node)
+    }) {
+        let spelling = node_text(source, &name);
+        let head = if name.cached_kind() == "qualified_identifier" {
+            qualify_class_name(
+                program,
+                ctx,
+                &normalize_qualified(type_name_before_template(spelling)),
+            )
+        } else {
+            reg_name.clone()
+        };
+        if let Some(owner) = explicit_class_specialization_key(&head, spelling) {
+            program.types.note_explicit_class_specialization(owner);
+        }
+    }
     let reg_name = container_elements::declaration_owner(program, ctx, source, node, &reg_name)
         .unwrap_or(reg_name);
     if let Some(tag) = member_tag.as_ref().filter(|tag| !tag.nests) {
@@ -7746,10 +7767,10 @@ fn has_function_template_parameters(node: Node) -> bool {
 }
 
 fn function_template_parameters(node: Node) -> Option<Node> {
-    enclosing_function_template_parameters(node).filter(|params| params.named_child_count() > 0)
+    enclosing_template_parameters(node).filter(|params| params.named_child_count() > 0)
 }
 
-fn enclosing_function_template_parameters(node: Node) -> Option<Node> {
+fn enclosing_template_parameters(node: Node) -> Option<Node> {
     node.parent()
         .and_then(|parent| {
             if parent.cached_kind() == "friend_declaration" {
@@ -7762,8 +7783,8 @@ fn enclosing_function_template_parameters(node: Node) -> Option<Node> {
         .and_then(|parent| parent.cached_field("parameters"))
 }
 
-fn is_explicit_function_specialization(node: Node) -> bool {
-    enclosing_function_template_parameters(node).is_some_and(|params| {
+fn has_empty_template_prefix(node: Node) -> bool {
+    enclosing_template_parameters(node).is_some_and(|params| {
         !params
             .named_children(&mut params.walk())
             .any(|param| param.cached_kind() != "comment")
@@ -7773,9 +7794,7 @@ fn is_explicit_function_specialization(node: Node) -> bool {
 /// Index an explicitly spelled allocator specialization under the overload
 /// name. Its own template arguments identify it separately from that name.
 fn allocator_specialization_name(name: String, declaration: Option<Node>) -> String {
-    if name.trim_end().ends_with('>')
-        && declaration.is_some_and(is_explicit_function_specialization)
-    {
+    if name.trim_end().ends_with('>') && declaration.is_some_and(has_empty_template_prefix) {
         let base = strip_template_args(&name);
         if is_allocator_name(&base) {
             return base;
@@ -8096,19 +8115,21 @@ fn register_member_prototype(
     let allocator_primary = is_member_template && is_allocator_name(&full_name);
     let non_deduced_pack =
         allocator_primary && function_pack_is_non_deduced(ctx, source, node, node, &shape);
-    let allocator_template = (allocator_primary && !shape.has_placeholder_parameter)
-        .then(|| {
-            allocator_template_metadata(
-                program,
-                ctx,
-                source,
-                node,
-                node,
-                &full_name,
-                non_deduced_pack,
-            )
-        })
-        .flatten();
+    let allocator_template = (is_allocator_name(&full_name)
+        && !shape.has_placeholder_parameter
+        && (is_member_template || has_empty_template_prefix(node)))
+    .then(|| {
+        allocator_template_metadata(
+            program,
+            ctx,
+            source,
+            node,
+            node,
+            &full_name,
+            non_deduced_pack,
+        )
+    })
+    .flatten();
     let explicit_arity = shape.declared();
     let span = node_span(program, ctx, node);
     let ret_type = node
@@ -8494,9 +8515,7 @@ fn lower_function_signature(
         && function_pack_is_non_deduced(ctx, source, node, decl, &shape);
     let allocator_template = (allocator
         && !shape.has_placeholder_parameter
-        && (eff_class.is_none()
-            || is_member_template
-            || is_explicit_function_specialization(node)))
+        && (eff_class.is_none() || is_member_template || has_empty_template_prefix(node)))
     .then(|| allocator_template_metadata(program, ctx, source, node, decl, &name, non_deduced_pack))
     .flatten();
     // Only a member meets an in-class prototype, the one kind of declaration
@@ -26904,11 +26923,23 @@ fn allocator_template_metadata(
     if !ctx.is_cpp {
         return None;
     }
-    if is_explicit_function_specialization(node) {
+    if has_empty_template_prefix(node) {
         let declarator = find_function_declarator(decl)?.cached_field("declarator")?;
         let leaf = initializer_callee_template_leaf(declarator)?;
-        let scope = &source[declarator.start_byte()..leaf.start_byte()];
-        let owner_templates = count_template_lists(scope);
+        let owner_templates = qualified_identifier_chain(declarator)
+            .filter_map(|part| part.cached_field("scope"))
+            .filter(|scope| scope.cached_kind() == "template_type")
+            .filter(|scope| {
+                let spelling = &source[declarator.start_byte()..scope.end_byte()];
+                let head = qualify_class_name(
+                    program,
+                    ctx,
+                    &normalize_qualified(type_name_before_template(spelling)),
+                );
+                explicit_class_specialization_key(&head, spelling)
+                    .is_none_or(|owner| !program.types.has_explicit_class_specialization(&owner))
+            })
+            .count();
         // A template prefix for each owner can specialize an ordinary
         // member. A function-template specialization has its own prefix.
         let template_prefixes = std::iter::successors(node.parent(), |parent| parent.parent())
@@ -26953,6 +26984,13 @@ fn allocator_template_metadata(
         trailing_pack: pack,
         pack_expands_into_parameters: non_deduced_pack,
     }))
+}
+
+/// Preserve the exact arguments. The general template spelling used for
+/// receiver substitution drops qualifiers that can distinguish owners here.
+fn explicit_class_specialization_key(head: &str, spelling: &str) -> Option<String> {
+    let arguments = &spelling[spelling.find('<')?..];
+    Some(format!("{head}{}", normalize_spacing(arguments)))
 }
 
 fn integral_literal_type(text: &str, value: i128) -> Option<trace_ir::IntegralLiteralType> {

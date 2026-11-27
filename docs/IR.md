@@ -156,6 +156,9 @@ placeholder parameter type is an abbreviated template and can bind a
 template-id without a written template parameter list. Known differences in
 explicit template argument types or integral literal values rule out a
 specialization before arity ranking, including for static member templates.
+An in-class declaration of a member specialization can select its definition
+in another translation unit. When recognizing an out-of-class specialization,
+an explicitly specialized owner does not consume a template prefix.
 Integral literals also retain their
 deduced type for `auto` template parameters. Each uncertain specialization
 is ranked independently alongside the ordinary candidates. A separate pass
