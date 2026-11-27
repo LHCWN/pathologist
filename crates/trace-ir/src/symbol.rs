@@ -155,14 +155,31 @@ impl Variable {
 pub enum AllocatorTemplateArgument {
     Type(String),
     Integer(i128),
+    DeducedInteger(i128, IntegralLiteralType),
+}
+
+/// Integral literal types distinguished by non-type template deduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegralLiteralType {
+    Int,
+    UnsignedInt,
+    Long,
+    UnsignedLong,
+    LongLong,
+    UnsignedLongLong,
 }
 
 /// Extra declaration facts for matching allocator template-ids.
 #[derive(Debug, Clone)]
 pub enum AllocatorTemplate {
-    /// Leading template parameters before the sole pack, which expands
-    /// into one function parameter per element.
-    SinglePack { fixed_template_parameters: u32 },
+    Primary {
+        /// Parameters which deduce the type of a non-type argument.
+        deduced_types: Box<[bool]>,
+        /// The final template parameter is a pack.
+        trailing_pack: bool,
+        /// The known layout expands the pack once into each function slot.
+        pack_expands_into_parameters: bool,
+    },
     /// Written arguments before any unknown-length expansion, or an empty
     /// slice when the specialization relies on deduction.
     Specialization(Box<[Option<AllocatorTemplateArgument>]>),
@@ -303,9 +320,15 @@ fn specialization_arguments_agree(
     a: &[Option<AllocatorTemplateArgument>],
     b: &[Option<AllocatorTemplateArgument>],
 ) -> bool {
-    a.iter()
-        .zip(b)
-        .all(|(a, b)| a.as_ref().zip(b.as_ref()).is_none_or(|(a, b)| a == b))
+    a.iter().zip(b).all(|(a, b)| {
+        a.as_ref().zip(b.as_ref()).is_none_or(|(a, b)| {
+            use AllocatorTemplateArgument::{DeducedInteger, Integer};
+            match (a, b) {
+                (Integer(a), DeducedInteger(b, _)) | (DeducedInteger(a, _), Integer(b)) => a == b,
+                _ => a == b,
+            }
+        })
+    })
 }
 
 impl Function {
@@ -321,32 +344,65 @@ impl Function {
     pub fn allocator_specialization_args(&self) -> Option<&[Option<AllocatorTemplateArgument>]> {
         match self.allocator_template.as_deref()? {
             AllocatorTemplate::Specialization(args) => Some(args),
-            AllocatorTemplate::SinglePack { .. } => None,
+            AllocatorTemplate::Primary { .. } => None,
         }
     }
 
-    /// Reject mismatched arguments and a prefix longer than the complete
-    /// list when the selected primary's pack layout determines its size.
-    pub fn specialization_accepts_template_args(
+    pub fn template_argument_deduces_type(&self, slot: usize) -> bool {
+        let Some(AllocatorTemplate::Primary {
+            deduced_types,
+            trailing_pack,
+            ..
+        }) = self.allocator_template.as_deref()
+        else {
+            return false;
+        };
+        deduced_types
+            .get(slot)
+            .or_else(|| deduced_types.last().filter(|_| *trailing_pack))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether a specialization matches a written template-id. Unknown
+    /// arguments and incomplete lists must not displace the primary.
+    pub fn specialization_matches_template_args(
         &self,
         written: &[Option<AllocatorTemplateArgument>],
         primary: Option<&Self>,
-    ) -> bool {
-        self.allocator_specialization_args().is_none_or(|args| {
-            let limit = primary.and_then(|primary| {
-                let AllocatorTemplate::SinglePack {
-                    fixed_template_parameters,
-                } = primary.allocator_template.as_deref()?
-                else {
+    ) -> Option<bool> {
+        let Some(args) = self.allocator_specialization_args() else {
+            return Some(true);
+        };
+        let limit = primary.and_then(|primary| {
+            let AllocatorTemplate::Primary {
+                deduced_types,
+                trailing_pack,
+                pack_expands_into_parameters,
+            } = primary.allocator_template.as_deref()?
+            else {
+                return None;
+            };
+            let limit = if *trailing_pack {
+                if !pack_expands_into_parameters {
                     return None;
-                };
+                }
                 let elements = self.explicit_arity?.checked_sub(primary.explicit_arity?)?;
-                let limit = fixed_template_parameters.checked_add(elements)? as usize;
-                (limit >= args.len()).then_some(limit)
-            });
-            limit.is_none_or(|limit| written.len() <= limit)
-                && specialization_arguments_agree(args, written)
-        })
+                deduced_types.len() - 1 + elements as usize
+            } else {
+                deduced_types.len()
+            };
+            (limit >= args.len()).then_some(limit)
+        });
+        if limit.is_some_and(|limit| written.len() > limit)
+            || !specialization_arguments_agree(args, written)
+        {
+            return Some(false);
+        }
+        (limit == Some(written.len())
+            && args.len() == written.len()
+            && args.iter().zip(written).all(|(a, b)| a.is_some() && a == b))
+        .then_some(true)
     }
 
     fn same_allocator_specialization(&self, other: &Self) -> bool {

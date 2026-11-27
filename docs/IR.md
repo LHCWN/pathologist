@@ -153,7 +153,9 @@ explicit casts. A template-id, including one with an empty argument list,
 restricts allocator candidates to templates and explicit specializations
 before ranking at file scope and in function bodies. Known differences in
 explicit template argument types or integral literal values rule out a
-specialization before arity ranking. With one primary whose single pack
+specialization before arity ranking. Integral literals also retain their
+deduced type for `auto` template parameters. A specialization whose match
+is uncertain cannot eliminate the primary. With one primary whose single pack
 expands into the function parameter list, a specialization's parameter
 count bounds its template argument count. Unknown or omitted arguments
 retain possible matches. Lowering retains the

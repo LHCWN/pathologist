@@ -8468,7 +8468,9 @@ fn lower_function_signature(
     let non_deduced_pack =
         eff_class.is_none() && free_function_pack_is_non_deduced(ctx, source, node, decl, &shape);
     let allocator_template = (eff_class.is_none() && is_allocator_name(&name))
-        .then(|| allocator_template_metadata(program, ctx, source, node, decl, non_deduced_pack))
+        .then(|| {
+            allocator_template_metadata(program, ctx, source, node, decl, &name, non_deduced_pack)
+        })
         .flatten();
     // Only a member meets an in-class prototype, the one kind of declaration
     // that records an unresolved parameter as unknown.
@@ -16491,7 +16493,7 @@ fn lower_function_decl(
     let allocator_template = declaration
         .filter(|_| is_allocator_name(&name))
         .and_then(|node| {
-            allocator_template_metadata(program, ctx, source, node, decl, non_deduced_pack)
+            allocator_template_metadata(program, ctx, source, node, decl, &name, non_deduced_pack)
         });
     let local_defaults = ctx.current_fn.is_some().then(|| {
         program
@@ -18057,39 +18059,41 @@ fn collect_call_at_node_inner(
         } else {
             cpp_callee_candidates(program, ctx, source, func, &callee_name, &arg_desc)
         };
-        let candidates = if is_allocator_name(&callee_name) {
+        let (candidates, uncertain) = if is_allocator_name(&callee_name) {
             allocator_template_candidates(program, ctx, source, func, candidates)
         } else {
-            candidates
+            (candidates, Vec::new())
         };
         // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
         // too: its `this` is not one of the arguments.
         let implicit_receiver = (!args.argument_references.is_empty())
             .then(|| qualified_this_context(program, ctx, &callee_name))
             .flatten();
-        let ranked = if let Some(class) = implicit_receiver {
-            select_call_overloads(
-                OverloadChoice::Edges,
-                program,
-                candidates,
-                &arg_desc,
-                &null_constants,
-                &args.argument_references,
-                Some(class.is_const),
-                Some(false),
-                callee_spells_template_args(func),
-                false,
-            )
-        } else {
-            rank_free_call_overloads(
-                program,
-                candidates,
-                &arg_desc,
-                &null_constants,
-                &args.argument_references,
-                argc,
-            )
-        };
+        let ranked = rank_with_uncertain_specializations(candidates, &uncertain, |candidates| {
+            if let Some(class) = implicit_receiver {
+                select_call_overloads(
+                    OverloadChoice::Edges,
+                    program,
+                    candidates,
+                    &arg_desc,
+                    &null_constants,
+                    &args.argument_references,
+                    Some(class.is_const),
+                    Some(false),
+                    callee_spells_template_args(func),
+                    false,
+                )
+            } else {
+                rank_free_call_overloads(
+                    program,
+                    candidates,
+                    &arg_desc,
+                    &null_constants,
+                    &args.argument_references,
+                    argc,
+                )
+            }
+        });
         if ranked.len() > 1
             && ranked
                 .iter()
@@ -19385,6 +19389,30 @@ fn narrow_reference_arguments(
                 preferred
             })
         })
+        .collect()
+}
+
+/// Rank both with the plausible specializations and without them. A
+/// possible specialization may take the call or leave it to the primary.
+fn rank_with_uncertain_specializations(
+    candidates: Vec<FnId>,
+    uncertain: &[FnId],
+    rank: impl Fn(Vec<FnId>) -> Vec<FnId>,
+) -> Vec<FnId> {
+    if uncertain.is_empty() {
+        return rank(candidates);
+    }
+    let ranked = rank(candidates.clone());
+    let definite = rank(
+        candidates
+            .iter()
+            .copied()
+            .filter(|id| !uncertain.contains(id))
+            .collect(),
+    );
+    candidates
+        .into_iter()
+        .filter(|id| ranked.contains(id) || definite.contains(id))
         .collect()
 }
 
@@ -26824,6 +26852,7 @@ fn allocator_template_metadata(
     source: &str,
     node: Node,
     decl: Node,
+    name: &str,
     non_deduced_pack: bool,
 ) -> Option<Box<trace_ir::AllocatorTemplate>> {
     if !ctx.is_cpp {
@@ -26834,13 +26863,14 @@ fn allocator_template_metadata(
             .and_then(|function| function.cached_field("declarator"))
             .and_then(initializer_callee_template_leaf)
             .and_then(callee_template_argument_list);
-        let args = allocator_template_arguments(program, ctx, source, arguments);
+        let candidates = program
+            .symbols
+            .resolve_function_candidates(name, Some(ctx.current_file));
+        let primary = sole_allocator_primary(program, &candidates);
+        let args = allocator_template_arguments(program, ctx, source, arguments, primary);
         return Some(Box::new(trace_ir::AllocatorTemplate::Specialization(
             args.into_boxed_slice(),
         )));
-    }
-    if !non_deduced_pack {
-        return None;
     }
     // Abbreviated function parameters can introduce implicit template
     // parameters that are absent from the written list.
@@ -26853,7 +26883,7 @@ fn allocator_template_metadata(
         return None;
     }
     let template = function_template_parameters(node)?;
-    let mut fixed_template_parameters = 0;
+    let mut deduced_types = Vec::new();
     let mut pack = false;
     for param in template.named_children(&mut template.walk()) {
         match param.cached_kind() {
@@ -26863,17 +26893,43 @@ fn allocator_template_metadata(
             "type_parameter_declaration"
             | "optional_type_parameter_declaration"
             | "parameter_declaration"
-            | "optional_parameter_declaration" => {
-                fixed_template_parameters += 1;
-            }
+            | "optional_parameter_declaration" => {}
             _ => return None,
         }
+        deduced_types.push(
+            param
+                .cached_field("type")
+                .is_some_and(|ty| is_placeholder_type(ctx, ty)),
+        );
     }
-    pack.then(|| {
-        Box::new(trace_ir::AllocatorTemplate::SinglePack {
-            fixed_template_parameters,
-        })
-    })
+    Some(Box::new(trace_ir::AllocatorTemplate::Primary {
+        deduced_types: deduced_types.into_boxed_slice(),
+        trailing_pack: pack,
+        pack_expands_into_parameters: non_deduced_pack,
+    }))
+}
+
+fn integral_literal_type(text: &str, value: i128) -> Option<trace_ir::IntegralLiteralType> {
+    use trace_ir::IntegralLiteralType::*;
+    let digits = text.trim_end_matches(['u', 'U', 'l', 'L']);
+    // Only infer types whose values fit the minimum C++ width.
+    match text[digits.len()..].to_ascii_lowercase().as_str() {
+        "" if (0..=i16::MAX as i128).contains(&value) => Some(Int),
+        "u" if (0..=u16::MAX as i128).contains(&value) => Some(UnsignedInt),
+        "l" if (0..=i32::MAX as i128).contains(&value) => Some(Long),
+        "ul" | "lu" if (0..=u32::MAX as i128).contains(&value) => Some(UnsignedLong),
+        "ll" if (0..=i64::MAX as i128).contains(&value) => Some(LongLong),
+        "ull" | "llu" if (0..=u64::MAX as i128).contains(&value) => Some(UnsignedLongLong),
+        _ => None,
+    }
+}
+
+fn sole_allocator_primary<'a>(program: &'a Program, candidates: &[FnId]) -> Option<&'a Function> {
+    let mut primaries = candidates
+        .iter()
+        .map(|&id| program.symbols.function(id))
+        .filter(|f| f.is_function_template());
+    primaries.next().filter(|_| primaries.next().is_none())
 }
 
 fn allocator_template_arguments(
@@ -26881,6 +26937,7 @@ fn allocator_template_arguments(
     ctx: &LowerContext,
     source: &str,
     arguments: Option<Node>,
+    primary: Option<&Function>,
 ) -> Vec<Option<trace_ir::AllocatorTemplateArgument>> {
     let Some(list) = arguments else {
         return Vec::new();
@@ -26888,7 +26945,8 @@ fn allocator_template_arguments(
     list.named_children(&mut list.walk())
         .filter(|arg| arg.cached_kind() != "comment")
         .take_while(|arg| !node_text(source, arg).trim_end().ends_with("..."))
-        .map(|arg| {
+        .enumerate()
+        .map(|(slot, arg)| {
             if spelling_is_dependent(ctx, source, arg, node_text(source, &arg), Spelling::Source) {
                 return None;
             }
@@ -26897,8 +26955,14 @@ fn allocator_template_arguments(
             // to ordinary conservative matching.
             let value = peel_expression(arg);
             if value.cached_kind() == "number_literal" {
-                return integer_constant_expression(program, ctx, source, value, 0)
-                    .map(trace_ir::AllocatorTemplateArgument::Integer);
+                use trace_ir::AllocatorTemplateArgument::{DeducedInteger, Integer};
+                let integer = integer_constant_expression(program, ctx, source, value, 0)?;
+                return if primary.is_some_and(|f| f.template_argument_deduces_type(slot)) {
+                    integral_literal_type(node_text(source, &value), integer)
+                        .map(|ty| DeducedInteger(integer, ty))
+                } else {
+                    Some(Integer(integer))
+                };
             }
             // Use the alias-aware type spelling for concrete types.
             // The coarse flow type cannot distinguish unsigned, cv,
@@ -26921,22 +26985,31 @@ fn allocator_template_candidates(
     source: &str,
     func: Node,
     mut candidates: Vec<FnId>,
-) -> Vec<FnId> {
+) -> (Vec<FnId>, Vec<FnId>) {
+    let mut uncertain = Vec::new();
     if let Some(leaf) =
         initializer_callee_template_leaf(func).filter(|&leaf| is_callee_template_id(leaf))
     {
-        let written =
-            allocator_template_arguments(program, ctx, source, callee_template_argument_list(leaf));
-        // A sole primary supplies the pack layout for its specializations.
-        // Different primaries can have different template parameter lists.
-        let mut primaries = candidates
-            .iter()
-            .map(|&id| program.symbols.function(id))
-            .filter(|f| f.is_function_template());
-        let primary = primaries.next().filter(|_| primaries.next().is_none());
+        let primary = sole_allocator_primary(program, &candidates);
+        let written = allocator_template_arguments(
+            program,
+            ctx,
+            source,
+            callee_template_argument_list(leaf),
+            primary,
+        );
         candidates.retain(|&id| {
             let f = program.symbols.function(id);
-            f.can_bind_template_id() && f.specialization_accepts_template_args(&written, primary)
+            if !f.can_bind_template_id() {
+                return false;
+            }
+            match f.specialization_matches_template_args(&written, primary) {
+                Some(matches) => matches,
+                None => {
+                    uncertain.push(id);
+                    true
+                }
+            }
         });
     } else if candidates.iter().any(|&id| {
         program
@@ -26961,7 +27034,7 @@ fn allocator_template_candidates(
                     .any(|&other| has_same_signature(program, id, other))
         });
     }
-    candidates
+    (candidates, uncertain)
 }
 
 fn initializer_allocation_binding(
@@ -26979,15 +27052,20 @@ fn initializer_allocation_binding(
         .collect();
     let template_id = initializer_callee_template_leaf(func).is_some_and(is_callee_template_id);
     let candidates = cpp_callee_candidates(program, ctx, source, func, &name, &args);
-    let candidates = allocator_template_candidates(program, ctx, source, func, candidates);
-    let selected = rank_free_call_overloads(
-        program,
-        candidates,
-        &args,
-        &null_constant_args(source, &nodes),
-        &move_argument_references(program, ctx, source, call),
-        nodes.len(),
-    );
+    let (candidates, uncertain) =
+        allocator_template_candidates(program, ctx, source, func, candidates);
+    let null_constants = null_constant_args(source, &nodes);
+    let references = move_argument_references(program, ctx, source, call);
+    let selected = rank_with_uncertain_specializations(candidates, &uncertain, |candidates| {
+        rank_free_call_overloads(
+            program,
+            candidates,
+            &args,
+            &null_constants,
+            &references,
+            nodes.len(),
+        )
+    });
     if selected.is_empty() {
         // A name-only fallback would bring back non-templates, including
         // an unrelated C allocator, for this template-id.

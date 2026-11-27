@@ -1738,3 +1738,101 @@ auto* local_other() {
         assert_eq!(pointees, [expected], "expected {tag}");
     }
 }
+
+#[test]
+fn allocator_specializations_distinguish_deduced_integral_types() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace deduced {
+struct Tag {};
+Tag primary, unsigned_result;
+template<auto N, class... P>
+Tag* malloc(P... args, int value) { return &primary; }
+template<> Tag* malloc<1u>(int value) { return &unsigned_result; }
+}
+namespace converted {
+struct Tag {};
+Tag converted_primary, converted_result;
+template<int N, class... P>
+Tag* malloc(P... args, int value) { return &converted_primary; }
+template<> Tag* malloc<1u>(int value) { return &converted_result; }
+}
+auto* signed_call = deduced::malloc<1>(7);
+auto* unsigned_call = deduced::malloc<0x1u>(7);
+auto* converted_call = converted::malloc<1>(7);
+auto* local_signed() {
+    auto* p = deduced::malloc<1>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (var, tag) in [
+        (only_variable(&program, "signed_call"), "primary"),
+        (only_variable(&program, "unsigned_call"), "unsigned_result"),
+        (
+            only_variable(&program, "converted_call"),
+            "converted_result",
+        ),
+        (local_variable(&program, "local_signed", "p"), "primary"),
+    ] {
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "expected {tag}");
+    }
+}
+
+#[test]
+fn uncertain_allocator_specialization_keeps_primary_return_flow() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag primary, specialized;
+template<int N, class... P>
+Tag* malloc(P... args, int value) { return &primary; }
+template<> Tag* malloc<1>(int value) { return &specialized; }
+}
+constexpr int n = 2;
+auto* global = app::malloc<n>(7);
+auto* local() {
+    auto* p = app::malloc<n>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let primary = pag.var_location[&only_variable(&program, "primary")];
+    let specialization = pag.var_location[&only_variable(&program, "specialized")];
+    for var in [
+        only_variable(&program, "global"),
+        local_variable(&program, "local", "p"),
+    ] {
+        let pointees = &result.points_to[&pag.var_node[&var]];
+        assert_eq!(pointees.len(), 2, "{pointees:?}");
+        assert!(pointees.contains(&primary), "{pointees:?}");
+        assert!(pointees.contains(&specialization), "{pointees:?}");
+    }
+}
