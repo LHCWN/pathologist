@@ -19392,8 +19392,9 @@ fn narrow_reference_arguments(
         .collect()
 }
 
-/// Rank both with the plausible specializations and without them. A
-/// possible specialization may take the call or leave it to the primary.
+/// Rank with no uncertain specialization and with each one in isolation.
+/// Conversion ranks cannot distinguish specializations whose template
+/// arguments could have selected different instantiations.
 fn rank_with_uncertain_specializations(
     candidates: Vec<FnId>,
     uncertain: &[FnId],
@@ -19402,17 +19403,21 @@ fn rank_with_uncertain_specializations(
     if uncertain.is_empty() {
         return rank(candidates);
     }
-    let ranked = rank(candidates.clone());
-    let definite = rank(
+    let uncertain: HashSet<_> = uncertain.iter().copied().collect();
+    let alternatives = |included| {
         candidates
             .iter()
             .copied()
-            .filter(|id| !uncertain.contains(id))
-            .collect(),
-    );
+            .filter(|id| included == Some(*id) || !uncertain.contains(id))
+            .collect()
+    };
+    let mut selected: HashSet<_> = rank(alternatives(None)).into_iter().collect();
+    for &id in candidates.iter().filter(|id| uncertain.contains(id)) {
+        selected.extend(rank(alternatives(Some(id))));
+    }
     candidates
         .into_iter()
-        .filter(|id| ranked.contains(id) || definite.contains(id))
+        .filter(|id| selected.contains(id))
         .collect()
 }
 
@@ -27024,14 +27029,23 @@ fn allocator_template_candidates(
             .filter(|&id| !program.symbols.function(id).can_bind_template_id())
             .collect();
         candidates.retain(|&id| {
-            program
+            if program
                 .symbols
                 .function(id)
                 .allocator_specialization_args()
                 .is_none()
-                || !ordinary
-                    .iter()
-                    .any(|&other| has_same_signature(program, id, other))
+            {
+                return true;
+            }
+            if ordinary
+                .iter()
+                .any(|&other| has_same_signature(program, id, other))
+            {
+                return false;
+            }
+            // An omitted template argument can be deduced or defaulted.
+            uncertain.push(id);
+            true
         });
     }
     (candidates, uncertain)

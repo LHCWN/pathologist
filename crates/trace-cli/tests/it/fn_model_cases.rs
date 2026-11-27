@@ -1836,3 +1836,74 @@ auto* local() {
         assert!(pointees.contains(&specialization), "{pointees:?}");
     }
 }
+
+#[test]
+fn allocator_specializations_without_template_ids_keep_the_primary() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace implicit_args {
+struct Tag {};
+Tag default_primary, wrong_default;
+template<int N = 2, class... P>
+Tag* malloc(P... args, int value) { return &default_primary; }
+template<> Tag* malloc<1>(int value) { return &wrong_default; }
+}
+auto* global = implicit_args::malloc(7);
+auto* local() {
+    auto* p = implicit_args::malloc(7);
+    return p;
+}
+"#,
+    )]);
+    assert_allocator_return_candidates(dir.path(), &["default_primary", "wrong_default"]);
+}
+
+#[test]
+fn uncertain_allocator_specializations_are_ranked_independently() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace dependent {
+struct Tag {};
+Tag dependent_primary, wrong_int, selected_long;
+template<auto N, class... P>
+Tag* malloc(P... args, decltype(N) value) { return &dependent_primary; }
+template<> Tag* malloc<1>(int value) { return &wrong_int; }
+template<> Tag* malloc<2L>(long value) { return &selected_long; }
+}
+constexpr long n = 2;
+auto* global = dependent::malloc<n>(7);
+auto* local() {
+    auto* p = dependent::malloc<n>(7);
+    return p;
+}
+"#,
+    )]);
+    assert_allocator_return_candidates(
+        dir.path(),
+        &["dependent_primary", "wrong_int", "selected_long"],
+    );
+}
+
+fn assert_allocator_return_candidates(root: &std::path::Path, tags: &[&str]) {
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for var in [
+        only_variable(&program, "global"),
+        local_variable(&program, "local", "p"),
+    ] {
+        let pointees = &result.points_to[&pag.var_node[&var]];
+        assert_eq!(pointees.len(), tags.len(), "{pointees:?}");
+        for tag in tags {
+            let expected = pag.var_location[&only_variable(&program, tag)];
+            assert!(pointees.contains(&expected), "missing {tag}: {pointees:?}");
+        }
+    }
+}

@@ -154,8 +154,11 @@ restricts allocator candidates to templates and explicit specializations
 before ranking at file scope and in function bodies. Known differences in
 explicit template argument types or integral literal values rule out a
 specialization before arity ranking. Integral literals also retain their
-deduced type for `auto` template parameters. A specialization whose match
-is uncertain cannot eliminate the primary. With one primary whose single pack
+deduced type for `auto` template parameters. Each uncertain specialization
+is ranked independently alongside the ordinary candidates. A separate pass
+with no uncertain specializations preserves the primary when those matches
+fail. Calls without a template-id also treat retained specializations as
+uncertain. With one primary whose single pack
 expands into the function parameter list, a specialization's parameter
 count bounds its template argument count. Unknown or omitted arguments
 retain possible matches. Lowering retains the
