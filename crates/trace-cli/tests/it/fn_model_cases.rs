@@ -1910,6 +1910,31 @@ Tag* malloc(auto value) { return &expected; }
     assert_allocator_return_candidates(dir.path(), &["expected"]);
 }
 
+#[test]
+fn allocator_template_ids_accept_abbreviated_static_members() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {};
+Tag expected, ordinary;
+struct Alloc {
+    static Tag* malloc(int) { return &ordinary; }
+    static Tag* malloc(auto value) { return &expected; }
+};
+struct DeferredAlloc {
+    static Tag* malloc(auto value);
+};
+Tag* global = Alloc::malloc<int>(7);
+auto* local() {
+    auto* p = DeferredAlloc::malloc<int>(7);
+    return p;
+}
+Tag* DeferredAlloc::malloc(auto value) { return &expected; }
+"#,
+    )]);
+    assert_allocator_return_candidates(dir.path(), &["expected"]);
+}
+
 fn assert_allocator_return_candidates(root: &std::path::Path, tags: &[&str]) {
     let program = build_program(root, &default_opts(root)).unwrap();
     let (pag, result) = analyze_with_options(

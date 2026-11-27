@@ -7784,13 +7784,16 @@ fn allocator_specialization_name(name: String, declaration: Option<Node>) -> Str
     name
 }
 
-/// Whether the member declaration or definition `node` is written as a
-/// function template (`template <class U> R f();`, or out-of-class
-/// `template <class U> R C::f()` / `template <class T> template <class U>
+/// Whether the member declaration or definition is an abbreviated function
+/// template or has its own template parameter list (`template <class U> R f();`,
+/// or out-of-class `template <class U> R C::f()` / `template <class T> template <class U>
 /// R H<T>::f()`). An out-of-class definition of a class template's non-template
 /// member (`template <class T> void H<T>::f()`) has one template parameter list
 /// per templated scope segment, so it is no function template.
-fn is_member_function_template(source: &str, node: Node) -> bool {
+fn is_member_function_template(source: &str, node: Node, has_placeholder_parameter: bool) -> bool {
+    if has_placeholder_parameter {
+        return true;
+    }
     let has_type_params = |tpl: Node| {
         tpl.children(&mut tpl.walk())
             .any(|c| c.cached_kind() == "template_parameter_list" && c.named_child_count() > 0)
@@ -8161,7 +8164,11 @@ fn register_member_prototype(
             declared_in_class: true,
             is_free_function_template: false,
             allocator_template: None,
-            is_member_template: is_member_function_template(source, node),
+            is_member_template: is_member_function_template(
+                source,
+                node,
+                shape.has_placeholder_parameter,
+            ),
             is_const_member: function_is_const_qualified(source, node),
             ref_qualifier: function_ref_qualifier(source, node),
             return_cv: function_return_cv(program, ctx, source, node, None, &return_kind),
@@ -8557,7 +8564,7 @@ fn lower_function_signature(
             allocator_template,
             is_member_template: ctx.is_cpp
                 && eff_class.is_some()
-                && is_member_function_template(source, node),
+                && is_member_function_template(source, node, shape.has_placeholder_parameter),
             is_const_member: ctx.is_cpp && function_is_const_qualified(source, node),
             ref_qualifier: ctx
                 .is_cpp
@@ -8839,6 +8846,12 @@ fn is_parameter_node(kind: &str) -> bool {
     )
 }
 
+fn parameter_has_placeholder_type(ctx: &LowerContext, param: Node) -> bool {
+    param
+        .cached_field("type")
+        .is_some_and(|ty| is_placeholder_type(ctx, ty))
+}
+
 /// A fixed parameter, excluding C's `(void)` and variadic tails. Counting
 /// these does not require resolving reference aliases or allocating a shape.
 fn declares_fixed_parameter(source: &str, param: Node) -> bool {
@@ -8892,9 +8905,7 @@ impl ParamListShape {
             }
         };
         if declares {
-            self.has_placeholder_parameter |= param
-                .cached_field("type")
-                .is_some_and(|ty| is_placeholder_type(ctx, ty));
+            self.has_placeholder_parameter |= parameter_has_placeholder_type(ctx, param);
             let reference = declaration_reference_kind(program, ctx, source, param);
             self.references.push(
                 reference.is_some() && !parameter_keeps_pointer_value(program, ctx, source, param),
@@ -13682,11 +13693,14 @@ fn register_template_return(
             parameter_names.iter().position(|p| *p == Some(returned))
         })
         .flatten();
-    let arity = find_params(node).map_or(0, |p| {
-        p.children(&mut p.walk())
-            .filter(|param| declares_fixed_parameter(source, *param))
-            .count() as u32
-    });
+    let mut arity = 0;
+    let mut has_placeholder_parameter = false;
+    if let Some(params) = find_params(node) {
+        for param in params.named_children(&mut params.walk()) {
+            arity += u32::from(declares_fixed_parameter(source, param));
+            has_placeholder_parameter |= parameter_has_placeholder_type(ctx, param);
+        }
+    }
     // Names and shapes only: a struct's fields differ with how complete it
     // was in the declaring unit, and would split one fact into several.
     let read;
@@ -13709,7 +13723,8 @@ fn register_template_return(
             .is_cpp
             .then(|| function_ref_qualifier(source, node))
             .flatten(),
-        is_member_template: ctx.is_cpp && is_member_function_template(source, node),
+        is_member_template: ctx.is_cpp
+            && is_member_function_template(source, node, has_placeholder_parameter),
         parameter,
         pointer_depth,
         // As spelled: which class it names is read from the template's own

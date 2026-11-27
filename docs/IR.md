@@ -151,7 +151,7 @@ body the occurrence identifies the call site's selected targets. At file scope
 lowering ranks overloads with the same argument types as body calls, including
 explicit casts. A template-id, including one with an empty argument list,
 restricts allocator candidates to templates and explicit specializations
-before ranking at file scope and in function bodies. A free function with a
+before ranking at file scope and in function bodies. A function with a
 placeholder parameter type is an abbreviated template and can bind a
 template-id without a written template parameter list. Known differences in
 explicit template argument types or integral literal values rule out a
