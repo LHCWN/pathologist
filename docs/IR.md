@@ -152,8 +152,11 @@ lowering ranks overloads with the same argument types as body calls, including
 explicit casts. A template-id, including one with an empty argument list,
 restricts allocator candidates to templates and explicit specializations
 before ranking at file scope and in function bodies. Known differences in
-explicit template argument types rule out a specialization before arity
-ranking. Unknown or omitted arguments retain possible matches. Lowering retains the
+explicit template argument types or integral literal values rule out a
+specialization before arity ranking. With one primary whose single pack
+expands into the function parameter list, a specialization's parameter
+count bounds its template argument count. Unknown or omitted arguments
+retain possible matches. Lowering retains the
 selected C++ declarations and the values lowered for each explicit formal slot. Lowering aligns written actuals across
 pack slots before choosing an address or a value. Omitted defaults bind
 directly to their own formal slots. PAG construction matches the declarations

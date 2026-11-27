@@ -1659,3 +1659,82 @@ auto* local_alias() {
         assert_eq!(pointees, [expected], "expected {tag}");
     }
 }
+
+#[test]
+fn allocator_template_ids_check_pack_length_and_integral_values() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace lengths {
+struct Tag {};
+Tag primary_length, empty_pack;
+template<class U, class... P>
+Tag* malloc(P... args, int value = 0) { return &primary_length; }
+template<> Tag* malloc<int>(int value) { return &empty_pack; }
+}
+namespace packed {
+struct Tag {};
+Tag primary_packed, nonempty_pack;
+template<class U, class... P>
+Tag* malloc(P... args, int value) { return &primary_packed; }
+template<> Tag* malloc<int, long>(long arg, int value) { return &nonempty_pack; }
+}
+namespace values {
+struct Tag {};
+Tag primary_value, one, three;
+template<int N, class... P>
+Tag* malloc(P... args, int value) { return &primary_value; }
+template<> Tag* malloc<1>(int value) { return &one; }
+template<> Tag* malloc<3>(int value) { return &three; }
+}
+auto* global_longer = lengths::malloc<int, long>(7);
+auto* global_shorter = lengths::malloc<int>(7);
+auto* global_packed = packed::malloc<int, long>(6, 7);
+auto* global_other = values::malloc<2>(7);
+auto* global_same = values::malloc<0x1>(7);
+auto* global_three = values::malloc<3>(7);
+auto* local_longer() {
+    auto* p = lengths::malloc<int, long>(7);
+    return p;
+}
+auto* local_other() {
+    auto* p = values::malloc<2>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (var, tag) in [
+        (only_variable(&program, "global_longer"), "primary_length"),
+        (only_variable(&program, "global_shorter"), "empty_pack"),
+        (only_variable(&program, "global_packed"), "nonempty_pack"),
+        (only_variable(&program, "global_other"), "primary_value"),
+        (only_variable(&program, "global_same"), "one"),
+        (only_variable(&program, "global_three"), "three"),
+        (
+            local_variable(&program, "local_longer", "p"),
+            "primary_length",
+        ),
+        (
+            local_variable(&program, "local_other", "p"),
+            "primary_value",
+        ),
+    ] {
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "expected {tag}");
+    }
+}

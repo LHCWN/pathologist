@@ -150,6 +150,24 @@ impl Variable {
     }
 }
 
+/// Concrete written arguments used to identify allocator specializations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllocatorTemplateArgument {
+    Type(String),
+    Integer(i128),
+}
+
+/// Extra declaration facts for matching allocator template-ids.
+#[derive(Debug, Clone)]
+pub enum AllocatorTemplate {
+    /// Leading template parameters before the sole pack, which expands
+    /// into one function parameter per element.
+    SinglePack { fixed_template_parameters: u32 },
+    /// Written arguments before any unknown-length expansion, or an empty
+    /// slice when the specialization relies on deduction.
+    Specialization(Box<[Option<AllocatorTemplateArgument>]>),
+}
+
 #[derive(Debug, Clone)]
 pub struct Function {
     pub id: FnId,
@@ -225,10 +243,7 @@ pub struct Function {
     pub is_member_template: bool,
     /// A namespace-scope function template eligible for a template-id call.
     pub is_free_function_template: bool,
-    /// A free allocator specialization's written template arguments. The
-    /// list is empty when the declaration relies on deduction. Unresolved
-    /// argument types occupy their own slots without excluding matches.
-    pub allocator_specialization_args: Option<Box<[Option<String>]>>,
+    pub allocator_template: Option<Box<AllocatorTemplate>>,
     /// Declared `static` in its class body: a member with no receiver. Its
     /// entry still takes a `this` slot ([`SymbolTable::has_this_param`]), as
     /// every member's does; this is what tells a static member's unused one
@@ -284,7 +299,10 @@ pub struct Function {
     pub tu: Option<crate::FileId>,
 }
 
-fn specialization_arguments_agree(a: &[Option<String>], b: &[Option<String>]) -> bool {
+fn specialization_arguments_agree(
+    a: &[Option<AllocatorTemplateArgument>],
+    b: &[Option<AllocatorTemplateArgument>],
+) -> bool {
     a.iter()
         .zip(b)
         .all(|(a, b)| a.as_ref().zip(b.as_ref()).is_none_or(|(a, b)| a == b))
@@ -297,20 +315,44 @@ impl Function {
 
     /// Whether a written template-id can denote this declaration.
     pub fn can_bind_template_id(&self) -> bool {
-        self.is_function_template() || self.allocator_specialization_args.is_some()
+        self.is_function_template() || self.allocator_specialization_args().is_some()
     }
 
-    /// A call can supply a prefix of a specialization's deduced/defaulted args.
-    pub fn specialization_accepts_template_args(&self, written: &[Option<String>]) -> bool {
-        self.allocator_specialization_args
-            .as_deref()
-            .is_none_or(|args| specialization_arguments_agree(args, written))
+    pub fn allocator_specialization_args(&self) -> Option<&[Option<AllocatorTemplateArgument>]> {
+        match self.allocator_template.as_deref()? {
+            AllocatorTemplate::Specialization(args) => Some(args),
+            AllocatorTemplate::SinglePack { .. } => None,
+        }
+    }
+
+    /// Reject mismatched arguments and a prefix longer than the complete
+    /// list when the selected primary's pack layout determines its size.
+    pub fn specialization_accepts_template_args(
+        &self,
+        written: &[Option<AllocatorTemplateArgument>],
+        primary: Option<&Self>,
+    ) -> bool {
+        self.allocator_specialization_args().is_none_or(|args| {
+            let limit = primary.and_then(|primary| {
+                let AllocatorTemplate::SinglePack {
+                    fixed_template_parameters,
+                } = primary.allocator_template.as_deref()?
+                else {
+                    return None;
+                };
+                let elements = self.explicit_arity?.checked_sub(primary.explicit_arity?)?;
+                let limit = fixed_template_parameters.checked_add(elements)? as usize;
+                (limit >= args.len()).then_some(limit)
+            });
+            limit.is_none_or(|limit| written.len() <= limit)
+                && specialization_arguments_agree(args, written)
+        })
     }
 
     fn same_allocator_specialization(&self, other: &Self) -> bool {
         match (
-            &self.allocator_specialization_args,
-            &other.allocator_specialization_args,
+            self.allocator_specialization_args(),
+            other.allocator_specialization_args(),
         ) {
             (Some(a), Some(b)) => specialization_arguments_agree(a, b),
             (None, None) => true,
@@ -794,20 +836,25 @@ fn absorb_redeclaration(
     }
     existing.is_member_template |= func.is_member_template;
     existing.is_free_function_template |= func.is_free_function_template;
-    if let Some(new) = &func.allocator_specialization_args {
-        match &mut existing.allocator_specialization_args {
-            Some(known) => {
-                let mut combined = known.to_vec();
-                combined.resize(combined.len().max(new.len()), None);
-                for (known, new) in combined.iter_mut().zip(new.iter()) {
-                    if known.is_none() {
-                        known.clone_from(new);
-                    }
+    match (
+        existing.allocator_template.as_deref_mut(),
+        func.allocator_template.as_deref(),
+    ) {
+        (
+            Some(AllocatorTemplate::Specialization(known)),
+            Some(AllocatorTemplate::Specialization(new)),
+        ) => {
+            let mut combined = known.to_vec();
+            combined.resize(combined.len().max(new.len()), None);
+            for (known, new) in combined.iter_mut().zip(new.iter()) {
+                if known.is_none() {
+                    known.clone_from(new);
                 }
-                *known = combined.into_boxed_slice();
             }
-            None => existing.allocator_specialization_args = Some(new.clone()),
+            *known = combined.into_boxed_slice();
         }
+        (None, Some(new)) => existing.allocator_template = Some(Box::new(new.clone())),
+        _ => {}
     }
     existing.default_args = existing.default_args.max(func.default_args);
     existing.is_virtual |= func.is_virtual;
@@ -5118,7 +5165,7 @@ mod tests {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
-            allocator_specialization_args: None,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,

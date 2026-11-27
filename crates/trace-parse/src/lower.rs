@@ -2735,7 +2735,7 @@ fn finalize_extern_callees(program: &mut Program) {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
-            allocator_specialization_args: None,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -2864,7 +2864,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             is_deleted: false,
             declared_in_class: false,
             is_free_function_template: false,
-            allocator_specialization_args: None,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -8160,7 +8160,7 @@ fn register_member_prototype(
             is_deleted: false,
             declared_in_class: true,
             is_free_function_template: false,
-            allocator_specialization_args: None,
+            allocator_template: None,
             is_member_template: is_member_function_template(source, node),
             is_const_member: function_is_const_qualified(source, node),
             ref_qualifier: function_ref_qualifier(source, node),
@@ -8465,6 +8465,11 @@ fn lower_function_signature(
         params.push(add_this_param(program, cls, provisional_id, span));
     }
     let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
+    let non_deduced_pack =
+        eff_class.is_none() && free_function_pack_is_non_deduced(ctx, source, node, decl, &shape);
+    let allocator_template = (eff_class.is_none() && is_allocator_name(&name))
+        .then(|| allocator_template_metadata(program, ctx, source, node, decl, non_deduced_pack))
+        .flatten();
     // Only a member meets an in-class prototype, the one kind of declaration
     // that records an unresolved parameter as unknown.
     let param_type_ids = if ctx.is_cpp && eff_class.is_some() {
@@ -8524,8 +8529,7 @@ fn lower_function_signature(
                     as u32,
             ),
             default_args: shape.defaults,
-            non_deduced_pack: eff_class.is_none()
-                && free_function_pack_is_non_deduced(ctx, source, node, decl, &shape),
+            non_deduced_pack,
             reference_params: shape.references,
             parameter_references: shape.reference_forms,
             owner_unresolved,
@@ -8548,9 +8552,7 @@ fn lower_function_signature(
                 .any(|c| c.cached_kind() == "delete_method_clause"),
             declared_in_class: ctx.class_ctx.is_some(),
             is_free_function_template,
-            allocator_specialization_args: (eff_class.is_none() && is_allocator_name(&name))
-                .then(|| allocator_specialization_arguments(program, ctx, source, node, decl))
-                .flatten(),
+            allocator_template,
             is_member_template: ctx.is_cpp
                 && eff_class.is_some()
                 && is_member_function_template(source, node),
@@ -16470,12 +16472,6 @@ fn lower_function_decl(
     }
     let raw_name = allocator_specialization_name(raw_name, object_declaration(decl));
     let name = ctx.qualify_decl(&raw_name);
-    let allocator_specialization_args = if is_allocator_name(&name) {
-        object_declaration(decl)
-            .and_then(|node| allocator_specialization_arguments(program, ctx, source, node, decl))
-    } else {
-        None
-    };
     let ret_type = if return_is_dependent(ctx, source, decl) {
         program.types.unknown()
     } else {
@@ -16489,6 +16485,14 @@ fn lower_function_decl(
     );
     let mut params = Vec::new();
     let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
+    let declaration = object_declaration(decl);
+    let non_deduced_pack = declaration
+        .is_some_and(|node| free_function_pack_is_non_deduced(ctx, source, node, decl, &shape));
+    let allocator_template = declaration
+        .filter(|_| is_allocator_name(&name))
+        .and_then(|node| {
+            allocator_template_metadata(program, ctx, source, node, decl, non_deduced_pack)
+        });
     let local_defaults = ctx.current_fn.is_some().then(|| {
         program
             .default_arguments
@@ -16520,9 +16524,7 @@ fn lower_function_decl(
         param_type_ids: Vec::new(),
         explicit_arity,
         default_args: shape.defaults,
-        non_deduced_pack: object_declaration(decl).is_some_and(|declaration| {
-            free_function_pack_is_non_deduced(ctx, source, declaration, decl, &shape)
-        }),
+        non_deduced_pack,
         reference_params: shape.references,
         parameter_references: shape.reference_forms,
         owner_unresolved: false,
@@ -16534,7 +16536,7 @@ fn lower_function_decl(
         declared_in_class: false,
         is_free_function_template: ctx.is_cpp
             && object_declaration(decl).is_some_and(has_function_template_parameters),
-        allocator_specialization_args,
+        allocator_template,
         is_member_template: false,
         is_const_member: ctx.is_cpp && function_is_const_qualified(source, decl),
         ref_qualifier: ctx
@@ -23112,7 +23114,7 @@ fn lower_lambda_expression(
         is_deleted: false,
         declared_in_class: false,
         is_free_function_template: false,
-        allocator_specialization_args: None,
+        allocator_template: None,
         is_member_template: false,
         is_const_member: false,
         ref_qualifier: None,
@@ -26816,37 +26818,87 @@ fn emit_call_return(
     ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
 }
 
-fn allocator_specialization_arguments(
+fn allocator_template_metadata(
     program: &Program,
     ctx: &LowerContext,
     source: &str,
     node: Node,
     decl: Node,
-) -> Option<Box<[Option<String>]>> {
-    if !ctx.is_cpp || !is_explicit_function_specialization(node) {
+    non_deduced_pack: bool,
+) -> Option<Box<trace_ir::AllocatorTemplate>> {
+    if !ctx.is_cpp {
         return None;
     }
-    let arguments = find_function_declarator(decl)
-        .and_then(|function| function.cached_field("declarator"))
-        .and_then(initializer_callee_template_leaf)
-        .and_then(callee_template_argument_list);
-    Some(allocator_template_argument_types(program, ctx, source, arguments).into_boxed_slice())
+    if is_explicit_function_specialization(node) {
+        let arguments = find_function_declarator(decl)
+            .and_then(|function| function.cached_field("declarator"))
+            .and_then(initializer_callee_template_leaf)
+            .and_then(callee_template_argument_list);
+        let args = allocator_template_arguments(program, ctx, source, arguments);
+        return Some(Box::new(trace_ir::AllocatorTemplate::Specialization(
+            args.into_boxed_slice(),
+        )));
+    }
+    if !non_deduced_pack {
+        return None;
+    }
+    // Abbreviated function parameters can introduce implicit template
+    // parameters that are absent from the written list.
+    let params = find_params(decl)?;
+    if params.named_children(&mut params.walk()).any(|param| {
+        node_text(source, &param)
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .any(|word| word == "auto")
+    }) {
+        return None;
+    }
+    let template = function_template_parameters(node)?;
+    let mut fixed_template_parameters = 0;
+    let mut pack = false;
+    for param in template.named_children(&mut template.walk()) {
+        match param.cached_kind() {
+            "comment" => continue,
+            _ if pack => return None,
+            "variadic_type_parameter_declaration" | "variadic_parameter_declaration" => pack = true,
+            "type_parameter_declaration"
+            | "optional_type_parameter_declaration"
+            | "parameter_declaration"
+            | "optional_parameter_declaration" => {
+                fixed_template_parameters += 1;
+            }
+            _ => return None,
+        }
+    }
+    pack.then(|| {
+        Box::new(trace_ir::AllocatorTemplate::SinglePack {
+            fixed_template_parameters,
+        })
+    })
 }
 
-fn allocator_template_argument_types(
+fn allocator_template_arguments(
     program: &Program,
     ctx: &LowerContext,
     source: &str,
     arguments: Option<Node>,
-) -> Vec<Option<String>> {
+) -> Vec<Option<trace_ir::AllocatorTemplateArgument>> {
     let Some(list) = arguments else {
         return Vec::new();
     };
     list.named_children(&mut list.walk())
         .filter(|arg| arg.cached_kind() != "comment")
+        .take_while(|arg| !node_text(source, arg).trim_end().ends_with("..."))
         .map(|arg| {
             if spelling_is_dependent(ctx, source, arg, node_text(source, &arg), Spelling::Source) {
                 return None;
+            }
+            // Literal folding preserves the value across radix and suffix
+            // spellings. Leave expressions with type-dependent arithmetic
+            // to ordinary conservative matching.
+            let value = peel_expression(arg);
+            if value.cached_kind() == "number_literal" {
+                return integer_constant_expression(program, ctx, source, value, 0)
+                    .map(trace_ir::AllocatorTemplateArgument::Integer);
             }
             // Use the alias-aware type spelling for concrete types.
             // The coarse flow type cannot distinguish unsigned, cv,
@@ -26858,7 +26910,7 @@ fn allocator_template_argument_types(
                 && !matches!(base, "auto" | "nullptr_t")
                 && !trace_ir::is_standard_integer_type_name(base)
                 || program.types.declares_class(base) && !base.contains('<');
-            concrete.then_some(spelling)
+            concrete.then_some(trace_ir::AllocatorTemplateArgument::Type(spelling))
         })
         .collect()
 }
@@ -26873,21 +26925,24 @@ fn allocator_template_candidates(
     if let Some(leaf) =
         initializer_callee_template_leaf(func).filter(|&leaf| is_callee_template_id(leaf))
     {
-        let written = allocator_template_argument_types(
-            program,
-            ctx,
-            source,
-            callee_template_argument_list(leaf),
-        );
+        let written =
+            allocator_template_arguments(program, ctx, source, callee_template_argument_list(leaf));
+        // A sole primary supplies the pack layout for its specializations.
+        // Different primaries can have different template parameter lists.
+        let mut primaries = candidates
+            .iter()
+            .map(|&id| program.symbols.function(id))
+            .filter(|f| f.is_function_template());
+        let primary = primaries.next().filter(|_| primaries.next().is_none());
         candidates.retain(|&id| {
             let f = program.symbols.function(id);
-            f.can_bind_template_id() && f.specialization_accepts_template_args(&written)
+            f.can_bind_template_id() && f.specialization_accepts_template_args(&written, primary)
         });
     } else if candidates.iter().any(|&id| {
         program
             .symbols
             .function(id)
-            .allocator_specialization_args
+            .allocator_specialization_args()
             .is_some()
     }) {
         let ordinary: Vec<_> = candidates
@@ -26899,7 +26954,7 @@ fn allocator_template_candidates(
             program
                 .symbols
                 .function(id)
-                .allocator_specialization_args
+                .allocator_specialization_args()
                 .is_none()
                 || !ordinary
                     .iter()
