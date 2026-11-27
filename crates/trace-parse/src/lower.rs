@@ -8451,13 +8451,6 @@ fn lower_function_signature(
     } else {
         eff_class.clone()
     };
-    let is_free_function_template = ctx.is_cpp
-        && eff_class.is_none()
-        && has_function_template_parameters(node)
-        && (!owner_unresolved
-            || lookup_scope
-                .as_ref()
-                .is_some_and(|scope| program.namespaces.contains(scope)));
     let scoped = enter_lookup_scope(ctx, lookup_scope.as_ref());
     // Implicit `this` for member functions, ctors and dtors.
     if let Some(cls) = &eff_class {
@@ -8465,13 +8458,20 @@ fn lower_function_signature(
         params.push(add_this_param(program, cls, provisional_id, span));
     }
     let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
+    let is_free_function_template = ctx.is_cpp
+        && eff_class.is_none()
+        && (shape.has_placeholder_parameter || has_function_template_parameters(node))
+        && (!owner_unresolved
+            || lookup_scope
+                .as_ref()
+                .is_some_and(|scope| program.namespaces.contains(scope)));
     let non_deduced_pack =
         eff_class.is_none() && free_function_pack_is_non_deduced(ctx, source, node, decl, &shape);
-    let allocator_template = (eff_class.is_none() && is_allocator_name(&name))
-        .then(|| {
-            allocator_template_metadata(program, ctx, source, node, decl, &name, non_deduced_pack)
-        })
-        .flatten();
+    let allocator_template = (eff_class.is_none()
+        && !shape.has_placeholder_parameter
+        && is_allocator_name(&name))
+    .then(|| allocator_template_metadata(program, ctx, source, node, decl, &name, non_deduced_pack))
+    .flatten();
     // Only a member meets an in-class prototype, the one kind of declaration
     // that records an unresolved parameter as unknown.
     let param_type_ids = if ctx.is_cpp && eff_class.is_some() {
@@ -8860,6 +8860,8 @@ struct ParamListShape {
     reference_forms: Vec<Option<trace_ir::ReferenceParameter>>,
     defaults: u32,
     variadic: bool,
+    /// A placeholder parameter introduces an implicit C++ template parameter.
+    has_placeholder_parameter: bool,
     /// Number of parameter packs lowered as formals: `explicit_arity`
     /// does not count them ([`trace_ir::Function::pack_positions`]).
     packs: usize,
@@ -8890,6 +8892,9 @@ impl ParamListShape {
             }
         };
         if declares {
+            self.has_placeholder_parameter |= param
+                .cached_field("type")
+                .is_some_and(|ty| is_placeholder_type(ctx, ty));
             let reference = declaration_reference_kind(program, ctx, source, param);
             self.references.push(
                 reference.is_some() && !parameter_keeps_pointer_value(program, ctx, source, param),
@@ -16491,7 +16496,7 @@ fn lower_function_decl(
     let non_deduced_pack = declaration
         .is_some_and(|node| free_function_pack_is_non_deduced(ctx, source, node, decl, &shape));
     let allocator_template = declaration
-        .filter(|_| is_allocator_name(&name))
+        .filter(|_| !shape.has_placeholder_parameter && is_allocator_name(&name))
         .and_then(|node| {
             allocator_template_metadata(program, ctx, source, node, decl, &name, non_deduced_pack)
         });
@@ -16537,7 +16542,8 @@ fn lower_function_decl(
         is_deleted: false,
         declared_in_class: false,
         is_free_function_template: ctx.is_cpp
-            && object_declaration(decl).is_some_and(has_function_template_parameters),
+            && (shape.has_placeholder_parameter
+                || declaration.is_some_and(has_function_template_parameters)),
         allocator_template,
         is_member_template: false,
         is_const_member: ctx.is_cpp && function_is_const_qualified(source, decl),
@@ -26851,6 +26857,8 @@ fn emit_call_return(
     ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
 }
 
+/// Abbreviated templates are handled by the template flag alone, since the
+/// written parameter list omits their implicit template parameters.
 fn allocator_template_metadata(
     program: &Program,
     ctx: &LowerContext,
@@ -26876,16 +26884,6 @@ fn allocator_template_metadata(
         return Some(Box::new(trace_ir::AllocatorTemplate::Specialization(
             args.into_boxed_slice(),
         )));
-    }
-    // Abbreviated function parameters can introduce implicit template
-    // parameters that are absent from the written list.
-    let params = find_params(decl)?;
-    if params.named_children(&mut params.walk()).any(|param| {
-        node_text(source, &param)
-            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-            .any(|word| word == "auto")
-    }) {
-        return None;
     }
     let template = function_template_parameters(node)?;
     let mut deduced_types = Vec::new();

@@ -1886,6 +1886,30 @@ auto* local() {
     );
 }
 
+#[test]
+fn allocator_template_ids_accept_abbreviated_templates() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag expected, ordinary;
+Tag* malloc(int) { return &ordinary; }
+Tag* malloc(auto value);
+}
+auto* global = app::malloc<int>(7);
+auto* local() {
+    auto* p = app::malloc<int>(7);
+    return p;
+}
+namespace app {
+Tag* malloc(auto value) { return &expected; }
+}
+"#,
+    )]);
+    assert_allocator_return_candidates(dir.path(), &["expected"]);
+}
+
 fn assert_allocator_return_candidates(root: &std::path::Path, tags: &[&str]) {
     let program = build_program(root, &default_opts(root)).unwrap();
     let (pag, result) = analyze_with_options(
