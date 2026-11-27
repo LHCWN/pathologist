@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use common::{default_opts, fixture, fn_name, has_any_edge, has_edge, must_not_have_edge};
 use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
-use trace_ir::{FnId, Linkage, Program};
+use trace_ir::{FnId, Linkage, Program, TypeDesc};
 use trace_parse::build_program;
 
 fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
@@ -760,6 +760,597 @@ fn container_lookup_preserves_ownership_and_callable_values() {
             .collect::<Vec<_>>(),
         ["beta", "from_capture"]
     );
+}
+
+#[test]
+fn nested_container_elements_flow_through_subscripts_and_ranges() {
+    let root = fixture("cpp_nested_containers");
+    let program = &build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(program);
+    for (caller, expected) in [
+        ("vector_direct", &["alpha"][..]),
+        ("vector_braced_insertion", &["alpha"][..]),
+        ("vector_emplace", &["alpha"][..]),
+        ("vector_braced_multi_emplace", &["alpha", "beta"][..]),
+        ("vector_braced_multi_push", &["alpha", "beta"][..]),
+        ("vector_map_push_braced", &["alpha"][..]),
+        ("vector_map_push_multi", &["alpha", "beta"][..]),
+        ("vector_braced_range", &["alpha", "beta"][..]),
+        ("vector_named_range", &["alpha"][..]),
+        ("vector_field_range", &["alpha"][..]),
+        ("vector_isolation", &["alpha"][..]),
+        ("map_map_subscript", &["alpha", "beta"][..]),
+        ("map_vector_subscript", &["alpha", "beta"][..]),
+        ("map_insert_single_pair", &["alpha", "beta"][..]),
+        ("vector_map_range", &["alpha", "beta"][..]),
+        ("vector_insert_ambiguous", &["alpha", "beta"][..]),
+        ("vector_descendant_copy", &["alpha"][..]),
+        ("alias_descendant_copy", &["alpha"][..]),
+        ("vector_typed_brace_copy", &["alpha"][..]),
+        ("vector_nested_allocator", &["alpha", "beta"][..]),
+        ("vector_nested_allocator_mixed", &["alpha", "beta"][..]),
+        ("vector_nested_ordinary_constructor", &["alpha"][..]),
+        ("vector_explicit_inner_allocator", &["alpha"][..]),
+        ("vector_braced_copy_allocator", &["alpha"][..]),
+        ("vector_mixed_allocator_copy", &["alpha"][..]),
+        ("vector_one_element_list", &["alpha"][..]),
+        ("vector_triple_braced", &["alpha"][..]),
+        ("vector_named_inner_braced_copy", &["alpha"][..]),
+        ("map_named_pair_insert", &["alpha"][..]),
+        ("map_at_chain", &["alpha", "beta"][..]),
+        ("vector_double_braced_push", &["alpha"][..]),
+        ("vector_braced_named_copy", &["alpha"][..]),
+        ("map_braced_named_insert", &["alpha"][..]),
+        ("map_initializer_named", &["alpha"][..]),
+        ("map_typed_pair_compound_insert", &["alpha", "beta"][..]),
+        ("map_pair_compound_entry_list_insert", &["alpha"][..]),
+        ("map_callback_alias_key_multi_insert", &["beta"][..]),
+        ("map_const_key_insert", &["alpha"][..]),
+        ("map_allocator_entry_list", &["alpha", "beta"][..]),
+        ("map_aggregate_key_multi_insert", &["alpha", "beta"][..]),
+        ("map_typed_pair_initializer", &["alpha"][..]),
+        ("vector_map_typed_pair_initializer", &["alpha"][..]),
+        ("map_allocator_aggregate_key", &["alpha", "beta"][..]),
+        ("map_mixed_pair_insert", &["alpha", "beta"][..]),
+        ("map_three_entry_named_insert", &["alpha", "beta"][..]),
+        ("map_insert_inner_allocator_one", &["alpha"][..]),
+        ("map_insert_triple_single", &["alpha", "beta"][..]),
+        ("map_pair_key_map_single", &["alpha", "beta"][..]),
+        ("vector_position_named_inner", &["alpha", "beta"][..]),
+        ("vector_position_inner_lists", &["alpha", "beta"][..]),
+        ("vector_const_alias_typed_inner", &["alpha"][..]),
+        ("map_const_pair_alias_insert", &["alpha"][..]),
+        ("map_initializer_mixed_named", &["alpha", "beta"][..]),
+        ("map_initializer_mixed_make_pair", &["alpha", "beta"][..]),
+        ("map_insert_named_first", &["alpha", "beta"][..]),
+        ("map_insert_make_pair_first", &["alpha", "beta"][..]),
+        ("map_aggregate_key_single_pair", &["beta"][..]),
+        ("map_const_callback_alias_key", &["beta"][..]),
+        ("map_pair_empty_key_insert", &["alpha"][..]),
+        ("map_pair_empty_key_initializer", &["alpha", "beta"][..]),
+        ("map_direct_typed_pair_non_nested", &["alpha"][..]),
+        ("map_pair_key_callback_non_nested", &["alpha"][..]),
+        ("map_pair_callback_key_non_nested", &["alpha"][..]),
+        ("map_named_pair_key_non_nested", &["alpha"][..]),
+        ("map_make_pair_key_non_nested", &["alpha"][..]),
+        ("map_braced_mapped_non_nested", &["alpha"][..]),
+        ("map_pair_key_as_entry_non_nested", &[][..]),
+        ("map_make_pair_key_as_entry_non_nested", &[][..]),
+        ("map_insert_widening_keys", &["alpha", "beta"][..]),
+        ("map_insert_converting_class_keys", &["alpha", "beta"][..]),
+        ("map_insert_qualified_callback_keys", &["alpha", "beta"][..]),
+        ("map_insert_qualified_pointer_keys", &["alpha", "beta"][..]),
+        ("map_numeric_key_initializer", &["alpha"][..]),
+        ("map_numeric_key_insert", &["alpha"][..]),
+        ("empty_brace_with_nondefault_key", &[][..]),
+        ("inner_container_conversions", &["alpha"][..]),
+        ("explicit_subscript_macro", &["alpha"][..]),
+        ("move_inner_callbacks", &["alpha", "beta"][..]),
+        ("copy_list_with_allocator", &["alpha"][..]),
+        ("copy_map_with_allocator", &["alpha"][..]),
+        ("map_pair_struct_key", &[][..]),
+        ("map_make_pair_enum_key", &[][..]),
+        ("map_nested_pair_key", &[][..]),
+        ("map_pair_container_key", &[][..]),
+        ("map_pair_key_entries", &["alpha", "beta"][..]),
+        ("map_aggregate_key_allocator_copy", &["alpha"][..]),
+        ("map_class_key_from_callback", &["alpha"][..]),
+        ("map_insert_braced_then_unmodeled", &["alpha"][..]),
+        ("map_insert_unmodeled_then_braced", &["alpha"][..]),
+        ("pair_container_field_copy", &["alpha"][..]),
+        ("pair_container_field_assignment", &["alpha"][..]),
+        ("map_empty_inner_brace_without_initializer", &["alpha"][..]),
+        ("map_initializer_default_entry", &["alpha", "beta"][..]),
+        ("map_initializer_unmodeled_pair", &["alpha"][..]),
+        ("map_copy_list_pair_key", &["alpha"][..]),
+        ("vector_allocator_extended_copy", &["alpha"][..]),
+        ("vector_empty_map_without_initializer", &["alpha"][..]),
+        ("map_entry_conversion", &["alpha"][..]),
+        ("vector_returned_inner", &["beta"][..]),
+        ("map_insert_braced_then_pair_return", &["alpha"][..]),
+        ("vector_initializer_allocator_copy", &["alpha", "beta"][..]),
+        ("vector_parenthesized_typed_inner", &["alpha", "beta"][..]),
+        ("map_converting_pair_key", &["alpha"][..]),
+        ("map_convertible_mapped_value", &["alpha"][..]),
+        ("map_single_pair_empty_mapped", &[][..]),
+        ("map_initializer_trailing_empty", &["alpha"][..]),
+        ("map_initializer_trailing_empty_nested", &["alpha"][..]),
+        ("vector_braced_typed_temporary_copy", &["alpha"][..]),
+        ("map_insert_empty_then_make_pair", &["alpha"][..]),
+        ("vector_callback_param_spelling", &["alpha"][..]),
+        ("map_initializer_aggregate_trailing_empty", &["alpha"][..]),
+        (
+            "map_initializer_aggregate_trailing_empty_nested",
+            &["alpha"][..],
+        ),
+        ("map_insert_inner_call_aggregate_key", &["alpha"][..]),
+        ("vector_braced_typed_named_copy", &["alpha"][..]),
+        ("vector_braced_typed_allocator_copy", &["alpha"][..]),
+        ("vector_braced_typed_temporary_initializer", &["alpha"][..]),
+        ("map_pair_compound_key", &["alpha"][..]),
+        ("map_three_level_single_pair", &["alpha"][..]),
+        ("map_insert_aggregate_key_empty_mapped", &[][..]),
+        ("map_insert_pair_key_integer_variable", &[][..]),
+        ("map_parenthesized_pair_compound", &["alpha"][..]),
+        ("map_insert_parenthesized_pair_compound", &["alpha"][..]),
+        ("vector_initializer_list_temporary", &["alpha", "beta"][..]),
+        ("map_initializer_list_temporary", &["alpha", "beta"][..]),
+        (
+            "map_insert_initializer_list_temporary",
+            &["alpha", "beta"][..],
+        ),
+        ("map_single_unmodeled_mapped", &[][..]),
+        ("reference_alias_range", &["alpha"][..]),
+        ("ignored_nested_accessor_macro", &["alpha"][..]),
+        ("ignored_accessor_assignment", &["alpha"][..]),
+        ("ignored_accessor_macro", &["alpha"][..]),
+        ("ignored_accessor_range", &["alpha"][..]),
+        ("ignored_range_bracket", &["alpha"][..]),
+        ("map_pair_key_insert", &["alpha", "beta"][..]),
+        ("map_pair_key_entry", &["alpha", "beta"][..]),
+        ("map_callback_pair_key_entry", &["alpha", "beta"][..]),
+        ("map_vector_pair_key_entry", &["alpha", "beta"][..]),
+        ("map_class_key_insert", &["alpha", "beta"][..]),
+        ("map_pair_braced_insert", &["alpha", "beta"][..]),
+        ("map_pair_named_insert", &["alpha"][..]),
+        ("vector_allocator_braced_push", &["alpha", "beta"][..]),
+        ("vector_typed_inner_brace", &["alpha", "beta"][..]),
+        ("vector_at_chain", &["alpha", "beta"][..]),
+        ("map_insert_allocator", &["alpha", "beta"][..]),
+        ("map_typed_mapped_entry", &["alpha", "beta"][..]),
+        ("map_callback_key_insert", &["beta"][..]),
+        ("map_pair_braced_copy", &["alpha"][..]),
+        ("map_pair_typed_brace", &["alpha", "beta"][..]),
+        ("ignored_typed_insert", &["alpha"][..]),
+        ("ignored_named_payload", &["alpha"][..]),
+        ("map_without_subscript_model", &["alpha"][..]),
+        ("map_inner_without_initializer", &["alpha"][..]),
+        ("typed_reference_range", &["alpha"][..]),
+        ("by_value_range_isolation", &["alpha"][..]),
+        ("nested_ignored_bracket", &["alpha"][..]),
+        ("ignored_range_field_subscript", &["alpha"][..]),
+        ("ignored_nested_field_bracket", &["alpha"][..]),
+        ("ignored_method_macro", &["alpha"][..]),
+        ("use_shared_slots_store", &["alpha"][..]),
+        ("use_shared_slots_read", &["alpha"][..]),
+        ("read_slots", &["alpha"][..]),
+        ("unevaluated_nested", &[][..]),
+    ] {
+        let mut targets: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(program, edge.caller) == caller)
+            .map(|edge| fn_name(program, edge.callee))
+            .filter(|name| matches!(name.as_str(), "alpha" | "beta" | "unrelated"))
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        assert_eq!(targets, expected, "{caller}");
+    }
+    assert!(has_any_edge(
+        program,
+        &analysis,
+        "pointer_range",
+        "Handler::run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "pointer_range",
+        "OtherHandler::run"
+    ));
+    assert!(has_any_edge(
+        program,
+        &analysis,
+        "copy_callback_parameter_cv",
+        "int_callback"
+    ));
+    assert!(has_any_edge(
+        program,
+        &analysis,
+        "copy_callback_pointer_parameter_cv",
+        "pointer_callback"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "copy_callback_pointer_parameter_cv",
+        "const_pointer_callback"
+    ));
+}
+
+#[test]
+fn pair_shaped_map_keys_do_not_contribute_mapped_callbacks() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        fixture("cpp_nested_containers").join("nested_containers.h"),
+        dir.path().join("nested_containers.h"),
+    )
+    .unwrap();
+    // Exercise lowering of incomplete or ill-typed code, as during edits.
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+#include "nested_containers.h"
+void alpha() {}
+void unrelated() {}
+
+void nested_initializer() {
+    std::pair<int, Callback> key{1, unrelated};
+    std::vector<std::map<std::pair<int, Callback>, Callback>> outer = {{key, {}}};
+    outer[0][key]();
+}
+
+void mixed_initializer() {
+    std::pair<int, Callback> key{1, unrelated};
+    std::map<std::pair<int, Callback>, Callback> callbacks = {{{1, unrelated}, alpha}, key};
+    callbacks[key]();
+}
+
+void insert_with_invalid_mapped_brace() {
+    std::pair<int, Callback> key{1, unrelated};
+    std::map<std::pair<int, Callback>, Callback> callbacks;
+    callbacks[key] = alpha;
+    callbacks.insert({key, {1, 2}});
+    callbacks.insert({std::make_pair(2, unrelated), {1, 2}});
+    callbacks[key]();
+}
+"#,
+    )
+    .unwrap();
+
+    let program = &build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_, analysis) = analyze(program);
+    for caller in [
+        "nested_initializer",
+        "mixed_initializer",
+        "insert_with_invalid_mapped_brace",
+    ] {
+        assert!(
+            must_not_have_edge(program, &analysis, caller, "unrelated"),
+            "{caller}"
+        );
+    }
+    assert!(has_any_edge(
+        program,
+        &analysis,
+        "insert_with_invalid_mapped_brace",
+        "alpha"
+    ));
+}
+
+#[test]
+fn nested_subscript_macro_is_ignored_at_each_bracket() {
+    let root = fixture("cpp_nested_containers");
+    let opts = default_opts(&root).with_ignored_macros(["OUTER_INDEX".to_owned()]);
+    let program = &build_program(&root, &opts).expect("build");
+    let (_, analysis) = analyze(program);
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "nested_ignored_bracket",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_range_bracket",
+        "alpha"
+    ));
+}
+
+#[test]
+fn nested_range_field_macros_and_unevaluated_sites_are_preserved() {
+    let root = fixture("cpp_nested_containers");
+    let opts = default_opts(&root).with_ignored_macros([
+        "SLOT".to_owned(),
+        "METHOD".to_owned(),
+        "INNER".to_owned(),
+        "PAYLOAD".to_owned(),
+        "AT_METHOD".to_owned(),
+        "IDX".to_owned(),
+        "EXPLICIT_SLOT".to_owned(),
+    ]);
+    let program = &build_program(&root, &opts).expect("build");
+    let (_, analysis) = analyze(program);
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "explicit_subscript_macro",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_range_field_subscript",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_nested_field_bracket",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_method_macro",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_typed_insert",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_named_payload",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_accessor_macro",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_accessor_range",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_nested_accessor_macro",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_accessor_assignment",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_receiver_chain_macro",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_accessor_receiver_chain_macro",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_parenthesized_receiver_chain_macro",
+        "alpha"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        &analysis,
+        "ignored_range_pointer_macro",
+        "alpha"
+    ));
+
+    let program = &build_program(&root, &default_opts(&root)).expect("build");
+    for (name, expected) in [
+        ("unevaluated_nested", 2),
+        ("unevaluated_at_chain", 1),
+        ("unevaluated_chained_accessor", 2),
+    ] {
+        let caller = *program
+            .symbols
+            .functions_named(name)
+            .first()
+            .expect("function");
+        let sites: Vec<_> = program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|site| site.caller == caller && site.callee_name.contains("operator[]"))
+            .collect();
+        assert_eq!(sites.len(), expected, "{name}: {sites:#?}");
+        let positions: std::collections::BTreeSet<_> = sites
+            .iter()
+            .map(|site| (site.span.line, site.span.col))
+            .collect();
+        assert_eq!(positions.len(), expected, "{name}: {sites:#?}");
+        assert!(sites.iter().all(|site| site.unevaluated), "{name}");
+    }
+}
+
+#[test]
+fn map_three_level_single_pair_reads_mapped_container_once() {
+    let root = fixture("cpp_nested_containers");
+    let program = &build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(program);
+    let count = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| {
+            fn_name(program, edge.caller) == "map_three_level_single_pair"
+                && fn_name(program, edge.callee) == "alpha"
+        })
+        .count();
+    assert_eq!(count, 1, "mapped container read more than once");
+}
+
+#[test]
+fn nested_container_models_gate_each_bracket_and_inner_initializer() {
+    let root = fixture("cpp_nested_containers");
+    let dir = tempfile::tempdir().unwrap();
+    let map_models = dir.path().join("map.toml");
+    std::fs::write(
+        &map_models,
+        r#"
+[[container]]
+name = "std::map"
+element = 1
+operations = [
+    { kind = "store", method = "insert", arity = 1, value = 0, entry = 1 },
+]
+"#,
+    )
+    .unwrap();
+    let map_access_models = dir.path().join("map_access.toml");
+    std::fs::write(
+        &map_access_models,
+        r#"
+[[container]]
+name = "std::map"
+element = 1
+operations = [
+    { kind = "store", method = "insert", arity = 1, value = 0, entry = 1 },
+    { kind = "access", method = "operator[]", arity = 1 },
+]
+"#,
+    )
+    .unwrap();
+    let vector_models = dir.path().join("vector.toml");
+    std::fs::write(
+        &vector_models,
+        r#"
+[[container]]
+name = "std::vector"
+element = 0
+operations = [
+    { kind = "store", method = "push_back", arity = 1, value = 0 },
+    { kind = "access", method = "operator[]", arity = 1 },
+]
+"#,
+    )
+    .unwrap();
+    let custom_models = dir.path().join("custom.toml");
+    std::fs::write(
+        &custom_models,
+        r#"
+[[container]]
+name = "app::Custom"
+element = 1
+operations = [
+    { kind = "store", method = "insert", arity = 1, value = 0, entry = 1 },
+    { kind = "access", method = "operator[]", arity = 1 },
+]
+"#,
+    )
+    .unwrap();
+    let reaches_alpha = |models: &std::path::Path, caller: &str| {
+        let db = common::cli_analyze(&root, &["--models", models.to_str().unwrap()]);
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM raw_call_edges AS edge \
+             JOIN raw_functions AS caller ON caller.id = edge.caller_fn_id \
+             JOIN raw_functions AS callee ON callee.id = edge.callee_fn_id \
+             WHERE caller.name = ?1 AND callee.name = 'alpha'",
+            [caller],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    };
+    assert!(!reaches_alpha(&map_models, "map_without_subscript_model"));
+    assert!(!reaches_alpha(
+        &vector_models,
+        "map_inner_without_initializer"
+    ));
+    // `{}` value-initializes an inner container even when its model does not
+    // provide an initializer-list constructor, so the rest of the outer list
+    // must still be modeled.
+    assert!(reaches_alpha(
+        &vector_models,
+        "map_empty_inner_brace_without_initializer"
+    ));
+    // `{}` default-constructs an associative inner container too, even when
+    // the map model does not opt into `initializer_list`.
+    assert!(reaches_alpha(
+        &map_access_models,
+        "vector_empty_map_without_initializer"
+    ));
+    assert!(reaches_alpha(&custom_models, "custom_entry_insert"));
+}
+
+#[test]
+fn deep_specialization_alias_chains_keep_default_and_explicit_allocators_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let header =
+        std::fs::read_to_string(fixture("cpp_nested_containers").join("nested_containers.h"))
+            .unwrap();
+    std::fs::write(dir.path().join("nested_containers.h"), header).unwrap();
+    let mut main = String::from("#include \"nested_containers.h\"\nvoid alpha() {}\n");
+    const LAST_LEVEL: usize = 27;
+    let access = "[0]".repeat(LAST_LEVEL + 1);
+    for (prefix, explicit) in [("Implicit", false), ("Explicit", true)] {
+        main.push_str(&format!("using {prefix}0 = std::vector<Callback>;\n"));
+        for level in 1..=LAST_LEVEL {
+            let previous = format!("{prefix}{}", level - 1);
+            let allocator = if explicit {
+                format!(", std::allocator<{previous}>")
+            } else {
+                String::new()
+            };
+            main.push_str(&format!(
+                "using {prefix}{level} = std::vector<{previous}{allocator}>;\n"
+            ));
+        }
+        main.push_str(&format!("void use_{prefix}() {{ {prefix}{LAST_LEVEL} value; value{access} = alpha; value{access}(); }}\n"));
+    }
+    main.push_str(&format!("void copy_across_spellings() {{ Implicit{LAST_LEVEL} inner; inner{access} = alpha; std::vector<Explicit{LAST_LEVEL}> outer; outer.push_back(inner); outer[0]{access}(); }}\n"));
+    std::fs::write(dir.path().join("main.cpp"), main).unwrap();
+
+    let started = std::time::Instant::now();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "nested alias canonicalization took {:?}",
+        started.elapsed()
+    );
+    let longest = program
+        .types
+        .all()
+        .iter()
+        .filter_map(|info| match info.desc.as_ref() {
+            TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => Some(name.len()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest < 16_384,
+        "expanded specialization alias grew to {longest} characters"
+    );
+    let (_, analysis) = analyze(&program);
+    for caller in ["use_Implicit", "use_Explicit", "copy_across_spellings"] {
+        assert!(
+            has_any_edge(&program, &analysis, caller, "alpha"),
+            "{caller}"
+        );
+    }
 }
 
 #[test]

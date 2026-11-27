@@ -4,6 +4,13 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Track nested container elements
+
+Callback and pointer values stored in nested modeled containers now reach
+chained subscripts, modeled accessors, and nested range-for loops. Named inner
+containers copy their element summaries, and map inserts carry only the
+mapped values of compatible entries. See [Container elements](docs/CXX.md#container-elements).
+
 ### Use the derived solver budget in canonical evaluation
 
 The canonical evaluation profile pinned `TRACE_SOLVE_BUDGET_POPS=850000`,

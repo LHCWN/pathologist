@@ -1992,15 +1992,26 @@ fn remap_flow(
             element,
         } => {
             use trace_ir::ContainerOwner;
-            FlowConstraint::ContainerElement {
-                dst: rv(*dst),
-                owner: match owner {
+            fn remap_owner(
+                owner: &ContainerOwner,
+                rv: &dyn Fn(VarId) -> VarId,
+                type_map: &[TypeId],
+            ) -> ContainerOwner {
+                match owner {
                     ContainerOwner::Variable(var) => ContainerOwner::Variable(rv(*var)),
                     ContainerOwner::Field { class, name } => ContainerOwner::Field {
                         class: remap_type(*class, type_map),
                         name: name.clone(),
                     },
-                },
+                    ContainerOwner::Nested { parent, instance } => ContainerOwner::Nested {
+                        parent: Arc::new(remap_owner(parent, rv, type_map)),
+                        instance: instance.clone(),
+                    },
+                }
+            }
+            FlowConstraint::ContainerElement {
+                dst: rv(*dst),
+                owner: remap_owner(owner, &rv, type_map),
                 element: remap_type(*element, type_map),
             }
         }
