@@ -6,6 +6,8 @@ pub struct LinkedMember {
     pub site: CallSiteId,
     pub caller: FnId,
     pub callee: FnId,
+    /// Original declaration selected for this candidate's call-site variant.
+    pub selected: Option<FnId>,
 }
 
 // Keep source-specific guesses distinct from a namesake another provider
@@ -121,8 +123,13 @@ pub fn link_graph_facts_in_targets(
             owner_unresolved: false,
             variadic: f.variadic,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
+            is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: true,
+            is_free_function_template: false,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -130,6 +137,7 @@ pub fn link_graph_facts_in_targets(
             is_static_member: f.static_member,
             default_args: 0,
             reference_params: vec![],
+            parameter_references: Vec::new(),
             is_virtual: f.virtual_member,
             is_final: f.final_member,
             is_cpp: true,
@@ -343,6 +351,7 @@ pub fn link_graph_facts_in_targets(
                     site: call.source_site,
                     caller: call.caller,
                     callee: id,
+                    selected: call.callee,
                 });
             }
         }

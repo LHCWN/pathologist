@@ -776,22 +776,33 @@ fn export_flow_provenance(
             _ => None,
         })
         .collect();
-    for flow in &unique_flows {
-        if let trace_ir::FlowConstraint::CallReferenceReturnDeclared { dst, callee, args } = flow {
-            if args.is_empty() {
-                continue;
-            }
-            for definition in
-                program
-                    .symbols
-                    .initializer_declaration_candidates(*dst, *callee, &program.types)
-            {
-                return_destinations.extend(
-                    program
-                        .symbols
-                        .initializer_argument_bindings(definition, args)
-                        .filter_map(|(formal, _)| pag.var_node.get(&formal).copied()),
-                );
+    let mut initializer_wiring = FxHashMap::<_, Vec<_>>::default();
+    for &flow in &unique_flows {
+        let calls = flow
+            .initializer_calls()
+            .filter(|(_, args)| !args.is_empty());
+        let Some(dst) = (match flow {
+            trace_ir::FlowConstraint::CallReferenceReturnDeclared { dst, .. }
+            | trace_ir::FlowConstraint::CallReturn { dst, .. } => Some(*dst),
+            _ => None,
+        }) else {
+            continue;
+        };
+        for (callee, args) in program
+            .symbols
+            .initializer_call_targets(dst, calls, &program.types)
+        {
+            for (formal, actual) in program.symbols.initializer_argument_bindings(callee, args) {
+                if let (Some(&src), Some(&dst)) =
+                    (pag.var_node.get(&actual), pag.var_node.get(&formal))
+                {
+                    return_destinations.insert(dst);
+                    let wiring = initializer_wiring.entry(flow).or_default();
+                    let edge = (callee, src, dst);
+                    if !wiring.contains(&edge) {
+                        wiring.push(edge);
+                    }
+                }
             }
         }
     }
@@ -838,12 +849,11 @@ fn export_flow_provenance(
                 dst,
                 callee_name,
                 caller,
+                binding,
             } => (
                 *dst,
-                program
-                    .symbols
-                    .call_return_candidates(*caller, *dst, callee_name)
-                    .to_vec(),
+                pag.return_candidates(program, callee_name, *caller, *dst, binding.as_deref())
+                    .into_owned(),
             ),
             trace_ir::FlowConstraint::CallReferenceReturn { dst, callee_name } => (
                 *dst,
@@ -888,30 +898,25 @@ fn export_flow_provenance(
             if returned_by_callee.contains_key(&root) {
                 continue;
             }
-            if let trace_ir::FlowConstraint::CallReferenceReturnDeclared { args, .. } = flow {
-                for (formal, actual) in program.symbols.initializer_argument_bindings(root, args) {
-                    if let (Some(src), Some(dst)) =
-                        (pag.var_node.get(&actual), pag.var_node.get(&formal))
-                    {
-                        if incoming
-                            .get(dst)
-                            .into_iter()
-                            .flatten()
-                            .any(|edge| edge.src == *src && edge.kind == ConstraintKind::Copy)
-                        {
-                            for (span, expression) in sites {
-                                origins.execute(params![
-                                    src.0,
-                                    dst.0,
-                                    strings.intern("copy")?,
-                                    span.file.0,
-                                    span.line,
-                                    span.col,
-                                    strings.intern(expression.as_ref())?,
-                                    strings.intern("argument")?
-                                ])?;
-                            }
-                        }
+            for &(callee, src, dst) in initializer_wiring.get(*flow).into_iter().flatten() {
+                if callee == root
+                    && incoming
+                        .get(&dst)
+                        .into_iter()
+                        .flatten()
+                        .any(|edge| edge.src == src && edge.kind == ConstraintKind::Copy)
+                {
+                    for (span, expression) in sites {
+                        origins.execute(params![
+                            src.0,
+                            dst.0,
+                            strings.intern("copy")?,
+                            span.file.0,
+                            span.line,
+                            span.col,
+                            strings.intern(expression.as_ref())?,
+                            strings.intern("argument")?
+                        ])?;
                     }
                 }
             }
@@ -959,7 +964,15 @@ fn export_flow_provenance(
                                 returned.insert(*n);
                             }
                             pending.extend(
-                                program.symbols.return_flow_candidates(callee, callee_name),
+                                pag.return_candidates(
+                                    program,
+                                    callee_name,
+                                    Some(callee),
+                                    *result,
+                                    None,
+                                )
+                                .iter()
+                                .copied(),
                             );
                         }
                     }
@@ -1080,6 +1093,29 @@ fn function_signature(func: &trace_ir::Function, program: &Program) -> String {
     }
     if func.is_member_template {
         sig.push_str(" <template>");
+    }
+    if func.is_cpp {
+        if let Some(params) = program.symbols.explicit_params(func) {
+            let bindings = (0..params.len()).map(|index| {
+                let mut slot = index;
+                for &pack in &func.pack_positions {
+                    if slot < pack as usize {
+                        break;
+                    }
+                    slot += 1;
+                }
+                let reference = func.parameter_references.get(slot).copied().flatten();
+                let value = func.reference_params.get(slot) == Some(&false)
+                    && params
+                        .get(index)
+                        .and_then(|ty| program.types.all().get(ty.0 as usize))
+                        .is_some_and(|ty| {
+                            ty.desc.is_pointer_like() || matches!(*ty.desc, TypeDesc::Array { .. })
+                        });
+                (reference, value)
+            });
+            trace_ir::append_signature_references(&mut sig, bindings);
+        }
     }
     sig
 }
@@ -2078,8 +2114,13 @@ mod tests {
                 owner_unresolved: false,
                 variadic: false,
                 pack_positions: Vec::new(),
+                non_deduced_pack: false,
+                is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
+                is_free_function_template: false,
+                allocator_template: None,
                 is_member_template: false,
                 is_const_member: false,
                 ref_qualifier: None,
@@ -2087,6 +2128,7 @@ mod tests {
                 is_static_member: false,
                 default_args: 0,
                 reference_params: Vec::new(),
+                parameter_references: Vec::new(),
                 is_virtual: false,
                 is_final: false,
                 is_cpp: false,

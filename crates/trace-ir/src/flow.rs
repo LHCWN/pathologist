@@ -31,6 +31,23 @@ pub enum ContainerOwner {
     Field { class: TypeId, name: Arc<str> },
 }
 
+/// Overload selection retained for a direct allocation return.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallReturnBinding {
+    Occurrence(crate::CallOccurrence),
+    /// An empty list suppresses ordinary name lookup for a template-id whose
+    /// template declaration was unavailable.
+    InitializerDeclarations(Vec<InitializerCall>),
+}
+
+/// A selected file-scope declaration and the arguments lowered for it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InitializerCall {
+    pub callee: FnId,
+    /// Values keyed by explicit formal slot, including synthetic pack slots.
+    pub args: Vec<(u32, VarId)>,
+}
+
 /// Statement-level flow facts extracted during IR lowering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FlowConstraint {
@@ -69,6 +86,7 @@ pub enum FlowConstraint {
         dst: VarId,
         callee_name: String,
         caller: Option<FnId>,
+        binding: Option<Box<CallReturnBinding>>,
     },
     /// Return from an exact, already-resolved function (not name-only lookup).
     /// Used for selected free operators and after merge when a file-scope
@@ -79,7 +97,7 @@ pub enum FlowConstraint {
     CallReferenceReturn { dst: VarId, callee_name: String },
     /// Address returned by a selected free/member declaration at file scope.
     /// Match definitions by signature and destination scope after merge,
-    /// then bind the retained explicit arguments to their parameters.
+    /// then bind the retained values by explicit formal slot.
     CallReferenceReturnDeclared {
         dst: VarId,
         callee: FnId,
@@ -127,13 +145,27 @@ impl FlowConstraint {
             | FlowConstraint::StringConst { dst, .. }
             | FlowConstraint::NullPointer { dst } => (dst, None),
         };
-        let arguments = match self {
-            FlowConstraint::CallReferenceReturnDeclared { args, .. } => args.as_slice(),
-            _ => &[],
+        std::iter::once(first).chain(second).chain(
+            self.initializer_calls()
+                .flat_map(|(_, args)| args.iter().map(|&(_, var)| var)),
+        )
+    }
+
+    /// Selected initializer declarations and the actuals associated with each.
+    pub fn initializer_calls(&self) -> impl Iterator<Item = (FnId, &[(u32, VarId)])> + '_ {
+        let (reference, value) = match self {
+            Self::CallReferenceReturnDeclared { callee, args, .. } => {
+                (Some((*callee, args.as_slice())), &[][..])
+            }
+            Self::CallReturn { binding, .. } => match binding.as_deref() {
+                Some(CallReturnBinding::InitializerDeclarations(calls)) => (None, calls.as_slice()),
+                _ => (None, &[][..]),
+            },
+            _ => (None, &[][..]),
         };
-        std::iter::once(first)
-            .chain(second)
-            .chain(arguments.iter().map(|(_, var)| *var))
+        reference
+            .into_iter()
+            .chain(value.iter().map(|call| (call.callee, call.args.as_slice())))
     }
 }
 

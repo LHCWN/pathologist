@@ -59,6 +59,15 @@ take the `memset` model, while a class's or namespace's own
 `SecureBuffer::memset`, `Pool::memcpy`, `secure::memset` or bodyless
 `Arena::malloc` take none of the libc models (no terminator, no copy, no fresh
 heap), and rule 4 still applies to them.
+The built-in libc memory, string, and epoll argument effects and the
+`malloc`, `calloc`, and `realloc` return effects check language linkage for
+known C++ declarations. Allocation summaries use the selected call targets
+from the call site or from the declarations retained for a file-scope
+initializer. This includes a C allocator found by ADL when ordinary lookup
+found a declaration in another namespace. Each call's own targets determine
+whether it has a real return flow or uses the summary, even when several calls
+assign to the same variable. Undeclared
+callees and explicitly configured models can still match by name.
 
 Not matched: a member a subclass inherits from a base the unit never declares,
 called bare in the subclass's body (`PostTask(f)` inside a subclass of
@@ -109,8 +118,10 @@ does `return_field` for a static member.
 ### Epoll event data
 
 `epoll_ctl` registers argument 3; `epoll_wait`, `epoll_pwait` and
-`epoll_pwait2` receive into argument 1. The solver connects each registered
-event pointer to each receiving buffer with the same whole-object aliasing
+`epoll_pwait2` receive into argument 1. These effects follow the built-in C API
+linkage rules in [Model matching](#model-matching).
+The solver connects each registered event pointer to each receiving buffer
+with the same whole-object aliasing
 approximation as `mem_copy`. Registration retains the actual pointer, including
 `&local_event`; a decayed local event array denotes its own storage. Receiving
 `&buffer` arguments name the buffer's value node. Wiring immediately propagates
@@ -345,7 +356,8 @@ still the callee of an `ipc` edge.
   `q.submit(f)`, `handler` in `handler->PostTask(f)`, `this` in
   `this->PostTask(f)` or a bare `Run()` in a member body, the object a
   constructor builds (`std::thread t(f)`), through parentheses, casts and
-  `std::move`. It is identity only, not bound to the callee's `this`. A field
+  [standard move and forward calls](CXX.md#c-support-first-step). This
+  records receiver identity for model matching. A field
   (`handler_->PostTask(f)`, `this->handler_`), a call result or any other
   expression records none, so tasks queued on a member handler are not told
   apart here; nor is a pointer variable's pointee: two variables naming one

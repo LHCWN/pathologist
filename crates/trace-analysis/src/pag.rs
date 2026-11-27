@@ -1,11 +1,13 @@
 use crate::constraints::{AbstractLocation, Constraint, ConstraintKind, LocKind};
 use crate::ipc::detect_ipc_pairs_with_models;
-use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
+use crate::summaries::{AllocationTargets, Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use std::borrow::Cow;
+use std::sync::Arc;
 use trace_ir::{
-    CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow,
-    StorageClass, TargetId, TypeDesc, TypeId, VarId,
+    CallReturnBinding, CallSite, ContainerOwner, FieldId, FlowConstraint, FnId, LocId, PagNodeId,
+    Program, ReturnFlow, StorageClass, TargetId, TypeDesc, TypeId, VarId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,6 +129,7 @@ pub struct Pag {
     pub indices: SolverIndices,
     /// Call results produced by `return_field`, for transitive return expansion.
     return_field_values: FxHashSet<VarId>,
+    allocation_targets: Arc<AllocationTargets>,
 }
 
 impl Pag {
@@ -145,6 +148,7 @@ impl Pag {
     ) -> Self {
         let mut pag = Self {
             ipc_enabled: enable_ipc,
+            allocation_targets: Arc::clone(models.allocation_targets()),
             ..Self::default()
         };
         pag.build_variables(program);
@@ -158,6 +162,20 @@ impl Pag {
             pag.ipc_bridges = detect_ipc_pairs_with_models(program, models);
         }
         pag
+    }
+
+    /// Resolve direct return facts using the same call selections as PAG
+    /// construction, so export can attribute the wiring to its occurrence.
+    pub fn return_candidates(
+        &self,
+        program: &Program,
+        name: &str,
+        caller: Option<FnId>,
+        dst: VarId,
+        binding: Option<&CallReturnBinding>,
+    ) -> Cow<'_, [FnId]> {
+        self.allocation_targets
+            .candidates(program, name, caller, dst, binding)
     }
 
     fn alloc_node(&mut self, kind: PagNodeKind) -> PagNodeId {
@@ -896,15 +914,32 @@ impl Pag {
                     dst,
                     callee_name,
                     caller,
+                    binding,
                 } => {
                     let dst_n = self.var_node_id(*dst);
                     let mut visited = FxHashSet::default();
-                    let candidates =
-                        program
-                            .symbols
-                            .call_return_candidates(*caller, *dst, callee_name);
+                    let candidates = models.allocation_targets().candidates(
+                        program,
+                        callee_name,
+                        *caller,
+                        *dst,
+                        binding.as_deref(),
+                    );
+                    let declared = matches!(
+                        binding.as_deref(),
+                        Some(CallReturnBinding::InitializerDeclarations(_)),
+                    );
+                    if declared {
+                        for (callee, args) in program.symbols.initializer_call_targets(
+                            *dst,
+                            flow.initializer_calls(),
+                            &program.types,
+                        ) {
+                            self.wire_initializer_arguments(program, callee, args);
+                        }
+                    }
                     let mut any_real = false;
-                    for callee in &candidates {
+                    for callee in candidates.iter() {
                         if self.expand_return_flows(program, dst_n, *callee, models, &mut visited) {
                             any_real = true;
                         }
@@ -912,15 +947,15 @@ impl Pag {
                     // Modeled return effects fire only when no real return
                     // flow exists (bodyless callees: libc realloc, vendor
                     // allocators). Synthesized externals never enter the
-                    // name-resolution maps, so the model is consulted by
-                    // call name directly.
-                    if !any_real {
-                        if let Some(model) = models.model(callee_name, EffectGroup::Return) {
-                            let params = candidates
-                                .iter()
-                                .find(|c| !program.symbols.function(**c).params.is_empty())
-                                .map(|c| program.symbols.function(*c).params.clone());
-                            self.apply_return_model(program, dst_n, model, params.as_deref());
+                    // name-resolution maps. Fall back to a return model
+                    // using the selected targets and the call spelling.
+                    if !any_real && (!declared || !candidates.is_empty()) {
+                        if let Some((model, params)) = models.return_model(
+                            callee_name,
+                            &candidates,
+                            declared || matches!(candidates, Cow::Borrowed(_)),
+                        ) {
+                            self.apply_return_model(program, dst_n, model, params);
                             // A file-scope initializer has no call record.
                             if caller.is_none() {
                                 self.apply_return_fields(program, *dst, model, &candidates, None);
@@ -952,14 +987,7 @@ impl Pag {
                         *callee,
                         &program.types,
                     ) {
-                        for (formal, actual) in program
-                            .symbols
-                            .initializer_argument_bindings(definition, args)
-                        {
-                            let dst = self.var_node_id(formal);
-                            let src = self.var_node_id(actual);
-                            self.add_copy(dst, src);
-                        }
+                        self.wire_initializer_arguments(program, definition, args);
                         self.expand_reference_returns(
                             program,
                             dst_node,
@@ -1089,11 +1117,10 @@ impl Pag {
             }
             if !any_real {
                 for cs in sites {
-                    if let Some(model) = models.model(&cs.callee_name, EffectGroup::Return) {
-                        let params = cs
-                            .callee_fn_id
-                            .map(|fid| program.symbols.function(fid).params.clone());
-                        self.apply_return_model(program, dst_n, model, params.as_deref());
+                    if let Some((model, params)) =
+                        models.return_model(&cs.callee_name, &program.callees_of(cs), true)
+                    {
+                        self.apply_return_model(program, dst_n, model, params);
                         break;
                     }
                 }
@@ -1226,8 +1253,13 @@ impl Pag {
                             callee_name,
                             result,
                         } => {
-                            let inner_candidates =
-                                program.symbols.return_flow_candidates(callee, &callee_name);
+                            let inner_candidates = models.allocation_targets().candidates(
+                                program,
+                                &callee_name,
+                                Some(callee),
+                                result,
+                                None,
+                            );
                             let mut inner_applied = false;
                             for inner in inner_candidates.iter().copied() {
                                 if self.expand_returns_in_mode(
@@ -1240,18 +1272,13 @@ impl Pag {
                             // realloc has no tree body): fall back to the
                             // modeled return effects.
                             if !inner_applied && !address {
-                                if let Some(model) = models.model(&callee_name, EffectGroup::Return)
-                                {
-                                    let params = inner_candidates
-                                        .iter()
-                                        .find(|c| !program.symbols.function(**c).params.is_empty())
-                                        .map(|c| program.symbols.function(*c).params.clone());
-                                    inner_applied = self.apply_return_model(
-                                        program,
-                                        dst,
-                                        model,
-                                        params.as_deref(),
-                                    );
+                                if let Some((model, params)) = models.return_model(
+                                    &callee_name,
+                                    &inner_candidates,
+                                    matches!(inner_candidates, Cow::Borrowed(_)),
+                                ) {
+                                    inner_applied =
+                                        self.apply_return_model(program, dst, model, params);
                                 }
                             }
                             if !address && self.return_field_values.contains(&result) {
@@ -1537,6 +1564,19 @@ impl Pag {
         let id = self.alloc_node(PagNodeKind::CallTarget(cs));
         self.call_targets.insert(cs, id);
         id
+    }
+
+    fn wire_initializer_arguments(
+        &mut self,
+        program: &Program,
+        callee: FnId,
+        args: &[(u32, VarId)],
+    ) {
+        for (formal, actual) in program.symbols.initializer_argument_bindings(callee, args) {
+            let dst = self.var_node_id(formal);
+            let src = self.var_node_id(actual);
+            self.add_copy(dst, src);
+        }
     }
 
     pub fn add_copy(&mut self, dst: PagNodeId, src: PagNodeId) {

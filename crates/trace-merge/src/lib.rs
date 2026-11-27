@@ -392,6 +392,71 @@ impl DefRecord {
 // their link target so their functions and outgoing calls stay separate.
 type FunctionOrigin = (i64, i64, String, String);
 
+/// A declaration may share a row across export versions when one copy lacks
+/// binding metadata. An exact match takes precedence over a legacy match.
+fn shared_declaration(
+    declarations: &[i64],
+    functions: &[DbFunction],
+    signature: &str,
+    allow_legacy_match: bool,
+) -> Option<i64> {
+    let signature_of = |id| functions[(id - 1) as usize].signature.as_str();
+    if let Some(&exact) = declarations
+        .iter()
+        .find(|&&id| signature_of(id) == signature)
+    {
+        return Some(exact);
+    }
+    if !allow_legacy_match {
+        return None;
+    }
+    let (_, references) = trace_ir::split_signature_references(signature);
+    let mut compatible = declarations.iter().copied().filter(|&id| {
+        references.is_empty()
+            || trace_ir::split_signature_references(signature_of(id))
+                .1
+                .is_empty()
+    });
+    let first = compatible.next()?;
+    compatible.next().is_none().then_some(first)
+}
+
+/// A legacy declaration can match a current signature only if the whole
+/// input set gives it one annotated overload at its source position.
+fn annotated_declaration_origins(
+    conns: &[Connection],
+    file_remap: &[FxHashMap<i64, i64>],
+) -> Result<FxHashMap<FunctionOrigin, Option<String>>> {
+    let mut origins: FxHashMap<_, Option<String>> = FxHashMap::default();
+    for (conn, files) in conns.iter().zip(file_remap) {
+        let mut stmt = conn.prepare(
+            "SELECT file_id, line_start, name, signature FROM functions
+             WHERE is_defined = 0 AND linkage != 'internal' AND line_start > 0
+               AND instr(signature, ' [refs=') > 0",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let file = files
+                .get(&row.get::<_, i64>(0)?)
+                .context("missing remapped file_id for declaration")?;
+            let signature: String = row.get(3)?;
+            let (storage, references) = trace_ir::split_signature_references(&signature);
+            if !references.is_empty() {
+                let key = (*file, row.get(1)?, row.get(2)?, storage.to_owned());
+                origins
+                    .entry(key)
+                    .and_modify(|known| {
+                        if known.as_ref().is_some_and(|sig| sig != &signature) {
+                            *known = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(signature));
+            }
+        }
+    }
+    Ok(origins)
+}
+
 /// Shared external/member definition selection. Strength competes only within
 /// a signature; exact strong conflicts prefer the caller's known image.
 fn prefer_definitions(
@@ -401,10 +466,24 @@ fn prefer_definitions(
 ) -> Vec<&DefRecord> {
     let strong: Vec<_> = candidates.iter().copied().filter(|d| !d.is_weak).collect();
     if fallback && candidates.len() > 1 {
-        let signatures: FxHashSet<_> = strong.iter().map(|d| d.signature.as_str()).collect();
+        let mut signatures: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        for def in strong {
+            let (signature, references) = trace_ir::split_signature_references(&def.signature);
+            signatures.entry(signature).or_default().push(references);
+        }
         return candidates
             .into_iter()
-            .filter(|d| !d.is_weak || !signatures.contains(d.signature.as_str()))
+            .filter(|def| {
+                if !def.is_weak {
+                    return true;
+                }
+                let (signature, references) = trace_ir::split_signature_references(&def.signature);
+                !signatures.get(signature).is_some_and(|forms| {
+                    forms
+                        .iter()
+                        .any(|form| trace_ir::signature_references_compatible(form, references))
+                })
+            })
             .collect();
     }
     if strong.is_empty() {
@@ -426,6 +505,7 @@ fn prefer_definitions(
 }
 
 fn matching_definitions<'a>(defs: &'a [DefRecord], signature: &str) -> (Vec<&'a DefRecord>, bool) {
+    let (signature, references) = trace_ir::split_signature_references(signature);
     let bare_sig = signature.strip_suffix(" <template>").unwrap_or(signature);
     let bare_sig = bare_sig
         .strip_suffix(" &&")
@@ -435,18 +515,57 @@ fn matching_definitions<'a>(defs: &'a [DefRecord], signature: &str) -> (Vec<&'a 
     if !signature.contains('(') || bare_sig.ends_with("(...)") {
         return (defs.iter().collect(), true);
     }
-    let matching: Vec<_> = defs.iter().filter(|d| d.signature == signature).collect();
-    if matching.is_empty() {
-        (defs.iter().collect(), true)
+    let mut same_type = Vec::new();
+    let mut other_type = Vec::new();
+    for def in defs {
+        let (candidate, candidate_references) =
+            trace_ir::split_signature_references(&def.signature);
+        if trace_ir::signature_references_compatible(references, candidate_references) {
+            if candidate == signature {
+                same_type.push(def);
+            } else {
+                other_type.push(def);
+            }
+        }
+    }
+    if same_type.is_empty() {
+        (other_type, true)
     } else {
-        (matching, false)
+        (same_type, false)
     }
 }
 
 fn same_definition_origin(pool: &[&DefRecord]) -> bool {
     let first = pool[0];
-    pool.iter()
-        .all(|d| d.source_origin() == first.source_origin())
+    let origin = first.source_origin();
+    if pool.iter().all(|def| def.source_origin() == origin) {
+        return true;
+    }
+    let (file, line, _, positionless_id) = origin;
+    let (signature, _) = trace_ir::split_signature_references(&first.signature);
+    let mut forms = Vec::new();
+    for def in pool {
+        let (other_file, other_line, _, other_id) = def.source_origin();
+        if (file, line, positionless_id) != (other_file, other_line, other_id) {
+            return false;
+        }
+        let (other_signature, references) = trace_ir::split_signature_references(&def.signature);
+        if signature != other_signature {
+            return false;
+        }
+        // An older export has no binding facts. It can agree with a
+        // newer copy, but cannot reconcile incompatible newer overloads.
+        if !references.is_empty() && !forms.contains(&references) {
+            if forms
+                .iter()
+                .any(|&form| !trace_ir::signature_references_compatible(form, references))
+            {
+                return false;
+            }
+            forms.push(references);
+        }
+    }
+    true
 }
 
 fn resolve_definition_pool(
@@ -752,7 +871,8 @@ pub fn merge_databases<P: AsRef<Path>>(
     let mut function_by_identity = FxHashMap::default();
     let mut fn_remap: Vec<FxHashMap<i64, i64>> = vec![FxHashMap::default(); inputs.len()];
     let mut header_def_map: FxHashMap<(Option<i64>, FunctionOrigin), i64> = FxHashMap::default();
-    let mut header_decl_map: FxHashMap<FunctionOrigin, i64> = FxHashMap::default();
+    let mut header_decl_map: FxHashMap<FunctionOrigin, Vec<i64>> = FxHashMap::default();
+    let annotated_origins = annotated_declaration_origins(&conns, &file_remap)?;
     // Exported definitions catalog: name -> list of definitions across repos
     let mut definitions_by_name: FxHashMap<String, Vec<DefRecord>> = FxHashMap::default();
     // Cache per-DB functions by old id for call edge lookup
@@ -795,6 +915,12 @@ pub fn merge_databases<P: AsRef<Path>>(
                 .is_dep
                 .min(unified_files[(new_file_id - 1) as usize].is_dep);
             let origin = func.source_origin(new_file_id);
+            let declaration_origin = origin.as_ref().filter(|_| func.is_defined == 0).map(
+                |(file, line, name, signature)| {
+                    let (storage, _) = trace_ir::split_signature_references(signature);
+                    (*file, *line, name.clone(), storage.to_owned())
+                },
+            );
             let function_identity = identity::inherited(inherited_identities.as_ref(), func.id)?
                 .unwrap_or_else(|| {
                     func.identity(
@@ -815,7 +941,14 @@ pub fn merge_databases<P: AsRef<Path>>(
                     if func.is_defined != 0 {
                         header_def_map.get(&(new_target_id, key.clone())).copied()
                     } else {
-                        header_decl_map.get(key).copied()
+                        let origin = declaration_origin.as_ref()?;
+                        let declarations = header_decl_map.get(origin)?;
+                        shared_declaration(
+                            declarations,
+                            &unified_functions,
+                            &func.signature,
+                            annotated_origins.get(origin).is_some_and(Option::is_some),
+                        )
                     }
                 });
             if let Some(existing_fn_id) = existing_fn_id {
@@ -825,6 +958,19 @@ pub fn merge_databases<P: AsRef<Path>>(
                 // A declaration shared by different images has no unique target.
                 if func.is_defined == 0 && existing.target_id != new_target_id {
                     existing.target_id = None;
+                }
+                if declaration_origin.is_some()
+                    && trace_ir::split_signature_references(&existing.signature)
+                        .1
+                        .is_empty()
+                    && !trace_ir::split_signature_references(&func.signature)
+                        .1
+                        .is_empty()
+                {
+                    // Retain the binding facts and identity from the current
+                    // export regardless of which copy was read first.
+                    existing.signature.clone_from(&func.signature);
+                    function_identities[(existing_fn_id - 1) as usize] = function_identity;
                 }
                 existing.is_dep = existing.is_dep.min(is_dep);
                 if origin.is_some() {
@@ -837,12 +983,10 @@ pub fn merge_databases<P: AsRef<Path>>(
             fn_remap[db_idx].insert(func.id, new_fn_id);
             function_by_identity.insert(function_identity, new_fn_id);
 
-            if let Some(key) = origin {
-                if func.is_defined != 0 {
-                    header_def_map.insert((new_target_id, key), new_fn_id);
-                } else {
-                    header_decl_map.insert(key, new_fn_id);
-                }
+            if let Some(key) = declaration_origin {
+                header_decl_map.entry(key).or_default().push(new_fn_id);
+            } else if let Some(key) = origin {
+                header_def_map.insert((new_target_id, key), new_fn_id);
             }
             function_identities.push(function_identity);
 
@@ -897,10 +1041,35 @@ pub fn merge_databases<P: AsRef<Path>>(
             continue;
         }
 
-        // Group definitions by signature so valid C++ overloads are evaluated independently
+        // A wholly unannotated export can join a uniquely identified
+        // current overload, but must not tie different overloads together.
+        let mut annotated: FxHashMap<&str, Option<&str>> = FxHashMap::default();
+        for d in defs {
+            let (storage, references) = trace_ir::split_signature_references(&d.signature);
+            if !references.is_empty() {
+                annotated
+                    .entry(storage)
+                    .and_modify(|known| {
+                        if known.is_some_and(|sig| sig != d.signature) {
+                            *known = None;
+                        }
+                    })
+                    .or_insert(Some(&d.signature));
+            }
+        }
         let mut defs_by_sig: FxHashMap<&str, Vec<&DefRecord>> = FxHashMap::default();
         for d in defs {
-            defs_by_sig.entry(&d.signature).or_default().push(d);
+            let (storage, references) = trace_ir::split_signature_references(&d.signature);
+            let key = if references.is_empty() {
+                annotated
+                    .get(storage)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(&d.signature)
+            } else {
+                &d.signature
+            };
+            defs_by_sig.entry(key).or_default().push(d);
         }
 
         let mut sigs: Vec<&&str> = defs_by_sig.keys().collect();
@@ -918,7 +1087,10 @@ pub fn merge_databases<P: AsRef<Path>>(
             let distinct_strong_defs: Vec<&DefRecord> = strong_defs
                 .iter()
                 .copied()
-                .filter(|d| seen_origins.insert(d.source_origin()))
+                .filter(|d| {
+                    let (file, line, _, positionless) = d.source_origin();
+                    seen_origins.insert((file, line, positionless))
+                })
                 .collect();
 
             if strong_db_indices.len() > 1 && distinct_strong_defs.len() > 1 {
@@ -984,6 +1156,7 @@ pub fn merge_databases<P: AsRef<Path>>(
 
     drop(header_def_map);
     drop(header_decl_map);
+    drop(annotated_origins);
     drop(function_by_identity);
     // 4. Call Sites Ingestion & Remapping
     let mut unified_call_sites: Vec<DbCallSite> = Vec::new();

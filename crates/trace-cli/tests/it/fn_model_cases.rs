@@ -724,6 +724,15 @@ fn epoll_registration_reaches_wait_dispatch() {
         },
     );
     assert!(with.solve.converged);
+    let overload_targets: Vec<_> = with
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "other::wait_overload")
+        .map(|edge| program.symbols.function(edge.callee))
+        .collect();
+    assert_eq!(overload_targets.len(), 1);
+    assert_eq!(overload_targets[0].name, "epoll_pwait");
+    assert!(overload_targets[0].is_cpp && !overload_targets[0].c_linkage);
     let registration = program
         .symbols
         .call_sites
@@ -914,6 +923,1170 @@ fn alias_models_accept_precise_members_but_reject_container_fallbacks() {
                 enabled && precise,
                 "models={enabled}, precise={precise}"
             );
+        }
+    }
+}
+
+#[test]
+fn adl_overloads_do_not_take_builtin_libc_models() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+using size_t = decltype(sizeof(0));
+struct Tag {};
+void memcpy(Tag*, Tag*) {}
+extern "C" void *memcpy(void *, const void *, size_t);
+namespace app {
+void memcpy(int);
+Tag tag;
+Tag* destination;
+Tag* source = &tag;
+void copy() { memcpy(destination, source); }
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let targets: Vec<_> = result
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "app::copy")
+        .map(|edge| program.symbols.function(edge.callee))
+        .collect();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].name, "memcpy");
+    assert!(targets[0].is_cpp && !targets[0].c_linkage);
+    let destination = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "destination")
+        .unwrap();
+    assert!(result
+        .points_to
+        .get(&pag.var_node[&destination.id])
+        .is_none_or(|pts| pts.is_empty()));
+}
+
+#[test]
+fn libc_allocation_models_follow_the_selected_call_target() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {};
+Tag* malloc(Tag*) { return nullptr; }
+namespace std { extern "C" void* malloc(unsigned long); }
+namespace app {
+void malloc(int, int);
+Tag tag;
+void unqualified() { Tag* p = malloc(&tag); }
+void qualified() { Tag* p = ::malloc(&tag); }
+void genuine() { void* p = std::malloc(sizeof(Tag)); }
+}
+namespace ordinary {
+void unqualified() { Tag* p = malloc(&app::tag); }
+Tag* forwarded() { return malloc(&app::tag); }
+void through_return() { Tag* p = forwarded(); }
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for caller in [
+        "app::unqualified",
+        "app::qualified",
+        "ordinary::unqualified",
+        "ordinary::forwarded",
+        "app::genuine",
+    ] {
+        let targets: Vec<_> = result
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(&program, edge.caller) == caller)
+            .map(|edge| program.symbols.function(edge.callee))
+            .collect();
+        assert_eq!(targets.len(), 1, "{caller}");
+        assert_eq!(
+            targets[0].name,
+            if caller == "app::genuine" {
+                "std::malloc"
+            } else {
+                "malloc"
+            },
+            "{caller}"
+        );
+        assert_eq!(targets[0].c_linkage, caller == "app::genuine", "{caller}");
+    }
+    for (caller, allocates) in [
+        ("app::unqualified", false),
+        ("app::qualified", false),
+        ("ordinary::unqualified", false),
+        ("ordinary::through_return", false),
+        ("app::genuine", true),
+    ] {
+        let var = local_variable(&program, caller, "p");
+        let heap = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .is_some_and(|pts| {
+                pts.iter()
+                    .any(|l| pag.locations[l.0 as usize].kind == trace_analysis::LocKind::Heap)
+            });
+        assert_eq!(heap, allocates, "{caller}");
+    }
+}
+
+#[test]
+fn allocation_models_keep_calls_to_the_same_destination_separate() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {} tag;
+Tag* malloc(Tag*) { return nullptr; }
+namespace std { extern "C" void* malloc(unsigned long); }
+#define ASSIGN(dst, callee, arg) dst = callee(arg)
+void run() {
+    void* p;
+    ASSIGN(p, std::malloc, 8UL);
+    ASSIGN(p, ::malloc, &tag);
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let dst = local_variable(&program, "run", "p");
+    let pointees = &result.points_to[&pag.var_node[&dst]];
+    assert_eq!(pointees.len(), 1, "{pointees:?}");
+    let loc = &pag.locations[pointees.iter().next().unwrap().0 as usize];
+    assert_eq!(loc.kind, trace_analysis::LocKind::Heap);
+}
+
+#[test]
+fn unselected_overload_returns_cannot_suppress_libc_allocation() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {} tag;
+extern "C" void* malloc(unsigned long);
+Tag* malloc(Tag*, int) { return &tag; }
+void run() { void* p = malloc(8UL); }
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let allocators: Vec<_> = result
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "run")
+        .map(|edge| program.symbols.function(edge.callee))
+        .collect();
+    assert_eq!(allocators.len(), 1);
+    assert_eq!(allocators[0].name, "malloc");
+    assert!(allocators[0].c_linkage);
+    let dst = local_variable(&program, "run", "p");
+    let pointees = &result.points_to[&pag.var_node[&dst]];
+    assert_eq!(pointees.len(), 1, "{pointees:?}");
+    let loc = &pag.locations[pointees.iter().next().unwrap().0 as usize];
+    assert_eq!(loc.kind, trace_analysis::LocKind::Heap);
+}
+
+#[test]
+fn namespaced_adl_allocator_overload_controls_return_flow() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+extern "C" void* malloc(unsigned long);
+namespace app {
+struct Tag {};
+Tag* malloc(Tag*) { return nullptr; }
+}
+
+void adl(app::Tag* tag) { void* p = malloc(tag); }
+void* forward(app::Tag* tag) { return malloc(tag); }
+void forwarded(app::Tag* tag) { void* p = forward(tag); }
+void libc() { void* p = malloc(8UL); }
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for caller in ["adl", "forward"] {
+        let targets: Vec<_> = result
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(&program, edge.caller) == caller)
+            .map(|edge| fn_name(&program, edge.callee))
+            .collect();
+        assert_eq!(targets, ["app::malloc"], "{caller}");
+    }
+    for (caller, allocates) in [("adl", false), ("forwarded", false), ("libc", true)] {
+        let dst = local_variable(&program, caller, "p");
+        let has_heap = result
+            .points_to
+            .get(&pag.var_node[&dst])
+            .is_some_and(|pts| {
+                pts.iter()
+                    .any(|loc| pag.locations[loc.0 as usize].kind == trace_analysis::LocKind::Heap)
+            });
+        assert_eq!(has_heap, allocates, "{caller}");
+    }
+}
+
+#[test]
+fn adl_selected_c_allocator_supplies_return_flow() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+extern "C" void* malloc(unsigned long);
+struct Size { operator unsigned long() const { return 8; } };
+namespace app {
+void* malloc(int, int);
+void direct(Size size) { void* p = malloc(size); }
+void* forward(Size size) { return malloc(size); }
+void forwarded(Size size) { void* p = forward(size); }
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for caller in ["app::direct", "app::forward"] {
+        let targets: Vec<_> = result
+            .call_edges
+            .iter()
+            .filter(|edge| fn_name(&program, edge.caller) == caller)
+            .map(|edge| fn_name(&program, edge.callee))
+            .collect();
+        assert_eq!(targets, ["malloc"], "{caller}");
+    }
+    for caller in ["app::direct", "app::forwarded"] {
+        let dst = local_variable(&program, caller, "p");
+        let pointees = &result.points_to[&pag.var_node[&dst]];
+        assert_eq!(pointees.len(), 1, "{caller}: {pointees:?}");
+        let loc = &pag.locations[pointees.iter().next().unwrap().0 as usize];
+        assert_eq!(loc.kind, trace_analysis::LocKind::Heap, "{caller}");
+    }
+}
+
+#[test]
+fn file_scope_allocator_returns_follow_adl_selection() {
+    let dir = scratch(&[
+        (
+            "main.cpp",
+            r#"
+extern "C" void* malloc(unsigned long);
+namespace app {
+struct Tag {};
+Tag tag;
+Tag* malloc(Tag*);
+}
+namespace address {
+struct Tag {};
+Tag address_tag;
+Tag* malloc(Tag*) { return &address_tag; }
+}
+namespace identity {
+struct Tag {};
+Tag identity_tag;
+Tag* malloc(Tag*);
+}
+struct Size { operator unsigned long() const { return 8; } };
+void* no_allocation = malloc(&app::tag);
+void* adl_address = malloc(&address::address_tag);
+void* libc_allocation = malloc(8UL);
+void* adl_argument = malloc(&identity::identity_tag);
+namespace inner {
+void* malloc(int, int);
+Size size;
+void* adl_allocation = malloc(size);
+}
+"#,
+        ),
+        (
+            "casts.cpp",
+            r#"
+extern "C" void* malloc(unsigned long);
+struct CastTag {};
+CastTag cast_tag;
+CastTag* malloc(CastTag*) { return &cast_tag; }
+void* cast_allocation = malloc(((unsigned long)8));
+void* cast_address = malloc((CastTag*)&cast_tag);
+"#,
+        ),
+        (
+            "overload.cpp",
+            r#"
+namespace app { struct Tag {}; Tag* malloc(Tag*) { return nullptr; } }
+namespace identity { struct Tag {}; Tag* malloc(Tag* value) { return value; } }
+"#,
+        ),
+    ]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let pointees = |name| {
+        let dst = only_variable(&program, name);
+        result
+            .points_to
+            .get(&pag.var_node[&dst])
+            .into_iter()
+            .flatten()
+    };
+    assert_eq!(pointees("no_allocation").count(), 0);
+    for (result, object) in [
+        ("adl_address", "address_tag"),
+        ("cast_address", "cast_tag"),
+        ("adl_argument", "identity_tag"),
+    ] {
+        let tag = only_variable(&program, object);
+        assert_eq!(
+            pointees(result).copied().collect::<Vec<_>>(),
+            [pag.var_location[&tag]],
+            "{result}",
+        );
+    }
+    for name in ["libc_allocation", "cast_allocation", "adl_allocation"] {
+        let locations: Vec<_> = pointees(name).collect();
+        assert_eq!(locations.len(), 1, "{name}");
+        assert_eq!(
+            pag.locations[locations[0].0 as usize].kind,
+            trace_analysis::LocKind::Heap,
+            "{name}",
+        );
+    }
+}
+
+#[test]
+fn file_scope_allocator_returns_bind_formals_after_packs() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+extern "C" void* malloc(unsigned long);
+namespace leading {
+struct Tag {};
+Tag leading_tag;
+template<class... P> Tag* malloc(P... ignored, Tag* value) { return value; }
+}
+namespace prefixed {
+struct Tag {};
+Tag prefix_tag;
+Tag tail_tag;
+template<class... P>
+Tag* malloc(Tag* prefix, P... ignored, Tag* value) { return value; }
+}
+void* leading_result = malloc(&leading::leading_tag);
+void* prefixed_result = malloc(&prefixed::prefix_tag, &prefixed::tail_tag);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("leading_result", "leading_tag"),
+        ("prefixed_result", "tail_tag"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}
+
+#[test]
+fn file_scope_allocator_formals_after_packs_get_addresses_and_only_omitted_defaults() {
+    let dir = scratch(&[
+        (
+            "main.cpp",
+            r#"
+namespace reference {
+struct Tag {};
+Tag referent;
+template<class... P> Tag* malloc(P... ignored, Tag& value);
+}
+namespace supplied_default {
+struct Tag {};
+Tag supplied, unused_fallback;
+template<class... P>
+Tag* malloc(P... ignored, Tag* value = &unused_fallback) { return value; }
+}
+namespace omitted_default {
+struct Tag {};
+Tag fallback;
+template<class... P>
+Tag* malloc(P... ignored, Tag* value = &fallback) { return value; }
+}
+void* address = reference::malloc(reference::referent);
+void* supplied_result = supplied_default::malloc(&supplied_default::supplied);
+void* omitted = omitted_default::malloc();
+"#,
+        ),
+        (
+            "definition.cpp",
+            r#"
+namespace reference {
+struct Tag {};
+template<class... P> Tag* malloc(P... ignored, Tag& value) { return &value; }
+template Tag* malloc<>(Tag&);
+}
+"#,
+        ),
+    ]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("address", "referent"),
+        ("supplied_result", "supplied"),
+        ("omitted", "fallback"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}
+
+#[test]
+fn file_scope_allocator_empty_packs_align_each_fixed_argument() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace ordered {
+struct Tag {};
+Tag a, b;
+template<class... P>
+Tag* malloc(P... ignored, Tag* first, Tag* second) { return first; }
+}
+namespace empty {
+struct Tag {};
+Tag supplied, unused_fallback;
+template<class... P>
+Tag* malloc(P... ignored, Tag* value = &unused_fallback) { return value; }
+}
+namespace explicit_pack {
+struct Tag {};
+Tag fallback;
+template<class... P>
+Tag* malloc(P... ignored, Tag* value = &fallback) { return value; }
+}
+namespace deduced_pack {
+struct Tag {};
+Tag deduced_fallback;
+template<class... P> struct Types {};
+Types<int> types;
+template<class... P>
+Tag* malloc(Types<P...>, P... ignored, Tag* value = &deduced_fallback) { return value; }
+}
+void* deduced_result = deduced_pack::malloc(deduced_pack::types, 42);
+void* first_result = ordered::malloc(&ordered::a, &ordered::b);
+void* supplied_result = empty::malloc<>(&empty::supplied);
+void* explicit_result = explicit_pack::malloc<int>(42);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("first_result", "a"),
+        ("supplied_result", "supplied"),
+        ("explicit_result", "fallback"),
+        ("deduced_result", "deduced_fallback"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}
+
+#[test]
+fn file_scope_allocator_template_id_excludes_non_templates_before_ranking() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag ordinary, expected;
+Tag* malloc(int) { return &ordinary; }
+template<class... P>
+Tag* malloc(P... ignored, int value) { return &expected; }
+}
+void* empty_id = app::malloc<>(7);
+void* explicit_id = app::malloc<int>(6, 7);
+void* bare_name = app::malloc(7);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("empty_id", "expected"),
+        ("explicit_id", "expected"),
+        ("bare_name", "ordinary"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}
+
+#[test]
+fn body_allocator_template_id_excludes_the_ordinary_overload() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag wrong, expected;
+Tag* malloc(int) { return &wrong; }
+template<class... P>
+Tag* malloc(P... ignored, int value) { return &expected; }
+}
+auto* use_template() {
+    auto* p = app::malloc<>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let caller = only_function(&program, "use_template");
+    let targets: Vec<_> = result
+        .call_edges
+        .iter()
+        .filter(|edge| edge.caller == caller)
+        .map(|edge| program.symbols.function(edge.callee))
+        .collect();
+    assert_eq!(targets.len(), 1, "{targets:?}");
+    assert!(targets[0].is_free_function_template, "{targets:?}");
+    let var = local_variable(&program, "use_template", "p");
+    let expected = pag.var_location[&only_variable(&program, "expected")];
+    let pointees: Vec<_> = result
+        .points_to
+        .get(&pag.var_node[&var])
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(pointees, [expected]);
+}
+
+#[test]
+fn file_scope_allocator_template_id_retains_the_explicit_specialization() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag ordinary, primary, specialized;
+Tag* malloc(int) { return &ordinary; }
+template<class... P>
+Tag* malloc(P... ignored, int value) { return &primary; }
+template<> Tag* malloc(int value) { return &specialized; }
+}
+auto* empty_id = app::malloc<>(7);
+auto* nonempty_id = app::malloc<int>(6, 7);
+auto* bare_name = app::malloc(7);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (dst, tag) in [
+        ("empty_id", "specialized"),
+        ("nonempty_id", "primary"),
+        ("bare_name", "ordinary"),
+    ] {
+        let var = only_variable(&program, dst);
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "{dst}");
+    }
+}
+
+#[test]
+fn allocator_template_ids_respect_specializations_written_arguments() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag primary, int_result, short_result;
+template<class U, class... P>
+Tag* malloc(P... ignored, int value) { return &primary; }
+template<> Tag* malloc<int>(int value);
+template<> Tag* malloc<short>(int value) { return &short_result; }
+}
+template<> app::Tag* app::malloc<int>(int value) { return &int_result; }
+auto* global_long = app::malloc<long>(7);
+auto* global_int = app::malloc<signed int>(7);
+auto* global_short = app::malloc<short>(7);
+auto* local_long() {
+    auto* p = app::malloc<long>(7);
+    return p;
+}
+auto* local_alias() {
+    using Selected = int;
+    auto* p = app::malloc<Selected>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (var, tag) in [
+        (only_variable(&program, "global_long"), "primary"),
+        (only_variable(&program, "global_int"), "int_result"),
+        (only_variable(&program, "global_short"), "short_result"),
+        (local_variable(&program, "local_long", "p"), "primary"),
+        (local_variable(&program, "local_alias", "p"), "int_result"),
+    ] {
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "expected {tag}");
+    }
+}
+
+#[test]
+fn allocator_template_ids_check_pack_length_and_integral_values() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace lengths {
+struct Tag {};
+Tag primary_length, empty_pack;
+template<class U, class... P>
+Tag* malloc(P... args, int value = 0) { return &primary_length; }
+template<> Tag* malloc<int>(int value) { return &empty_pack; }
+}
+namespace packed {
+struct Tag {};
+Tag primary_packed, nonempty_pack;
+template<class U, class... P>
+Tag* malloc(P... args, int value) { return &primary_packed; }
+template<> Tag* malloc<int, long>(long arg, int value) { return &nonempty_pack; }
+}
+namespace values {
+struct Tag {};
+Tag primary_value, one, three;
+template<int N, class... P>
+Tag* malloc(P... args, int value) { return &primary_value; }
+template<> Tag* malloc<1>(int value) { return &one; }
+template<> Tag* malloc<3>(int value) { return &three; }
+}
+auto* global_longer = lengths::malloc<int, long>(7);
+auto* global_shorter = lengths::malloc<int>(7);
+auto* global_packed = packed::malloc<int, long>(6, 7);
+auto* global_other = values::malloc<2>(7);
+auto* global_same = values::malloc<0x1>(7);
+auto* global_three = values::malloc<3>(7);
+auto* local_longer() {
+    auto* p = lengths::malloc<int, long>(7);
+    return p;
+}
+auto* local_other() {
+    auto* p = values::malloc<2>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (var, tag) in [
+        (only_variable(&program, "global_longer"), "primary_length"),
+        (only_variable(&program, "global_shorter"), "empty_pack"),
+        (only_variable(&program, "global_packed"), "nonempty_pack"),
+        (only_variable(&program, "global_other"), "primary_value"),
+        (only_variable(&program, "global_same"), "one"),
+        (only_variable(&program, "global_three"), "three"),
+        (
+            local_variable(&program, "local_longer", "p"),
+            "primary_length",
+        ),
+        (
+            local_variable(&program, "local_other", "p"),
+            "primary_value",
+        ),
+    ] {
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "expected {tag}");
+    }
+}
+
+#[test]
+fn allocator_specializations_distinguish_deduced_integral_types() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace deduced {
+struct Tag {};
+Tag primary, unsigned_result;
+template<auto N, class... P>
+Tag* malloc(P... args, int value) { return &primary; }
+template<> Tag* malloc<1u>(int value) { return &unsigned_result; }
+}
+namespace converted {
+struct Tag {};
+Tag converted_primary, converted_result;
+template<int N, class... P>
+Tag* malloc(P... args, int value) { return &converted_primary; }
+template<> Tag* malloc<1u>(int value) { return &converted_result; }
+}
+auto* signed_call = deduced::malloc<1>(7);
+auto* unsigned_call = deduced::malloc<0x1u>(7);
+auto* converted_call = converted::malloc<1>(7);
+auto* local_signed() {
+    auto* p = deduced::malloc<1>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (var, tag) in [
+        (only_variable(&program, "signed_call"), "primary"),
+        (only_variable(&program, "unsigned_call"), "unsigned_result"),
+        (
+            only_variable(&program, "converted_call"),
+            "converted_result",
+        ),
+        (local_variable(&program, "local_signed", "p"), "primary"),
+    ] {
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "expected {tag}");
+    }
+}
+
+#[test]
+fn uncertain_allocator_specialization_keeps_primary_return_flow() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag primary, specialized;
+template<int N, class... P>
+Tag* malloc(P... args, int value) { return &primary; }
+template<> Tag* malloc<1>(int value) { return &specialized; }
+}
+constexpr int n = 2;
+auto* global = app::malloc<n>(7);
+auto* local() {
+    auto* p = app::malloc<n>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let primary = pag.var_location[&only_variable(&program, "primary")];
+    let specialization = pag.var_location[&only_variable(&program, "specialized")];
+    for var in [
+        only_variable(&program, "global"),
+        local_variable(&program, "local", "p"),
+    ] {
+        let pointees = &result.points_to[&pag.var_node[&var]];
+        assert_eq!(pointees.len(), 2, "{pointees:?}");
+        assert!(pointees.contains(&primary), "{pointees:?}");
+        assert!(pointees.contains(&specialization), "{pointees:?}");
+    }
+}
+
+#[test]
+fn allocator_specializations_without_template_ids_keep_the_primary() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace implicit_args {
+struct Tag {};
+Tag default_primary, wrong_default;
+template<int N = 2, class... P>
+Tag* malloc(P... args, int value) { return &default_primary; }
+template<> Tag* malloc<1>(int value) { return &wrong_default; }
+}
+auto* global = implicit_args::malloc(7);
+auto* local() {
+    auto* p = implicit_args::malloc(7);
+    return p;
+}
+"#,
+    )]);
+    assert_allocator_return_candidates(dir.path(), &["default_primary", "wrong_default"]);
+}
+
+#[test]
+fn uncertain_allocator_specializations_are_ranked_independently() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace dependent {
+struct Tag {};
+Tag dependent_primary, wrong_int, selected_long;
+template<auto N, class... P>
+Tag* malloc(P... args, decltype(N) value) { return &dependent_primary; }
+template<> Tag* malloc<1>(int value) { return &wrong_int; }
+template<> Tag* malloc<2L>(long value) { return &selected_long; }
+}
+constexpr long n = 2;
+auto* global = dependent::malloc<n>(7);
+auto* local() {
+    auto* p = dependent::malloc<n>(7);
+    return p;
+}
+"#,
+    )]);
+    assert_allocator_return_candidates(
+        dir.path(),
+        &["dependent_primary", "wrong_int", "selected_long"],
+    );
+}
+
+#[test]
+fn allocator_template_ids_accept_abbreviated_templates() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+namespace app {
+struct Tag {};
+Tag expected, ordinary;
+Tag* malloc(int) { return &ordinary; }
+Tag* malloc(auto value);
+}
+auto* global = app::malloc<int>(7);
+auto* local() {
+    auto* p = app::malloc<int>(7);
+    return p;
+}
+namespace app {
+Tag* malloc(auto value) { return &expected; }
+}
+"#,
+    )]);
+    assert_allocator_return_candidates(dir.path(), &["expected"]);
+}
+
+#[test]
+fn allocator_template_ids_accept_abbreviated_static_members() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {};
+Tag expected, ordinary;
+struct Alloc {
+    static Tag* malloc(int) { return &ordinary; }
+    static Tag* malloc(auto value) { return &expected; }
+};
+struct DeferredAlloc {
+    static Tag* malloc(auto value);
+};
+Tag* global = Alloc::malloc<int>(7);
+auto* local() {
+    auto* p = DeferredAlloc::malloc<int>(7);
+    return p;
+}
+Tag* DeferredAlloc::malloc(auto value) { return &expected; }
+"#,
+    )]);
+    assert_allocator_return_candidates(dir.path(), &["expected"]);
+}
+
+#[test]
+fn allocator_template_ids_select_static_member_specializations() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+struct Tag {};
+Tag primary, specialized;
+struct Alloc {
+    template<class... P>
+    static Tag* malloc(P... args, int value) { return &primary; }
+};
+template<> Tag* Alloc::malloc(int value) { return &specialized; }
+auto* empty_id = Alloc::malloc<>(7);
+auto* nonempty_id = Alloc::malloc<long>(6L, 7);
+auto* local() {
+    auto* p = Alloc::malloc<>(7);
+    return p;
+}
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for (var, tag) in [
+        (only_variable(&program, "empty_id"), "specialized"),
+        (only_variable(&program, "nonempty_id"), "primary"),
+        (local_variable(&program, "local", "p"), "specialized"),
+    ] {
+        let expected = pag.var_location[&only_variable(&program, tag)];
+        let pointees: Vec<_> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(pointees, [expected], "expected {tag}");
+    }
+}
+
+#[test]
+fn allocator_specialization_can_belong_to_an_explicit_class_specialization() {
+    let dir = scratch(&[(
+        "owner.cpp",
+        r#"
+struct Tag {};
+Tag primary, specialized;
+namespace app {
+template<class T> struct Alloc;
+template<class T> struct OtherAlloc {
+    static Tag* malloc(int value);
+};
+template<> struct OtherAlloc<int> {};
+template<> Tag* OtherAlloc<const int>::malloc(int value) { return &primary; }
+}
+template<> struct app::Alloc<int> {
+    template<class... P>
+    static Tag* malloc(P... args, int value) { return &primary; }
+};
+template<> Tag* app::Alloc<int>::malloc(int value) { return &specialized; }
+Tag* result = app::Alloc<int>::malloc<>(7);
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let ordinary = only_function(&program, "app::OtherAlloc::malloc");
+    assert!(program
+        .symbols
+        .function(ordinary)
+        .allocator_specialization_args()
+        .is_none());
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let dst = only_variable(&program, "result");
+    let expected = pag.var_location[&only_variable(&program, "specialized")];
+    assert_eq!(result.points_to[&pag.var_node[&dst]].len(), 1);
+    assert!(result.points_to[&pag.var_node[&dst]].contains(&expected));
+}
+
+#[test]
+fn in_class_allocator_specialization_declaration_guides_cross_tu_return() {
+    let dir = scratch(&[
+        (
+            "alloc.hpp",
+            r#"
+#pragma once
+struct Tag {};
+inline Tag primary;
+struct Alloc {
+    template<class... P>
+    static Tag* malloc(P... args, int value) { return &primary; }
+    template<> Tag* malloc<>(int);
+};
+"#,
+        ),
+        (
+            "caller.cpp",
+            r#"
+#include "alloc.hpp"
+Tag* result = Alloc::malloc<>(7);
+"#,
+        ),
+        (
+            "impl.cpp",
+            r#"
+#include "alloc.hpp"
+Tag specialized;
+template<> Tag* Alloc::malloc<>(int value) { return &specialized; }
+"#,
+        ),
+    ]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    let dst = only_variable(&program, "result");
+    let expected = pag.var_location[&only_variable(&program, "specialized")];
+    assert_eq!(result.points_to[&pag.var_node[&dst]].len(), 1);
+    assert!(result.points_to[&pag.var_node[&dst]].contains(&expected));
+}
+
+fn assert_allocator_return_candidates(root: &std::path::Path, tags: &[&str]) {
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let (pag, result) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for var in [
+        only_variable(&program, "global"),
+        local_variable(&program, "local", "p"),
+    ] {
+        let pointees = &result.points_to[&pag.var_node[&var]];
+        assert_eq!(pointees.len(), tags.len(), "{pointees:?}");
+        for tag in tags {
+            let expected = pag.var_location[&only_variable(&program, tag)];
+            assert!(pointees.contains(&expected), "missing {tag}: {pointees:?}");
         }
     }
 }

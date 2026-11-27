@@ -7,9 +7,13 @@
 //! models") for semantics and the configuration format.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
+use std::borrow::Cow;
+use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
-use trace_ir::{ContainerModel, ContainerModels, Program};
+use trace_ir::{
+    CallOccurrence, CallReturnBinding, ContainerModel, ContainerModels, FnId, Function, Program,
+    TempKind, VarId,
+};
 
 /// One parameter relation of a function model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +279,8 @@ impl FnModel {
 #[derive(Debug, Default, Clone)]
 pub struct FnModelSet {
     by_name: FxHashMap<String, FnModel>,
+    /// Built-in models for C APIs that can share a name with C++ overloads.
+    c_api_models: FxHashSet<String>,
     /// Class → the model registered for its constructor (`C` → `C::C`).
     constructors: FxHashMap<String, String>,
     /// Member name → the qualified models of that name (`PostTask` →
@@ -402,10 +408,23 @@ impl FnModelSet {
         ] {
             reg(name, vec![Effect::Entry { context }]);
         }
-        reg("epoll_ctl", vec![Effect::EpollRegister { param: 3 }]);
-        for name in ["epoll_wait", "epoll_pwait", "epoll_pwait2"] {
-            reg(name, vec![Effect::EpollWait { param: 1 }]);
+        for n in ["zalloc", "kmalloc", "OsalMemAlloc", "OsalMemCalloc"] {
+            reg(n, vec![Effect::ReturnHeap]);
         }
+        for n in ["dlsym", "dlvsym", "GetProcAddress"] {
+            reg(n, vec![Effect::Dlsym { name_param: 1 }]);
+        }
+        let mut reg = |name: &str, effects| {
+            set.register(FnModel::new(name, effects));
+            set.c_api_models.insert(name.to_owned());
+        };
+        for name in ["malloc", "calloc"] {
+            reg(name, vec![Effect::ReturnHeap]);
+        }
+        reg(
+            "realloc",
+            vec![Effect::ReturnAlias { param: 0 }, Effect::ReturnHeap],
+        );
         for n in ["memcpy", "memmove", "strcpy", "strncpy"] {
             reg(n, vec![Effect::MemCopy { dst: 0, src: 1 }]);
         }
@@ -423,22 +442,13 @@ impl FnModelSet {
         for n in ["memset", "memset_s"] {
             reg(n, vec![Effect::Clears { param: 0 }]);
         }
-        for n in [
-            "malloc",
-            "calloc",
-            "zalloc",
-            "kmalloc",
-            "OsalMemAlloc",
-            "OsalMemCalloc",
+        for (name, effect) in [
+            ("epoll_ctl", Effect::EpollRegister { param: 3 }),
+            ("epoll_wait", Effect::EpollWait { param: 1 }),
+            ("epoll_pwait", Effect::EpollWait { param: 1 }),
+            ("epoll_pwait2", Effect::EpollWait { param: 1 }),
         ] {
-            reg(n, vec![Effect::ReturnHeap]);
-        }
-        reg(
-            "realloc",
-            vec![Effect::ReturnAlias { param: 0 }, Effect::ReturnHeap],
-        );
-        for n in ["dlsym", "dlvsym", "GetProcAddress"] {
-            reg(n, vec![Effect::Dlsym { name_param: 1 }]);
+            reg(name, vec![effect]);
         }
         set
     }
@@ -496,10 +506,12 @@ impl FnModelSet {
             models: self,
             program,
             member_models: RefCell::default(),
+            allocation_targets: OnceCell::new(),
         }
     }
 
     pub fn register(&mut self, model: FnModel) {
+        self.c_api_models.remove(&model.name);
         if let Some((class, last)) = model.name.rsplit_once("::") {
             if class.rsplit("::").next() == Some(last) {
                 self.constructors
@@ -636,6 +648,60 @@ impl FnModel {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct AllocationTargets {
+    sites: FxHashMap<(FnId, VarId, Option<CallOccurrence>), Vec<FnId>>,
+    model_names: FxHashSet<String>,
+}
+
+impl AllocationTargets {
+    pub(crate) fn candidates(
+        &self,
+        program: &Program,
+        name: &str,
+        caller: Option<FnId>,
+        dst: VarId,
+        binding: Option<&CallReturnBinding>,
+    ) -> Cow<'_, [FnId]> {
+        let occurrence = match binding {
+            Some(CallReturnBinding::InitializerDeclarations(calls)) => {
+                let mut candidates = Vec::new();
+                let calls = calls.iter().map(|call| (call.callee, call.args.as_slice()));
+                for (callee, _) in
+                    program
+                        .symbols
+                        .initializer_call_targets(dst, calls, &program.types)
+                {
+                    if !candidates.contains(&callee) {
+                        candidates.push(callee);
+                    }
+                }
+                return Cow::Owned(candidates);
+            }
+            Some(CallReturnBinding::Occurrence(occurrence)) => Some(*occurrence),
+            None => None,
+        };
+        // Ordinary lookup can name a different namespace than the target
+        // selected by ADL. Its leaf identifies the allocation candidate index.
+        let name = if self.has_allocator_leaf(name) {
+            if let Some(selected) =
+                caller.and_then(|caller| self.sites.get(&(caller, dst, occurrence)))
+            {
+                return Cow::Borrowed(selected);
+            }
+            name.trim_start_matches("::")
+        } else {
+            name
+        };
+        Cow::Owned(program.symbols.call_return_candidates(caller, dst, name))
+    }
+
+    fn has_allocator_leaf(&self, name: &str) -> bool {
+        self.model_names
+            .contains(name.rsplit("::").next().unwrap_or(name))
+    }
+}
+
 /// The one matcher every model lookup of an analysis goes through
 /// (`docs/MODELS.md`, "Model matching"): the model named for the function
 /// (`FnModelSet::named`), else the member models of a class the
@@ -648,6 +714,8 @@ pub struct ModelLookup<'m> {
     /// Function name → the member models the class rule admits for it,
     /// nearest class first, then by model name.
     member_models: RefCell<FxHashMap<String, Vec<&'m FnModel>>>,
+    /// Lowering's selected targets for allocations with a recorded call site.
+    allocation_targets: OnceCell<Arc<AllocationTargets>>,
 }
 
 impl<'m> ModelLookup<'m> {
@@ -665,6 +733,115 @@ impl<'m> ModelLookup<'m> {
     pub fn model(&self, name: &str, group: EffectGroup) -> Option<&'m FnModel> {
         self.find(name, group, |model| model.has(group).then_some(()))
             .map(|(model, ())| model)
+    }
+
+    pub(crate) fn argument_model(&self, callee: &Function) -> Option<&'m FnModel> {
+        let model = self.model(&callee.name, EffectGroup::Args)?;
+        (!self.models.c_api_models.contains(&model.name) || Self::can_name_c_api(callee))
+            .then_some(model)
+    }
+
+    pub(crate) fn allocation_targets(&self) -> &Arc<AllocationTargets> {
+        self.allocation_targets
+            .get_or_init(|| Arc::new(self.collect_allocation_targets()))
+    }
+
+    pub(crate) fn return_model(
+        &self,
+        name: &str,
+        candidates: &[FnId],
+        selected: bool,
+    ) -> Option<(&'m FnModel, Option<&'m [VarId]>)> {
+        let model = self.model(name, EffectGroup::Return).or_else(|| {
+            // Ordinary lookup can name a different namespace from the
+            // allocator that won ADL. Only ranked targets can recover a
+            // built-in model whose name did not match the return fact.
+            if !selected || !self.has_allocator_leaf(name) {
+                return None;
+            }
+            candidates.iter().find_map(|&id| {
+                let callee = self.program.symbols.function(id);
+                (Self::can_name_c_api(callee) && self.is_builtin_allocator(&callee.name))
+                    .then(|| self.model(&callee.name, EffectGroup::Return))
+                    .flatten()
+            })
+        })?;
+        let guarded = self.models.c_api_models.contains(&model.name);
+        let mut eligible = candidates
+            .iter()
+            .map(|&id| self.program.symbols.function(id))
+            .filter(|callee| !guarded || Self::can_name_c_api(callee))
+            .peekable();
+        if !candidates.is_empty() && eligible.peek().is_none() {
+            return None;
+        }
+        let params = eligible
+            .find(|callee| !callee.params.is_empty())
+            .map(|callee| callee.params.as_slice());
+        Some((model, params))
+    }
+
+    fn is_builtin_allocator(&self, name: &str) -> bool {
+        self.models
+            .named(name, EffectGroup::Return)
+            .is_some_and(|model| {
+                self.models.c_api_models.contains(&model.name) && model.has(EffectGroup::Return)
+            })
+    }
+
+    fn has_allocator_leaf(&self, name: &str) -> bool {
+        self.is_builtin_allocator(name.rsplit("::").next().unwrap_or(name))
+    }
+
+    fn collect_allocation_targets(&self) -> AllocationTargets {
+        let mut targets = AllocationTargets {
+            model_names: self
+                .models
+                .c_api_models
+                .iter()
+                .filter(|name| self.is_builtin_allocator(name))
+                .cloned()
+                .collect(),
+            ..AllocationTargets::default()
+        };
+        if targets.model_names.is_empty() {
+            return targets;
+        }
+        for site in &self.program.symbols.call_sites {
+            let Some(dst) = site
+                .return_dst
+                .filter(|_| !site.unevaluated && site.callee_var.is_none())
+            else {
+                continue;
+            };
+            let spelling = site.callee_name.as_str();
+            // Additional ranked overloads of the same call site append
+            // their numeric ID to the spelling.
+            let name = spelling
+                .rsplit_once("::")
+                .filter(|(_, suffix)| suffix.parse::<u32>().is_ok())
+                .map_or(spelling, |(name, _)| name);
+            // ADL can select a namespace's own overload even when the
+            // return fact names the global allocator from ordinary lookup.
+            if !targets.has_allocator_leaf(name) {
+                continue;
+            }
+            let occurrence = (self.program.symbols.variable(dst).temp
+                != Some(TempKind::ReturnedCall))
+            .then(|| site.occurrence());
+            targets
+                .sites
+                .entry((site.caller, dst, occurrence))
+                .or_default()
+                .extend(self.program.callees_of(site));
+        }
+        targets
+    }
+
+    fn can_name_c_api(callee: &Function) -> bool {
+        // Calls without a declaration may still name a C API outside the
+        // index. A declared C++ overload has its own linker symbol.
+        !callee.is_cpp || callee.c_linkage || callee.explicit_arity.is_none()
     }
 
     /// The `entry` model the function named `name` is the member of or an

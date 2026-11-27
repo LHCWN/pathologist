@@ -415,10 +415,113 @@ pub struct InitializerOrigin {
 
 /// The binding operator and known top-level qualification of a referent.
 /// Unknown qualification (for example through an opaque alias) proves nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConstructorReference {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceParameter {
     pub rvalue: bool,
     pub is_const: Option<bool>,
+    /// Const qualification of the pointee when the referent is a raw pointer.
+    pub pointee_const: Option<bool>,
+}
+
+impl ReferenceParameter {
+    pub(crate) fn compatible_with(self, other: Self) -> bool {
+        self.rvalue == other.rvalue
+            && self
+                .is_const
+                .zip(other.is_const)
+                .is_none_or(|(a, b)| a == b)
+            && self
+                .pointee_const
+                .zip(other.pointee_const)
+                .is_none_or(|(a, b)| a == b)
+    }
+}
+
+const SIGNATURE_REFERENCES: &str = " [refs=";
+
+/// Record written bindings separately from the signature's storage types.
+/// A by-value marker disambiguates pointers from references with the same
+/// IR storage type. The suffix is absent when no such facts are available.
+pub fn append_signature_references(
+    signature: &mut String,
+    bindings: impl Iterator<Item = (Option<ReferenceParameter>, bool)> + Clone,
+) {
+    if !bindings
+        .clone()
+        .any(|(reference, value)| reference.is_some() || value)
+    {
+        return;
+    }
+    signature.push_str(SIGNATURE_REFERENCES);
+    for (index, (reference, value)) in bindings.enumerate() {
+        if index > 0 {
+            signature.push(',');
+        }
+        if let Some(reference) = reference {
+            match reference.is_const {
+                Some(true) => signature.push_str("const"),
+                Some(false) => {}
+                None => signature.push('?'),
+            }
+            signature.push_str(if reference.rvalue { "&&" } else { "&" });
+            match reference.pointee_const {
+                Some(true) => signature.push_str(":c"),
+                Some(false) => signature.push_str(":m"),
+                None => {}
+            }
+        } else if value {
+            signature.push_str("value");
+        } else {
+            signature.push('-');
+        }
+    }
+    signature.push(']');
+}
+
+/// Read the storage-type signature and the optional written binding facts.
+pub fn split_signature_references(signature: &str) -> (&str, &str) {
+    signature
+        .strip_suffix(']')
+        .and_then(|s| s.rsplit_once(SIGNATURE_REFERENCES))
+        .unwrap_or((signature, ""))
+}
+
+/// Missing facts, including all reference information in older databases,
+/// leave an overload compatible for name or storage-signature fallback.
+/// Compare only shared slots here. Exact storage matching checks arity as
+/// part of the signature; name fallback can consider differently shaped
+/// declarations when the two databases disagree about their storage types.
+pub fn signature_references_compatible(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+    let reference = |spelling: &str| {
+        let (spelling, pointee_const) = match spelling.rsplit_once(':') {
+            Some((binding, "c")) => (binding, Some(true)),
+            Some((binding, "m")) => (binding, Some(false)),
+            _ => (spelling, None),
+        };
+        let rvalue = spelling.ends_with("&&");
+        let qualifier = spelling.strip_suffix(if rvalue { "&&" } else { "&" })?;
+        let is_const = match qualifier {
+            "const" => Some(true),
+            "" => Some(false),
+            _ => None,
+        };
+        Some(ReferenceParameter {
+            rvalue,
+            is_const,
+            pointee_const,
+        })
+    };
+    a.split(',')
+        .zip(b.split(','))
+        .all(|(a, b)| match (reference(a), reference(b)) {
+            (Some(a), Some(b)) => a.compatible_with(b),
+            (Some(_), None) => b != "value",
+            (None, Some(_)) => a != "value",
+            (None, None) => true,
+        })
 }
 
 /// Known explicit parameter types of an own constructor that may hide an
@@ -430,7 +533,7 @@ pub struct ConstructorSignature {
     /// Source-level parameter types retain cv and reference categories that
     /// the value-flow descriptors erase. Missing syntax cannot prove hiding.
     pub parameter_syntax: Vec<Option<Arc<str>>>,
-    pub reference_forms: Vec<Option<ConstructorReference>>,
+    pub reference_forms: Vec<Option<ReferenceParameter>>,
     pub declaration: Option<(Arc<std::path::PathBuf>, u32, u32)>,
     pub variadic: bool,
     pub default_args: u32,
@@ -562,12 +665,12 @@ impl std::fmt::Debug for ByAddress {
     }
 }
 
-/// Const qualification of a declared entity, alias, or return type: whether
-/// the top-level object/referent is `const`, and for a pointer or smart-pointer
-/// wrapper whether its immediate pointee is `const`.
+/// Qualification of a declared entity, alias, or return type. Tracks const
+/// and volatile on the object or referent, and const on the immediate pointee.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CvQualification {
     pub object_const: bool,
+    pub object_volatile: bool,
     pub pointee_const: Option<bool>,
 }
 
@@ -628,6 +731,8 @@ pub struct TypeTable {
     /// specifier carried a body: a forward declaration says a name is a
     /// class, a definition says what its members are.
     defined_structs: FxHashSet<std::sync::Arc<str>>,
+    /// Exact spellings of explicitly specialized C++ class owners.
+    explicit_class_specializations: FxHashSet<Arc<str>>,
     /// Class names lowering guessed for a type it could not resolve
     /// ([`note_guessed_class`](Self::note_guessed_class)): while no unit
     /// declares such a name, a descriptor of it registers no tag.
@@ -725,6 +830,7 @@ impl TypeTable {
         let mut table = Self {
             declared_structs: FxHashSet::default(),
             defined_structs: FxHashSet::default(),
+            explicit_class_specializations: FxHashSet::default(),
             guessed_tags: FxHashSet::default(),
             untagged: FxHashMap::default(),
             descriptors: descriptor_pool(),
@@ -1844,6 +1950,14 @@ impl TypeTable {
         self.defined_structs.contains(name)
     }
 
+    pub fn note_explicit_class_specialization(&mut self, owner: String) {
+        self.explicit_class_specializations.insert(owner.into());
+    }
+
+    pub fn has_explicit_class_specialization(&self, owner: &str) -> bool {
+        self.explicit_class_specializations.contains(owner)
+    }
+
     pub fn merge_struct_declarations(&mut self, other: &Self) {
         self.constructor_epoch += 1;
         for name in &other.declared_structs {
@@ -1853,6 +1967,10 @@ impl TypeTable {
             }
         }
         extend_missing(&mut self.defined_structs, &other.defined_structs);
+        extend_missing(
+            &mut self.explicit_class_specializations,
+            &other.explicit_class_specializations,
+        );
         extend_missing(&mut self.guessed_tags, &other.guessed_tags);
         for (specialization, element) in &other.template_element_types {
             if !self.template_element_types.contains_key(specialization) {

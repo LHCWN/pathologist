@@ -9,7 +9,7 @@ pub(crate) use target_merge::{merge_linked_units, record_link_targets};
 use trace_ir::CallSiteDetails;
 use trace_ir::{
     same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
-    ReturnFlow, TempKind, TemplateBase, TypeDesc, TypeId, VarId, Variable,
+    ReturnFlow, SymbolTable, TempKind, TemplateBase, TypeDesc, TypeId, VarId, Variable,
 };
 
 /// Per-file indexing result merged into a single [`Program`].
@@ -1603,7 +1603,7 @@ fn merge_unit(
         if !valid_flow(flow) {
             continue;
         }
-        let remapped = remap_flow(flow, &fn_map, &var_map, &type_map);
+        let remapped = remap_flow(flow, &fn_map, &var_map, &type_map, &map_file);
         let shared_body = !shared_vars.is_empty() && flow.vars().any(|v| shared_vars.contains(&v));
         let seen = if shared_body {
             Some(&mut program.dedup.header_flow)
@@ -1691,18 +1691,17 @@ fn merges_body(program: &Program, mode: MergeMode, function: &Function) -> bool 
             || (function.linkage == trace_ir::Linkage::Internal && function.is_cpp))
 }
 
-fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
-    match flow {
+fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> + '_ {
+    let one = match flow {
         FlowConstraint::AddrOfFn { callee, .. }
         | FlowConstraint::ArrayFnMember { callee, .. }
-        | FlowConstraint::CallReturnResolved { callee, .. }
-        | FlowConstraint::CallReferenceReturnDeclared { callee, .. } => Some(*callee),
-        // A call follows the function it is written in: dropped with it in
-        // `valid_flow`, replayed with it in `MergeMode::SymbolsOnly`.
+        | FlowConstraint::CallReturnResolved { callee, .. } => Some(*callee),
+        // A call follows the function it is written in.
         FlowConstraint::CallReturn { caller, .. } => *caller,
         _ => None,
-    }
-    .into_iter()
+    };
+    one.into_iter()
+        .chain(flow.initializer_calls().map(|(id, _)| id))
 }
 
 fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> {
@@ -1919,6 +1918,7 @@ fn respelled_declarations(
                         && f.ref_qualifier == declaration.ref_qualifier
                         && f.is_member_template == declaration.is_member_template
                         && arity(f) == arity(declaration)
+                        && SymbolTable::references_alike(f, declaration)
                 })
                 .collect();
             let only = |same: &dyn Fn(TypeId, TypeId) -> bool| {
@@ -1951,6 +1951,7 @@ fn remap_flow(
     fn_map: &FxHashMap<FnId, FnId>,
     var_map: &FxHashMap<VarId, VarId>,
     type_map: &[TypeId],
+    map_file: &impl Fn(trace_ir::FileId) -> trace_ir::FileId,
 ) -> FlowConstraint {
     let rv = |v: VarId| var_map.get(&v).copied().unwrap_or(v);
     let rf = |f: FnId| fn_map.get(&f).copied().unwrap_or(f);
@@ -2012,11 +2013,42 @@ fn remap_flow(
             dst,
             callee_name,
             caller,
-        } => FlowConstraint::CallReturn {
-            dst: rv(*dst),
-            callee_name: callee_name.clone(),
-            caller: caller.map(rf),
-        },
+            binding,
+        } => {
+            use trace_ir::CallReturnBinding;
+            FlowConstraint::CallReturn {
+                dst: rv(*dst),
+                callee_name: callee_name.clone(),
+                caller: caller.map(rf),
+                binding: binding.as_deref().map(|binding| {
+                    Box::new(match binding {
+                        CallReturnBinding::Occurrence(occurrence) => {
+                            let mut occurrence = *occurrence;
+                            occurrence.span.file = map_file(occurrence.span.file);
+                            if let Some(span) = &mut occurrence.expansion_span {
+                                span.file = map_file(span.file);
+                            }
+                            CallReturnBinding::Occurrence(occurrence)
+                        }
+                        CallReturnBinding::InitializerDeclarations(declarations) => {
+                            CallReturnBinding::InitializerDeclarations(
+                                declarations
+                                    .iter()
+                                    .map(|call| trace_ir::InitializerCall {
+                                        callee: rf(call.callee),
+                                        args: call
+                                            .args
+                                            .iter()
+                                            .map(|&(index, var)| (index, rv(var)))
+                                            .collect(),
+                                    })
+                                    .collect(),
+                            )
+                        }
+                    })
+                }),
+            }
+        }
         FlowConstraint::CallReturnResolved { dst, callee } => FlowConstraint::CallReturnResolved {
             dst: rv(*dst),
             callee: rf(*callee),
@@ -2271,7 +2303,7 @@ mod tests {
             src: VarId(2),
         };
         assert_eq!(
-            remap_flow(&flow, &FxHashMap::default(), &var_map, &[]),
+            remap_flow(&flow, &FxHashMap::default(), &var_map, &[], &|file| file),
             FlowConstraint::UnwrapPointer {
                 dst: VarId(11),
                 src: VarId(12),
@@ -2466,6 +2498,7 @@ mod tests {
         let element_cv = trace_ir::CvQualification {
             object_const: false,
             pointee_const: Some(true),
+            ..Default::default()
         };
         header.register_template_element(specialization, element.clone(), element_cv);
         header.complete_nested_tags();
@@ -2752,11 +2785,17 @@ mod tests {
                 explicit_arity: Some(1),
                 default_args: 0,
                 reference_params: Vec::new(),
+                parameter_references: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
                 pack_positions: Vec::new(),
+                non_deduced_pack: false,
+                is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
+                is_free_function_template: false,
+                allocator_template: None,
                 is_member_template: false,
                 is_const_member: false,
                 ref_qualifier: None,
@@ -2839,11 +2878,17 @@ mod tests {
             explicit_arity: Some(1),
             default_args: 0,
             reference_params: Vec::new(),
+            parameter_references: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
+            is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
+            is_free_function_template: false,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -2973,11 +3018,17 @@ mod tests {
             explicit_arity: Some(0),
             default_args: 0,
             reference_params: Vec::new(),
+            parameter_references: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
+            is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
+            is_free_function_template: false,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -3087,11 +3138,17 @@ mod tests {
                 explicit_arity: Some(0),
                 default_args: 0,
                 reference_params: Vec::new(),
+                parameter_references: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
                 pack_positions: Vec::new(),
+                non_deduced_pack: false,
+                is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
+                is_free_function_template: false,
+                allocator_template: None,
                 is_member_template: false,
                 is_const_member: false,
                 ref_qualifier: None,
@@ -3164,11 +3221,17 @@ mod tests {
             explicit_arity: Some(arity),
             default_args: 0,
             reference_params: Vec::new(),
+            parameter_references: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
+            is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
+            is_free_function_template: false,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -3408,11 +3471,17 @@ mod tests {
             explicit_arity: Some(0),
             default_args: 0,
             reference_params: Vec::new(),
+            parameter_references: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
+            is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
+            is_free_function_template: false,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -3662,11 +3731,17 @@ mod tests {
                 explicit_arity: Some(0),
                 default_args: 0,
                 reference_params: Vec::new(),
+                parameter_references: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
                 pack_positions: Vec::new(),
+                non_deduced_pack: false,
+                is_explicit_constructor: false,
                 defaulted_in_class: false,
+                is_deleted: false,
                 declared_in_class: false,
+                is_free_function_template: false,
+                allocator_template: None,
                 is_member_template: false,
                 is_const_member: false,
                 ref_qualifier: None,

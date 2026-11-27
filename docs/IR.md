@@ -125,7 +125,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `Store { dst, src }` | store through pointer | `*p = y`, `field = val` |
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
 | `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
-| `CallReturn { dst, callee_name, caller }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer) | `p = GetOps()`; `void *g = GetOps();` |
+| `CallReturn { dst, callee_name, caller, binding }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer). Allocation calls can retain the body call's source occurrence or the file-scope initializer's selected declarations. | `p = GetOps()`; `void *g = GetOps();` |
 | `CallReturnResolved { dst, callee }` | return from an exact selected function | selected free arrow-star overload or post-merge file-scope getter return |
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
@@ -145,6 +145,33 @@ Integer zero/`NULL` spellings and omitted defaults are not materialized by this
 explicit C++ `nullptr` rule.
 
 ### Return-value flow
+
+A direct allocation return can preserve overload selection. In a function
+body the occurrence identifies the call site's selected targets. At file scope
+lowering ranks overloads with the same argument types as body calls, including
+explicit casts. A template-id, including one with an empty argument list,
+restricts allocator candidates to templates and explicit specializations
+before ranking at file scope and in function bodies. A function with a
+placeholder parameter type is an abbreviated template and can bind a
+template-id without a written template parameter list. Known differences in
+explicit template argument types or integral literal values rule out a
+specialization before arity ranking, including for static member templates.
+An in-class declaration of a member specialization can select its definition
+in another translation unit. When recognizing an out-of-class specialization,
+an explicitly specialized owner does not consume a template prefix.
+Integral literals also retain their
+deduced type for `auto` template parameters. Each uncertain specialization
+is ranked independently alongside the ordinary candidates. A separate pass
+with no uncertain specializations preserves the primary when those matches
+fail. Calls without a template-id also treat retained specializations as
+uncertain. With one primary whose single pack
+expands into the function parameter list, a specialization's parameter
+count bounds its template argument count. Unknown or omitted arguments
+retain possible matches. Lowering retains the
+selected C++ declarations and the values lowered for each explicit formal slot. Lowering aligns written actuals across
+pack slots before choosing an address or a value. Omitted defaults bind
+directly to their own formal slots. PAG construction matches the declarations
+in the destination's file and link target before wiring and expanding returns. Export uses the same targets to attribute argument and return flow.
 
 When only a callee name is available, file-scope direct reference-getter
 addresses use `CallReferenceReturn { dst, callee_name }`. PAG construction
@@ -329,7 +356,40 @@ subDev->subDevOps = GetSensorDeviceOps();  // return &g_sensorDeviceOps
 subDev.subDevOps->setConfig(subDev);
 ```
 
-Nested call arguments (`consume(make())`, `Register(obj->GetHandler())`, `consume(table[i]())`, `std::move(make())`) materialize a temporary variable assigned via `CallReturn`, `CallReturnIndirect`, or member call return destinations, which is then passed as the actual argument into the outer call site, matching the semantics of `Callback f = make(); consume(f);` both within a translation unit and across units. Member call returns (`consume(obj->GetHandler())`, `consume(base->virtual_method())`, `x = obj->method()`, `return obj->method()`) are classified as `ResolvedCallReturn::Member` during lowering: candidate methods are ranked by argument count and overload resolution (`rank_per_class`), attaching `return_dst` to the resulting `CallSite`. Class Hierarchy Analysis (`expand_virtual_overrides`) replicates `return_dst` across all concrete derived overrides, and `Pag::expand_call_site_returns` expands return flows into `return_dst` across all candidates and overrides at PAG construction time, properly connecting return values from derived implementations (including pure virtual base interface declarations `= 0`). Candidate grouping, visited cycle-guards, and model fallback decisions are scoped to each syntactic call occurrence (`(dst_var, caller, occurrence)`), ensuring a real return from one call does not suppress models for a separate bodyless call assigning the same variable. Only qualified `std::move` and `std::forward` invocations (`std::` or `::std::`) with forwarding reference semantics (`T&&`) are treated as rvalue cast expressions in `peel_casts`, preserving ordinary user-defined `move` and `forward` functions. Returned call expressions (`return make()`, `return (*factory)()`, `return obj->method()`) resolve through the shared `resolve_call_for_return`, ensuring indirect and member call returns materialize into temporaries with `ReturnFlow::Copy` and preventing local variable or field names from leaking into direct function resolution. Temporaries are allocated only after confirming resolution, preventing orphaned variables in symbol tables.
+Nested call arguments (`consume(make())`, `Register(obj->GetHandler())`, `consume(table[i]())`, `std::move(make())`) materialize a temporary variable assigned via `CallReturn`, `CallReturnIndirect`, or member call return destinations, which is then passed as the actual argument into the outer call site, matching the semantics of `Callback f = make(); consume(f);` both within a translation unit and across units. Member call returns (`consume(obj->GetHandler())`, `consume(base->virtual_method())`, `x = obj->method()`, `return obj->method()`) are classified as `ResolvedCallReturn::Member` during lowering: candidate methods are ranked by argument count and overload resolution (`rank_per_class`), attaching `return_dst` to the resulting `CallSite`. Class Hierarchy Analysis (`expand_virtual_overrides`) replicates `return_dst` across all concrete derived overrides, and `Pag::expand_call_site_returns` expands return flows into `return_dst` across all candidates and overrides at PAG construction time, properly connecting return values from derived implementations (including pure virtual base interface declarations `= 0`). Candidate grouping, visited cycle-guards, and model fallback decisions are scoped to each syntactic call occurrence (`(dst_var, caller, occurrence)`), ensuring a real return from one call does not suppress models for a separate bodyless call assigning the same variable. Returned call expressions (`return make()`, `return (*factory)()`, `return obj->method()`) resolve through the shared `resolve_call_for_return`, ensuring indirect and member call returns materialize into temporaries with `ReturnFlow::Copy` and preventing local variable or field names from leaking into direct function resolution. Temporaries are allocated only after confirming resolution, preventing orphaned variables in symbol tables.
+
+Value lowering peels [standard move and forward calls](CXX.md#c-support-first-step)
+to their operand. Argument ranking retains the known lvalue or rvalue
+category and referent qualification. Parameter metadata uses the
+collapsed reference category for declarations such as `Ref&&` with
+`using Ref = T&`. Pointer-reference parameters keep this category and known
+pointee constness in overload metadata even when lowered as pointer values
+for flow analysis. For member calls ranking checks receiver viability before
+preferring an argument binding. Base qualifiers resolve in their lexical scope, with a leading
+`::` starting lookup at global scope. Result type and constness inference
+share the receiver and reference viability checks. Default arguments come from declarations
+matching the selected member overload. Reference viability also checks direct
+bindings to base subobjects. Virtual dispatch expands the overload selected
+from the static receiver's declarations to its override family.
+A same-class glvalue such as a named object, member access, reference-returning
+call, or conditional glvalue converted to a common base selects a copy or move
+constructor when it initializes an object. Constructors eligible for implicit
+conversion participate in selection, including defaulted and deleted overloads.
+When a winning defaulted move may be implicitly deleted because of its
+subobjects, lowering also considers the overloads that could win without it.
+An own move-assignment declaration on a subobject can suppress its implicit
+move constructor and delete its implicit copy constructor. The viability
+check reuses the result for layouts reached through multiple subobjects.
+A const class subobject requires a viable copy. A reference field can make
+that copy unavailable when the field is an rvalue reference.
+A class subobject declared `volatile` also prevents proving a viable move.
+The call graph records selected user-provided constructors. Reference
+declarations bind directly to the initializer, and same-type prvalues
+construct the destination directly under C++17 copy elision. Same-class assignments record
+declared copy or move `operator=` sites where a visible user-provided overload
+can accept a same-class argument and wins overload selection. Defaulted
+assignments participate in selection and have no synthetic call site. This
+supplements the existing may-flow for assignment.
 
 **`CallReturnIndirect`** is the indirect-call analogue of `CallReturn`. The callee is resolved by the solver when indirect call targets are known (via function-pointer analysis). The `callee_var` is a synthetic load variable that holds the resolved function pointer; the solver wires return flows from each resolved target into `dst`.
 

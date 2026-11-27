@@ -150,6 +150,41 @@ impl Variable {
     }
 }
 
+/// Concrete written arguments used to identify allocator specializations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllocatorTemplateArgument {
+    Type(String),
+    Integer(i128),
+    DeducedInteger(i128, IntegralLiteralType),
+}
+
+/// Integral literal types distinguished by non-type template deduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegralLiteralType {
+    Int,
+    UnsignedInt,
+    Long,
+    UnsignedLong,
+    LongLong,
+    UnsignedLongLong,
+}
+
+/// Extra declaration facts for matching allocator template-ids.
+#[derive(Debug, Clone)]
+pub enum AllocatorTemplate {
+    Primary {
+        /// Parameters which deduce the type of a non-type argument.
+        deduced_types: Box<[bool]>,
+        /// The final template parameter is a pack.
+        trailing_pack: bool,
+        /// The known layout expands the pack once into each function slot.
+        pack_expands_into_parameters: bool,
+    },
+    /// Written arguments before any unknown-length expansion, or an empty
+    /// slice when the specialization relies on deduction.
+    Specialization(Box<[Option<AllocatorTemplateArgument>]>),
+}
+
 #[derive(Debug, Clone)]
 pub struct Function {
     pub id: FnId,
@@ -202,10 +237,17 @@ pub struct Function {
     /// have uncertain actual positions because each pack may be empty
     /// (docs/POINTERS.md, "Variadic parameter packs").
     pub pack_positions: Vec<u32>,
+    /// A single non-terminal pack of a free function template whose fixed
+    /// parameter spellings cannot deduce its length.
+    pub non_deduced_pack: bool,
     /// A constructor declared `= default` or `= delete` in its class body. It
     /// is not user-provided, so the class is still an aggregate (C++17) and
     /// braces initialize its fields rather than call it.
     pub defaulted_in_class: bool,
+    /// An explicitly deleted function (`= delete`).
+    pub is_deleted: bool,
+    /// A constructor with a known true or unconditional explicit specifier.
+    pub is_explicit_constructor: bool,
     /// Declared in its class body: a member, whatever its parameter list
     /// shows. An in-class prototype lowers no parameter variables, so this is
     /// the only record that a parameterless entry is a member rather than a
@@ -216,6 +258,9 @@ pub struct Function {
     /// non-template that is as good a match, so an inherited non-template a
     /// class body imports can win over it.
     pub is_member_template: bool,
+    /// A namespace-scope function template eligible for a template-id call.
+    pub is_free_function_template: bool,
+    pub allocator_template: Option<Box<AllocatorTemplate>>,
     /// Declared `static` in its class body: a member with no receiver. Its
     /// entry still takes a `this` slot ([`SymbolTable::has_this_param`]), as
     /// every member's does; this is what tells a static member's unused one
@@ -246,6 +291,8 @@ pub struct Function {
     /// reference parameter from a value one before any body is seen
     /// (docs/IR.md, "Dereferenced operands").
     pub reference_params: Vec<bool>,
+    /// Written reference category and referent cv at explicit parameter positions.
+    pub parameter_references: Vec<Option<crate::ReferenceParameter>>,
     /// Declared `virtual` (C++ methods). Virtual dispatch expansion treats a
     /// method as virtual if *any* entry with its qualified name carries this
     /// flag, so out-of-class definitions without the token still participate.
@@ -269,7 +316,106 @@ pub struct Function {
     pub tu: Option<crate::FileId>,
 }
 
+fn specialization_arguments_agree(
+    a: &[Option<AllocatorTemplateArgument>],
+    b: &[Option<AllocatorTemplateArgument>],
+) -> bool {
+    a.iter().zip(b).all(|(a, b)| {
+        a.as_ref().zip(b.as_ref()).is_none_or(|(a, b)| {
+            use AllocatorTemplateArgument::{DeducedInteger, Integer};
+            match (a, b) {
+                (Integer(a), DeducedInteger(b, _)) | (DeducedInteger(a, _), Integer(b)) => a == b,
+                _ => a == b,
+            }
+        })
+    })
+}
+
 impl Function {
+    pub fn is_function_template(&self) -> bool {
+        self.is_free_function_template || self.is_member_template
+    }
+
+    /// Whether a written template-id can denote this declaration.
+    pub fn can_bind_template_id(&self) -> bool {
+        self.is_function_template() || self.allocator_specialization_args().is_some()
+    }
+
+    pub fn allocator_specialization_args(&self) -> Option<&[Option<AllocatorTemplateArgument>]> {
+        match self.allocator_template.as_deref()? {
+            AllocatorTemplate::Specialization(args) => Some(args),
+            AllocatorTemplate::Primary { .. } => None,
+        }
+    }
+
+    pub fn template_argument_deduces_type(&self, slot: usize) -> bool {
+        let Some(AllocatorTemplate::Primary {
+            deduced_types,
+            trailing_pack,
+            ..
+        }) = self.allocator_template.as_deref()
+        else {
+            return false;
+        };
+        deduced_types
+            .get(slot)
+            .or_else(|| deduced_types.last().filter(|_| *trailing_pack))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether a specialization matches a written template-id. Unknown
+    /// arguments and incomplete lists must not displace the primary.
+    pub fn specialization_matches_template_args(
+        &self,
+        written: &[Option<AllocatorTemplateArgument>],
+        primary: Option<&Self>,
+    ) -> Option<bool> {
+        let Some(args) = self.allocator_specialization_args() else {
+            return Some(true);
+        };
+        let limit = primary.and_then(|primary| {
+            let AllocatorTemplate::Primary {
+                deduced_types,
+                trailing_pack,
+                pack_expands_into_parameters,
+            } = primary.allocator_template.as_deref()?
+            else {
+                return None;
+            };
+            let limit = if *trailing_pack {
+                if !pack_expands_into_parameters {
+                    return None;
+                }
+                let elements = self.explicit_arity?.checked_sub(primary.explicit_arity?)?;
+                deduced_types.len() - 1 + elements as usize
+            } else {
+                deduced_types.len()
+            };
+            (limit >= args.len()).then_some(limit)
+        });
+        if limit.is_some_and(|limit| written.len() > limit)
+            || !specialization_arguments_agree(args, written)
+        {
+            return Some(false);
+        }
+        (limit == Some(written.len())
+            && args.len() == written.len()
+            && args.iter().zip(written).all(|(a, b)| a.is_some() && a == b))
+        .then_some(true)
+    }
+
+    fn same_allocator_specialization(&self, other: &Self) -> bool {
+        match (
+            self.allocator_specialization_args(),
+            other.allocator_specialization_args(),
+        ) {
+            (Some(a), Some(b)) => specialization_arguments_agree(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Check the declaration-order pack slots shared by type lookup and wiring.
     pub fn debug_assert_pack_positions(&self, implicit_params: usize) {
         debug_assert!(
@@ -290,6 +436,46 @@ impl Function {
             "{}: parameter pack position is outside the parameter list",
             self.name
         );
+    }
+
+    /// Each stored formal, its first possible actual slot, and whether it
+    /// is a pack. Slots include the implicit receiver when one is stored.
+    /// A pack or a formal shifted by earlier packs can take later slots too.
+    pub fn parameter_actual_starts(
+        &self,
+        implicit_params: u32,
+    ) -> impl Iterator<Item = (VarId, u32, bool)> + '_ {
+        self.debug_assert_pack_positions(implicit_params as usize);
+        self.params
+            .iter()
+            .copied()
+            .zip(self.actual_starts(self.params.len(), implicit_params))
+            .map(|(formal, (first, is_pack))| (formal, first, is_pack))
+    }
+
+    /// First possible actual slots for explicit parameters, including on
+    /// prototypes whose formal variables have yet to be merged.
+    pub fn explicit_parameter_actual_starts(&self) -> impl Iterator<Item = (u32, bool)> + '_ {
+        self.actual_starts(self.reference_params.len(), 0)
+    }
+
+    fn actual_starts(
+        &self,
+        slots: usize,
+        implicit_params: u32,
+    ) -> impl Iterator<Item = (u32, bool)> + '_ {
+        let mut packs = self
+            .pack_positions
+            .iter()
+            .map(move |at| at + implicit_params)
+            .peekable();
+        let mut packs_before = 0;
+        (0..slots as u32).map(move |index| {
+            let is_pack = packs.next_if_eq(&index).is_some();
+            let first = index - packs_before;
+            packs_before += u32::from(is_pack);
+            (first, is_pack)
+        })
     }
 
     /// Whether this declaration accepts the explicit argument count.
@@ -658,6 +844,31 @@ fn absorb_redeclaration(
     if existing.explicit_arity.is_none() || (variadic_read && !has_tail) {
         existing.reference_params = func.reference_params.clone();
     }
+    if existing.parameter_references.is_empty() {
+        existing
+            .parameter_references
+            .clone_from(&func.parameter_references);
+    } else {
+        if existing.parameter_references.len() < func.parameter_references.len() {
+            existing
+                .parameter_references
+                .resize(func.parameter_references.len(), None);
+        }
+        for (known, new) in existing
+            .parameter_references
+            .iter_mut()
+            .zip(&func.parameter_references)
+        {
+            match (known, new) {
+                (Some(known), Some(new)) => {
+                    known.is_const = known.is_const.or(new.is_const);
+                    known.pointee_const = known.pointee_const.or(new.pointee_const);
+                }
+                (known @ None, new) => *known = *new,
+                _ => {}
+            }
+        }
+    }
     if existing.explicit_arity.is_none() {
         existing.explicit_arity = func.explicit_arity;
     }
@@ -665,8 +876,11 @@ fn absorb_redeclaration(
     if existing.pack_positions.is_empty() {
         existing.pack_positions.clone_from(&func.pack_positions);
     }
+    existing.non_deduced_pack |= func.non_deduced_pack;
     // User-provided once any declaration of it is.
     existing.defaulted_in_class &= func.defaulted_in_class;
+    existing.is_deleted |= func.is_deleted;
+    existing.is_explicit_constructor |= func.is_explicit_constructor;
     existing.is_static_member |= func.is_static_member;
     existing.is_const_member |= func.is_const_member;
     if existing.ref_qualifier.is_none() {
@@ -677,6 +891,27 @@ fn absorb_redeclaration(
         existing.return_cv.pointee_const = func.return_cv.pointee_const;
     }
     existing.is_member_template |= func.is_member_template;
+    existing.is_free_function_template |= func.is_free_function_template;
+    match (
+        existing.allocator_template.as_deref_mut(),
+        func.allocator_template.as_deref(),
+    ) {
+        (
+            Some(AllocatorTemplate::Specialization(known)),
+            Some(AllocatorTemplate::Specialization(new)),
+        ) => {
+            let mut combined = known.to_vec();
+            combined.resize(combined.len().max(new.len()), None);
+            for (known, new) in combined.iter_mut().zip(new.iter()) {
+                if known.is_none() {
+                    known.clone_from(new);
+                }
+            }
+            *known = combined.into_boxed_slice();
+        }
+        (None, Some(new)) => existing.allocator_template = Some(Box::new(new.clone())),
+        _ => {}
+    }
     existing.default_args = existing.default_args.max(func.default_args);
     existing.is_virtual |= func.is_virtual;
     existing.is_final |= func.is_final;
@@ -2026,7 +2261,9 @@ impl SymbolTable {
                     // declarations too.
                     if existing.is_const_member != func.is_const_member
                         || existing.ref_qualifier != func.ref_qualifier
+                        || !Self::reference_forms_alike(existing, func)
                         || existing.is_member_template != func.is_member_template
+                        || !existing.same_allocator_specialization(func)
                     {
                         return false;
                     }
@@ -2219,6 +2456,9 @@ impl SymbolTable {
         types: &crate::TypeTable,
         tolerance: SpellingTolerance,
     ) -> Option<bool> {
+        if !Self::reference_forms_alike(a, b) {
+            return Some(false);
+        }
         let (a, b) = (self.explicit_params(a)?, self.explicit_params(b)?);
         self.explicit_params_alike_with(&a, &b, types, tolerance)
     }
@@ -2454,12 +2694,29 @@ impl SymbolTable {
     /// which an override binds. A side that recorded none, having read no
     /// declaration, agrees with any.
     pub fn references_alike(a: &Function, b: &Function) -> bool {
-        a.reference_params.is_empty()
-            || b.reference_params.is_empty()
-            || a.reference_params
+        Self::reference_forms_alike(a, b)
+            && a.reference_params
                 .iter()
                 .zip(&b.reference_params)
                 .all(|(x, y)| x == y)
+    }
+
+    fn reference_forms_alike(a: &Function, b: &Function) -> bool {
+        let form = |f: &Function, i| f.parameter_references.get(i).copied().flatten();
+        (0..a
+            .parameter_references
+            .len()
+            .max(b.parameter_references.len()))
+            .all(|i| {
+                match (form(a, i), form(b, i)) {
+                    (Some(x), Some(y)) => x.compatible_with(y),
+                    // A written pointer reference may use value storage. Check
+                    // the binding only on the side without a written form.
+                    (Some(_), None) => b.reference_params.get(i) != Some(&false),
+                    (None, Some(_)) => a.reference_params.get(i) != Some(&false),
+                    (None, None) => true,
+                }
+            })
     }
 
     /// Type of a parameter variable, for overload signature comparison.
@@ -3020,6 +3277,7 @@ impl SymbolTable {
             |id| {
                 let candidate = self.function(id);
                 selected.variadic == candidate.variadic
+                    && selected.same_allocator_specialization(candidate)
                     && selected
                         .explicit_arity
                         .zip(candidate.explicit_arity)
@@ -3043,8 +3301,23 @@ impl SymbolTable {
         candidates
     }
 
-    /// Explicit initializer arguments bound to a selected definition's
-    /// parameter variables, past a member's implicit receiver.
+    /// Match selected initializer declarations in the destination's context,
+    /// carrying the actuals lowered for each declaration to its targets.
+    pub fn initializer_call_targets<'a>(
+        &'a self,
+        dst: VarId,
+        calls: impl Iterator<Item = (FnId, &'a [(u32, VarId)])> + 'a,
+        types: &'a crate::TypeTable,
+    ) -> impl Iterator<Item = (FnId, &'a [(u32, VarId)])> + 'a {
+        calls.flat_map(move |(declaration, args)| {
+            self.initializer_declaration_candidates(dst, declaration, types)
+                .into_iter()
+                .map(move |callee| (callee, args))
+        })
+    }
+
+    /// Initializer arguments already aligned to explicit formal slots by
+    /// lowering, mapped to the selected definition's parameter variables.
     pub fn initializer_argument_bindings<'a>(
         &'a self,
         callee: FnId,
@@ -3052,10 +3325,10 @@ impl SymbolTable {
     ) -> impl Iterator<Item = (VarId, VarId)> + 'a {
         let function = self.function(callee);
         let first = usize::from(self.has_this_param(callee));
-        args.iter().filter_map(move |&(index, actual)| {
+        args.iter().filter_map(move |&(slot, actual)| {
             function
                 .params
-                .get(first + index as usize)
+                .get(first + slot as usize)
                 .map(|&formal| (formal, actual))
         })
     }
@@ -3252,7 +3525,9 @@ impl SymbolTable {
                     if both_cpp
                         && (f.is_const_member != cand.is_const_member
                             || f.ref_qualifier != cand.ref_qualifier
-                            || f.is_member_template != cand.is_member_template)
+                            || !Self::reference_forms_alike(f, cand)
+                            || f.is_member_template != cand.is_member_template
+                            || !f.same_allocator_specialization(cand))
                     {
                         return false;
                     }
@@ -3468,6 +3743,7 @@ impl SymbolTable {
                             && a.is_const_member == b.is_const_member
                             && a.ref_qualifier == b.ref_qualifier
                             && a.is_member_template == b.is_member_template
+                            && a.same_allocator_specialization(b)
                             && Self::references_alike(a, b)
                             && self.explicit_params_alike(
                                 a,
@@ -4935,11 +5211,17 @@ mod tests {
             explicit_arity: None,
             default_args: 0,
             reference_params: Vec::new(),
+            parameter_references: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             pack_positions: Vec::new(),
+            non_deduced_pack: false,
+            is_explicit_constructor: false,
             defaulted_in_class: false,
+            is_deleted: false,
             declared_in_class: false,
+            is_free_function_template: false,
+            allocator_template: None,
             is_member_template: false,
             is_const_member: false,
             ref_qualifier: None,
@@ -5328,6 +5610,35 @@ mod tests {
                 .add_function_with_param_types(on_control, Some(&[control]), Some(&p.types));
         assert_ne!(control_id, data_id, "distinct tags are distinct overloads");
         assert_eq!(p.symbols.externals_by_name["send"].len(), 2);
+    }
+
+    #[test]
+    fn a_redeclaration_supplies_missing_trailing_reference_forms() {
+        let mut symbols = SymbolTable::default();
+        let file = FileId(1);
+        let lvalue = crate::ReferenceParameter {
+            rvalue: false,
+            is_const: Some(false),
+            pointee_const: None,
+        };
+        let rvalue = crate::ReferenceParameter {
+            rvalue: true,
+            ..lvalue
+        };
+        let mut first = fake_function(symbols.alloc_fn_id(), "f", vec![], false, false, file, 1);
+        first.is_cpp = true;
+        first.explicit_arity = Some(2);
+        first.reference_params = vec![true, true];
+        first.parameter_references = vec![Some(lvalue)];
+        let mut second = first.clone();
+        second.id = symbols.alloc_fn_id();
+        second.parameter_references.push(Some(rvalue));
+        let id = symbols.add_function(first);
+        assert_eq!(symbols.add_function(second), id);
+        assert_eq!(
+            symbols.function(id).parameter_references,
+            [Some(lvalue), Some(rvalue)]
+        );
     }
 
     #[test]

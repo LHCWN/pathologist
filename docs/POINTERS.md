@@ -556,7 +556,12 @@ is added: the wiring is the ordinary actual-to-formal copy of
   actual position: it may immediately follow an empty pack or move right by
   any number of elements. It receives every recorded actual from that first
   possible position on. Parameters before the pack retain their fixed
-  bindings. Declaration signatures skip every pack wherever it occurs;
+  bindings. Selected file-scope initializers use the same formal positions
+  to wire actuals and export argument origins. When a free function's single
+  non-terminal pack cannot be deduced elsewhere and no explicit template
+  arguments or argument expansions supply elements, lowering skips the empty
+  pack and binds each fixed slot individually. Default argument selection uses
+  those same positions. Declaration signatures skip every pack wherever it occurs;
   argument-type filtering and ranking use only the known prefix before the first pack,
   retaining uncertain suffix matches. Member receivers remain at position zero.
 - **An expansion serves every formal from its position on.** An argument that
